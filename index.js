@@ -762,62 +762,79 @@ export class ChatServer2 {
   }
   
   // ==================== STATE MANAGEMENT ====================
-  async sendAllStateTo(ws, room) {
-    try {
-      if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
+  // ==================== STATE MANAGEMENT ====================
+async sendAllStateTo(ws, room) {
+  try {
+    if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
+    
+    const storageManager = this.storageManagers.get(room);
+    if (!storageManager) return;
+    
+    const occupiedSeats = await storageManager.getOccupiedSeats();
+    const allKursiMeta = {};
+    const lastPointsData = [];
+    
+    for (const [seatNum, username] of Object.entries(occupiedSeats)) {
+      const seat = parseInt(seatNum);
+      const seatData = await storageManager.getSeat(seat);
       
-      const storageManager = this.storageManagers.get(room);
-      if (!storageManager) return;
-      
-      const occupiedSeats = await storageManager.getOccupiedSeats();
-      const allKursiMeta = {};
-      const lastPointsData = [];
-      
-      for (const [seatNum, username] of Object.entries(occupiedSeats)) {
-        const seat = parseInt(seatNum);
-        const seatData = await storageManager.getSeat(seat);
+      // HANYA JIKA SEAT TERISI (namauser tidak kosong)
+      if (seatData && seatData.namauser && seatData.namauser !== "") {
+        allKursiMeta[seat] = {
+          noimageUrl: seatData.noimageUrl || "",
+          namauser: seatData.namauser,
+          color: seatData.color || "",
+          itembawah: seatData.itembawah || 0,
+          itematas: seatData.itematas || 0,
+          vip: seatData.vip || 0,
+          viptanda: seatData.viptanda || 0
+        };
         
-        if (seatData && seatData.namauser) {
-          allKursiMeta[seat] = {
-            noimageUrl: seatData.noimageUrl || "",
-            namauser: seatData.namauser,
-            color: seatData.color || "",
-            itembawah: seatData.itembawah || 0,
-            itematas: seatData.itematas || 0,
-            vip: seatData.vip || 0,
-            viptanda: seatData.viptanda || 0
-          };
-          
-          if (seatData.lastPoint && seatData.lastPoint.x !== undefined) {
-            lastPointsData.push({ 
-              seat: seat, 
-              x: seatData.lastPoint.x, 
-              y: seatData.lastPoint.y, 
-              fast: seatData.lastPoint.fast ? 1 : 0 
-            });
-          }
+        // HANYA JIKA LASTPOINT VALID (bukan null/undefined)
+        if (seatData.lastPoint && 
+            typeof seatData.lastPoint.x === 'number' && 
+            typeof seatData.lastPoint.y === 'number' &&
+            !isNaN(seatData.lastPoint.x) && 
+            !isNaN(seatData.lastPoint.y)) {
+          lastPointsData.push({ 
+            seat: seat, 
+            x: seatData.lastPoint.x, 
+            y: seatData.lastPoint.y, 
+            fast: seatData.lastPoint.fast ? 1 : 0 
+          });
         }
       }
-      
-      await this.safeSend(ws, ["allUpdateKursiList", room, allKursiMeta]);
-      
-      if (lastPointsData.length > 0) {
-        await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
-      }
-      
-      await this.safeSend(ws, ["roomUserCount", room, await this.getRoomCount(room)]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-      await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
-      
-      const seatInfo = this.userToSeat.get(ws.idtarget);
-      if (seatInfo && seatInfo.room === room) {
-        await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
-      }
-      
-    } catch (error) {
-      console.error("Error sending state:", error);
     }
+    
+    const roomCount = await this.getRoomCount(room);
+    
+    // KIRIM HANYA JIKA ADA DATA YANG TIDAK KOSONG
+    if (Object.keys(allKursiMeta).length > 0) {
+      await this.safeSend(ws, ["allUpdateKursiList", room, allKursiMeta]);
+    }
+    
+    if (lastPointsData.length > 0) {
+      await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
+    }
+    
+    // HANYA KIRIM JIKA ROOM COUNT > 0
+    if (roomCount > 0) {
+      await this.safeSend(ws, ["roomUserCount", room, roomCount]);
+    }
+    
+    // SELALU KIRIM INI (nilai default penting)
+    await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+    await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+    
+    const seatInfo = this.userToSeat.get(ws.idtarget);
+    if (seatInfo && seatInfo.room === room) {
+      await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
+    }
+    
+  } catch (error) {
+    console.error("Error sending state:", error);
   }
+}
   
   // ==================== ROOM JOIN/LEAVE ====================
   async handleJoinRoom(ws, room) {
