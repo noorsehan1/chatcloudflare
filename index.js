@@ -1,4 +1,4 @@
-// index.js - ChatServer2 untuk Durable Object dengan SQLite
+// index.js - ChatServer2 untuk Durable Object
 import { LowCardGameManager } from "./lowcard.js";
 
 
@@ -160,7 +160,6 @@ export class ChatServer2 {
     this._initPromise = null;
     this._locks = new LockManager();
     this._cleanupInterval = null;
-    this._heartbeatInterval = null;
     this._isClosing = false;
     this._pendingPromises = new Set();
     
@@ -293,7 +292,6 @@ export class ChatServer2 {
     
     this.startNumberTickTimer();
     this._startPeriodicCleanup();
-    this._startHeartbeat();
   }
 
   _initMuteStatus() {
@@ -900,6 +898,13 @@ export class ChatServer2 {
 
   // ==================== CLEANUP METHODS ====================
   
+  _startPeriodicCleanup() {
+    // Periodic cleanup setiap interval
+    this._cleanupInterval = setInterval(() => {
+      this._periodicCleanup();
+    }, CONSTANTS.CLEANUP_INTERVAL);
+  }
+  
   scheduleCleanup(userId) {
     if (!userId) return;
     this.cancelCleanup(userId);
@@ -1163,31 +1168,7 @@ export class ChatServer2 {
     return true;
   }
 
-  // ==================== HEARTBEAT & TICK METHODS ====================
-  
-  _startHeartbeat() {
-    if (this._heartbeatInterval) clearInterval(this._heartbeatInterval);
-    
-    this._heartbeatInterval = setInterval(() => {
-      if (this._isClosing) return;
-      
-      const now = Date.now();
-      const toCleanup = [];
-      
-      for (let i = 0; i < this._activeClients.length; i++) {
-        const ws = this._activeClients[i];
-        if (ws && ws.readyState === 1 && !ws._isClosing) {
-          if (ws._lastActivity && (now - ws._lastActivity) > CONSTANTS.HEARTBEAT_INTERVAL * 2) {
-            toCleanup.push(ws);
-          }
-        }
-      }
-      
-      for (const ws of toCleanup) {
-        this.safeWebSocketCleanup(ws);
-      }
-    }, CONSTANTS.HEARTBEAT_INTERVAL);
-  }
+  // ==================== TICK METHODS ====================
 
   startNumberTickTimer() {
     if (this.numberTickTimer) clearTimeout(this.numberTickTimer);
@@ -1260,7 +1241,7 @@ export class ChatServer2 {
     this._isClosing = true;
     
     if (this.numberTickTimer) clearTimeout(this.numberTickTimer);
-    if (this._heartbeatInterval) clearInterval(this._heartbeatInterval);
+    if (this._cleanupInterval) clearInterval(this._cleanupInterval);
     
     for (let i = 0; i < this._activeClients.length; i++) {
       const ws = this._activeClients[i];
