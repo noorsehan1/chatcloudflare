@@ -1,6 +1,7 @@
 // index.js - ChatServer2 untuk Durable Object dengan SQLite
 import { LowCardGameManager } from "./lowcard.js";
 
+
 // 92: Freeze constants
 const CONSTANTS = Object.freeze({
   MAX_SEATS: 35,
