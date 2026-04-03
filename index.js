@@ -762,62 +762,64 @@ export class ChatServer2 {
   }
   
   // ==================== STATE MANAGEMENT ====================
-  async sendAllStateTo(ws, room) {
-    try {
-      if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
+ // Di dalam sendAllStateTo method, pastikan data VIP dikirim lengkap:
+
+async sendAllStateTo(ws, room) {
+  try {
+    if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
+    
+    const storageManager = this.storageManagers.get(room);
+    if (!storageManager) return;
+    
+    const occupiedSeats = await storageManager.getOccupiedSeats();
+    const allKursiMeta = {};
+    const lastPointsData = [];
+    
+    for (const [seatNum, username] of Object.entries(occupiedSeats)) {
+      const seat = parseInt(seatNum);
+      const seatData = await storageManager.getSeat(seat);
       
-      const storageManager = this.storageManagers.get(room);
-      if (!storageManager) return;
-      
-      const occupiedSeats = await storageManager.getOccupiedSeats();
-      const allKursiMeta = {};
-      const lastPointsData = [];
-      
-      for (const [seatNum, username] of Object.entries(occupiedSeats)) {
-        const seat = parseInt(seatNum);
-        const seatData = await storageManager.getSeat(seat);
+      if (seatData && seatData.namauser) {
+        allKursiMeta[seat] = {
+          noimageUrl: seatData.noimageUrl || "",
+          namauser: seatData.namauser,
+          color: seatData.color || "",
+          itembawah: seatData.itembawah || 0,
+          itematas: seatData.itematas || 0,
+          vip: seatData.vip || 0,           // ← PASTIKAN
+          viptanda: seatData.viptanda || 0  // ← PASTIKAN
+        };
         
-        if (seatData && seatData.namauser) {
-          allKursiMeta[seat] = {
-            noimageUrl: seatData.noimageUrl || "",
-            namauser: seatData.namauser,
-            color: seatData.color || "",
-            itembawah: seatData.itembawah || 0,
-            itematas: seatData.itematas || 0,
-            vip: seatData.vip || 0,
-            viptanda: seatData.viptanda || 0
-          };
-          
-          if (seatData.lastPoint && seatData.lastPoint.x !== undefined) {
-            lastPointsData.push({ 
-              seat: seat, 
-              x: seatData.lastPoint.x, 
-              y: seatData.lastPoint.y, 
-              fast: seatData.lastPoint.fast ? 1 : 0 
-            });
-          }
+        if (seatData.lastPoint && seatData.lastPoint.x !== undefined) {
+          lastPointsData.push({ 
+            seat: seat, 
+            x: seatData.lastPoint.x, 
+            y: seatData.lastPoint.y, 
+            fast: seatData.lastPoint.fast ? 1 : 0 
+          });
         }
       }
-      
-      await this.safeSend(ws, ["allUpdateKursiList", room, allKursiMeta]);
-      
-      if (lastPointsData.length > 0) {
-        await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
-      }
-      
-      await this.safeSend(ws, ["roomUserCount", room, await this.getRoomCount(room)]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-      await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
-      
-      const seatInfo = this.userToSeat.get(ws.idtarget);
-      if (seatInfo && seatInfo.room === room) {
-        await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
-      }
-      
-    } catch (error) {
-      console.error("Error sending state:", error);
     }
+    
+    await this.safeSend(ws, ["allUpdateKursiList", room, allKursiMeta]);
+    
+    if (lastPointsData.length > 0) {
+      await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
+    }
+    
+    await this.safeSend(ws, ["roomUserCount", room, await this.getRoomCount(room)]);
+    await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+    await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+    
+    const seatInfo = this.userToSeat.get(ws.idtarget);
+    if (seatInfo && seatInfo.room === room) {
+      await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
+    }
+    
+  } catch (error) {
+    console.error("Error sending state:", error);
   }
+}
   
   // ==================== ROOM JOIN/LEAVE ====================
   async handleJoinRoom(ws, room) {
@@ -1747,56 +1749,60 @@ export class ChatServer2 {
           break;
         }
         
-        case "updateKursi": {
-          const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
-          
-          if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
-          if (ws.roomname !== room || !roomList.includes(room)) return;
-          if (namauser !== ws.idtarget) return;
-          
-          const storageManager = this.storageManagers.get(room);
-          const existingSeat = await storageManager.getSeat(seat);
-          
-          const updatedSeat = {
-            noimageUrl: noimageUrl?.slice(0, 255) || "", 
-            namauser: namauser || "", 
-            color: color || "",
-            itembawah: itembawah || 0,
-            itematas: itematas || 0,
-            vip: vip || 0,
-            viptanda: viptanda || 0,
-            lastPoint: existingSeat?.lastPoint || null,
-            lastUpdated: Date.now()
-          };
-          
-          const success = await storageManager.replaceSeat(seat, updatedSeat);
-          
-          if (!success) {
-            await this.safeSend(ws, ["error", "Failed to update seat"]);
-            return;
-          }
-          
-          if (namauser === ws.idtarget) {
-            this.userToSeat.set(namauser, { room, seat });
-            this.userCurrentRoom.set(namauser, room);
-          }
-          
-          const kursiBatchData = [];
-          kursiBatchData.push([seat, {
-            noimageUrl: noimageUrl || "",
-            namauser: namauser || "",
-            color: color || "",
-            itembawah: itembawah || 0,
-            itematas: itematas || 0,
-            vip: vip || 0,
-            viptanda: viptanda || 0
-          }]);
-          
-          this.broadcastToRoom(room, ["kursiBatchUpdate", room, kursiBatchData]);
-          await this.updateRoomCount(room);
-          
-          break;
-        }
+        // Perbaikan untuk case "updateKursi" di dalam _processMessage
+
+case "updateKursi": {
+  const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
+  
+  if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
+  if (ws.roomname !== room || !roomList.includes(room)) return;
+  if (namauser !== ws.idtarget) return;
+  
+  const storageManager = this.storageManagers.get(room);
+  const existingSeat = await storageManager.getSeat(seat);
+  
+  const updatedSeat = {
+    noimageUrl: noimageUrl?.slice(0, 255) || "", 
+    namauser: namauser || "", 
+    color: color || "",
+    itembawah: itembawah || 0,
+    itematas: itematas || 0,
+    vip: vip || 0,        // ← SUDAH BENAR, TAPI...
+    viptanda: viptanda || 0,  // ← SUDAH BENAR
+    lastPoint: existingSeat?.lastPoint || null,
+    lastUpdated: Date.now()
+  };
+  
+  const success = await storageManager.replaceSeat(seat, updatedSeat);
+  
+  if (!success) {
+    await this.safeSend(ws, ["error", "Failed to update seat"]);
+    return;
+  }
+  
+  if (namauser === ws.idtarget) {
+    this.userToSeat.set(namauser, { room, seat });
+    this.userCurrentRoom.set(namauser, room);
+  }
+  
+  // PERBAIKAN: Kirim data VIP juga di broadcast
+  const kursiBatchData = [];
+  kursiBatchData.push([seat, {
+    noimageUrl: noimageUrl || "",
+    namauser: namauser || "",
+    color: color || "",
+    itembawah: itembawah || 0,
+    itematas: itematas || 0,
+    vip: vip || 0,           // ← PASTIKAN INI TERKIRIM
+    viptanda: viptanda || 0  // ← PASTIKAN INI TERKIRIM
+  }]);
+  
+  // Broadcast ke semua client di room
+  this.broadcastToRoom(room, ["kursiBatchUpdate", room, kursiBatchData]);
+  await this.updateRoomCount(room);
+  
+  break;
+}
         
         case "gift": {
           const [, roomname, sender, receiver, giftName] = data;
