@@ -914,136 +914,160 @@ export class ChatServer2 {
   }
 
   async handleJoinRoom(ws, room) {
-    if (!ws?.idtarget) { 
-      await this.safeSend(ws, ["error", "User ID not set"]); 
-      return false; 
+  if (!ws?.idtarget) { 
+    await this.safeSend(ws, ["error", "User ID not set"]); 
+    return false; 
+  }
+  if (!roomList.includes(room)) { 
+    await this.safeSend(ws, ["error", "Invalid room"]); 
+    return false; 
+  }
+  if (!this.rateLimiter.check(ws.idtarget)) { 
+    await this.safeSend(ws, ["error", "Too many requests"]); 
+    return false; 
+  }
+  
+  const release = await this._locks.acquire(`user_${ws.idtarget}`);
+  try {
+    console.log(`[JOIN] User ${ws.idtarget} trying to join room ${room}`);
+    
+    this.cancelCleanup(ws.idtarget);
+    
+    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
+    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
+    
+    // Jika sudah di room yang sama, langsung berhasil
+    if (currentRoomBeforeJoin === room && existingSeatInfo) {
+      ws.roomname = room;
+      await this.sendAllStateTo(ws, room);
+      await this.safeSend(ws, ["rooMasuk", existingSeatInfo.seat, room]);
+      return true;
     }
-    if (!roomList.includes(room)) { 
-      await this.safeSend(ws, ["error", "Invalid room"]); 
-      return false; 
+    
+    // Jika user sedang di room lain, keluar dulu
+    if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
+      const oldSeatInfo = this.userToSeat.get(ws.idtarget);
+      if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
+        await this._removeUserFromCurrentRoom(
+          ws.idtarget, 
+          currentRoomBeforeJoin, 
+          oldSeatInfo.seat,
+          false
+        );
+      }
+      this._removeFromRoomClients(ws, currentRoomBeforeJoin);
+      this._cleanupNullClients(currentRoomBeforeJoin);
     }
-    if (!this.rateLimiter.check(ws.idtarget)) { 
-      await this.safeSend(ws, ["error", "Too many requests"]); 
+    
+    // CEK APAKAH ROOM PENUH
+    const currentRoomCount = this.getRoomCount(room);
+    if (currentRoomCount >= CONSTANTS.MAX_SEATS) {
+      console.log(`[JOIN] Room ${room} is FULL! (${currentRoomCount}/${CONSTANTS.MAX_SEATS})`);
+      
+      // Kirim langsung ke client bahwa room penuh
+      await this.safeSend(ws, ["roomFull", room]);
+      return false;
+    }
+    
+    // Cek apakah user memiliki seat di room ini (reconnect case)
+    if (existingSeatInfo && existingSeatInfo.room === room) {
+      const seatNum = existingSeatInfo.seat;
+      const occupancyMap = this.seatOccupancy.get(room);
+      const seatMap = this.roomSeats.get(room);
+      
+      if (occupancyMap && seatMap && occupancyMap.get(seatNum) === null) {
+        occupancyMap.set(seatNum, ws.idtarget);
+        ws.roomname = room;
+        
+        let clientArray = this.roomClients.get(room);
+        if (!clientArray) {
+          clientArray = [];
+          this.roomClients.set(room, clientArray);
+        }
+        
+        if (!clientArray.includes(ws)) {
+          const nullIndex = clientArray.indexOf(null);
+          if (nullIndex > -1) {
+            clientArray[nullIndex] = ws;
+          } else {
+            clientArray.push(ws);
+          }
+        }
+        
+        this._addUserConnection(ws.idtarget, ws);
+        this.userCurrentRoom.set(ws.idtarget, room);
+        
+        await this.sendAllStateTo(ws, room);
+        await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+        await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+        
+        console.log(`[JOIN] User ${ws.idtarget} reconnected to seat ${seatNum} in ${room}`);
+        this._saveDebounced();
+        return true;
+      } else if (occupancyMap.get(seatNum) === ws.idtarget) {
+        ws.roomname = room;
+        await this.sendAllStateTo(ws, room);
+        await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+        return true;
+      } else {
+        this.userToSeat.delete(ws.idtarget);
+      }
+    }
+    
+    // Cari seat kosong
+    const assignedSeat = await this._assignSeat(room, ws.idtarget);
+    if (!assignedSeat) { 
+      console.log(`[JOIN] No empty seat available in room ${room}`);
+      await this.safeSend(ws, ["roomFull", room]);
       return false; 
     }
     
-    const release = await this._locks.acquire(`user_${ws.idtarget}`);
-    try {
-      console.log(`[JOIN] User ${ws.idtarget} joining room ${room}`);
-      
-      this.cancelCleanup(ws.idtarget);
-      
-      const existingSeatInfo = this.userToSeat.get(ws.idtarget);
-      const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
-      
-      if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
-        console.log(`[JOIN] User ${ws.idtarget} was in room ${currentRoomBeforeJoin}, leaving first...`);
-        const oldSeatInfo = this.userToSeat.get(ws.idtarget);
-        if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-          await this._removeUserFromCurrentRoom(
-            ws.idtarget, 
-            currentRoomBeforeJoin, 
-            oldSeatInfo.seat,
-            false
-          );
-        }
-        this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-        this._cleanupNullClients(currentRoomBeforeJoin);
-      }
-      
-      if (existingSeatInfo && existingSeatInfo.room === room) {
-        const seatNum = existingSeatInfo.seat;
-        const occupancyMap = this.seatOccupancy.get(room);
-        const seatMap = this.roomSeats.get(room);
-        
-        if (occupancyMap && seatMap && occupancyMap.get(seatNum) === null) {
-          occupancyMap.set(seatNum, ws.idtarget);
-          ws.roomname = room;
-          
-          let clientArray = this.roomClients.get(room);
-          if (!clientArray) {
-            clientArray = [];
-            this.roomClients.set(room, clientArray);
-          }
-          
-          if (!clientArray.includes(ws)) {
-            const nullIndex = clientArray.indexOf(null);
-            if (nullIndex > -1) {
-              clientArray[nullIndex] = ws;
-            } else {
-              clientArray.push(ws);
-            }
-          }
-          
-          this._addUserConnection(ws.idtarget, ws);
-          this.userCurrentRoom.set(ws.idtarget, room);
-          
-          await this.sendAllStateTo(ws, room);
-          await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
-          await this.safeSend(ws, ["rooMasuk", seatNum, room]);
-          
-          console.log(`[JOIN] User ${ws.idtarget} reconnected to seat ${seatNum} in ${room}`);
-          this._saveDebounced();
-          return true;
-        } else if (occupancyMap.get(seatNum) === ws.idtarget) {
-          ws.roomname = room;
-          await this.sendAllStateTo(ws, room);
-          await this.safeSend(ws, ["rooMasuk", seatNum, room]);
-          return true;
-        } else {
-          this.userToSeat.delete(ws.idtarget);
-        }
-      }
-      
-      const assignedSeat = await this._assignSeat(room, ws.idtarget);
-      if (!assignedSeat) { 
-        await this.safeSend(ws, ["roomFull", room]); 
-        console.log(`[JOIN] Room ${room} is full`);
-        return false; 
-      }
-      
-      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
-      this.userCurrentRoom.set(ws.idtarget, room);
-      ws.roomname = room;
-      
-      let clientArray = this.roomClients.get(room);
-      if (!clientArray) {
-        clientArray = [];
-        this.roomClients.set(room, clientArray);
-      }
-      
-      if (!clientArray.includes(ws)) {
-        const nullIndex = clientArray.indexOf(null);
-        if (nullIndex > -1) {
-          clientArray[nullIndex] = ws;
-        } else {
-          clientArray.push(ws);
-        }
-      }
-      
-      this._addUserConnection(ws.idtarget, ws);
-      
-      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
-      
-      setTimeout(async () => {
-        await this.sendAllStateTo(ws, room);
-        console.log(`[JOIN] Sent all state to ${ws.idtarget} in room ${room}`);
-      }, 100);
-      
-      await this._saveToStorage();
-      console.log(`[JOIN] User ${ws.idtarget} assigned to seat ${assignedSeat} in ${room}`);
-      
-      return true;
-      
-    } catch (error) {
-      console.error("[JOIN] Error:", error);
-      await this.safeSend(ws, ["error", "Failed to join room"]);
-      return false;
-    } finally {
-      release();
+    // Set mapping
+    this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+    this.userCurrentRoom.set(ws.idtarget, room);
+    ws.roomname = room;
+    
+    // Add to room clients
+    let clientArray = this.roomClients.get(room);
+    if (!clientArray) {
+      clientArray = [];
+      this.roomClients.set(room, clientArray);
     }
+    
+    if (!clientArray.includes(ws)) {
+      const nullIndex = clientArray.indexOf(null);
+      if (nullIndex > -1) {
+        clientArray[nullIndex] = ws;
+      } else {
+        clientArray.push(ws);
+      }
+    }
+    
+    this._addUserConnection(ws.idtarget, ws);
+    
+    // Send responses
+    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+    await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+    
+    setTimeout(async () => {
+      await this.sendAllStateTo(ws, room);
+      console.log(`[JOIN] Sent all state to ${ws.idtarget} in room ${room}`);
+    }, 100);
+    
+    await this._saveToStorage();
+    console.log(`[JOIN] User ${ws.idtarget} assigned to seat ${assignedSeat} in ${room}`);
+    
+    return true;
+    
+  } catch (error) {
+    console.error("[JOIN] Error:", error);
+    await this.safeSend(ws, ["error", "Failed to join room"]);
+    return false;
+  } finally {
+    release();
   }
+}}
+}
 
   async cleanupFromRoom(ws, room) {
     if (!ws?.idtarget || !ws.roomname) return;
