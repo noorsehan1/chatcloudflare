@@ -1,4 +1,4 @@
-// index.js - ChatServer2 untuk Durable Object (FIXED VERSION)
+// index.js - ChatServer2 untuk Durable Object (Optimized for Android Client)
 import { LowCardGameManager } from "./lowcard.js";
 
 // Constants
@@ -555,7 +555,7 @@ export class ChatServer2 {
             seat: seat, 
             x: info.lastPoint.x, 
             y: info.lastPoint.y, 
-            fast: info.lastPoint.fast || false 
+            fast: info.lastPoint.fast ? 1 : 0 
           });
         }
       }
@@ -569,6 +569,12 @@ export class ChatServer2 {
       await this.safeSend(ws, ["roomUserCount", room, this.getRoomCount(room)]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+      
+      // Kirim nomor kursi user
+      const seatInfo = this.userToSeat.get(ws.idtarget);
+      if (seatInfo && seatInfo.room === room) {
+        await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
+      }
       
     } catch (error) {}
   }
@@ -645,11 +651,13 @@ export class ChatServer2 {
           
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           return true;
         } else if (occupancyMap.get(seatNum) === ws.idtarget) {
           ws.roomname = room;
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           return true;
         } else {
           this.userToSeat.delete(ws.idtarget);
@@ -684,6 +692,7 @@ export class ChatServer2 {
       this._addUserConnection(ws.idtarget, ws);
       
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
       
       setTimeout(async () => {
@@ -1109,9 +1118,10 @@ export class ChatServer2 {
             
             await this.sendAllStateTo(ws, room);
             if (seatData.lastPoint) {
-              await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast]);
+              await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast ? 1 : 0]);
             }
             await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+            await this.safeSend(ws, ["numberKursiSaya", seat]);
             
             this._pendingReconnections.delete(id);
             return;
@@ -1142,9 +1152,10 @@ export class ChatServer2 {
               this._addUserConnection(id, ws, ip);
               await this.sendAllStateTo(ws, room);
               if (seatData.lastPoint) {
-                await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast]);
+                await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast ? 1 : 0]);
               }
               await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+              await this.safeSend(ws, ["numberKursiSaya", seat]);
               return;
             }
           }
@@ -1227,6 +1238,13 @@ export class ChatServer2 {
           this.broadcastToRoom(roomName, ["rollangakBroadcast", roomName, username, angka]);
           break;
         }
+        case "modwarning": {
+          const roomName = data[1];
+          if (roomName && roomList.includes(roomName) && ws.idtarget) {
+            this.broadcastToRoom(roomName, ["modwarning", roomName]);
+          }
+          break;
+        }
         case "setMuteType": {
           const isMuted = data[1], roomName = data[2];
           if (!roomName || !roomList.includes(roomName)) break;
@@ -1293,7 +1311,7 @@ export class ChatServer2 {
         case "getAllRoomsUserCount": {
           const result = [];
           for (const room of roomList) {
-            result.push([room, this.getRoomCount(room)]);
+            result.push({ roomName: room, userCount: this.getRoomCount(room) });
           }
           await this.safeSend(ws, ["allRoomsUserCount", result]);
           break;
@@ -1391,7 +1409,7 @@ export class ChatServer2 {
             currentSeat.lastPoint = { 
               x: parseFloat(x), 
               y: parseFloat(y), 
-              fast: fast || false, 
+              fast: fast === 1 || fast === true, 
               timestamp: Date.now() 
             };
             return currentSeat;
@@ -1476,6 +1494,10 @@ export class ChatServer2 {
               await this.lowcard.handleEvent(ws, data);
             } catch (error) {}
           }
+          break;
+        }
+        case "ping": {
+          await this.safeSend(ws, ["pong", Date.now()]);
           break;
         }
         default: break;
