@@ -1,14 +1,13 @@
-# wrangler.toml
-name = "chat-server"
+name = "chatcloudflare"  # Use the CI expected name
 main = "index.js"
+compatibility_date = "2026-04-03"
 
+# Durable Object binding
 [[durable_objects.bindings]]
 name = "CHAT_SERVER"
 class_name = "ChatServer2"
 
+# Migrations for Durable Objects
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer2"]
-
-[env.variables]
-ADMIN_LIST = "admin1,admin2"
+new_classes = ["ChatServer2"
