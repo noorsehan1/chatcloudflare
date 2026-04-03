@@ -1,6 +1,4 @@
 // index.js - ChatServer2 untuk Durable Object (STORAGE-FIRST VERSION - ZERO MEMORY LEAK)
-// MODIFIED: No automatic seat data creation, users must manually update their seat via updateKursi
-
 import { LowCardGameManager } from "./lowcard.js";
 
 // Constants
@@ -503,6 +501,8 @@ export class ChatServer2 {
   }
   
   getAllRoomCountsArray() {
+    const countsPromise = this.getJumlahRoom();
+    // Handle async properly -这个方法应该改成async
     return roomList.map(room => [room, this._roomCountsCache.get(room) || 0]);
   }
   
@@ -589,6 +589,45 @@ export class ChatServer2 {
       if (!storageManager) return false;
       
       return await storageManager.replacePoint(seatNumber, point);
+    } finally {
+      release();
+    }
+  }
+  
+  async _assignSeatOnly(room, userId) {
+    const release = await this._locks.acquire(`seat_assign_${room}`);
+    try {
+      const storageManager = this.storageManagers.get(room);
+      if (!storageManager) return null;
+      
+      const currentCount = await storageManager.getOccupiedCount();
+      if (currentCount >= CONSTANTS.MAX_SEATS) return null;
+      
+      const occupiedSeats = await storageManager.getOccupiedSeats();
+      
+      for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
+        if (!occupiedSeats[seat]) {
+          const newSeat = {
+            noimageUrl: "",
+            namauser: userId,
+            color: "",
+            itembawah: 0,
+            itematas: 0,
+            vip: 0,
+            viptanda: 0,
+            lastPoint: null,
+            lastUpdated: Date.now()
+          };
+          
+          const success = await storageManager.replaceSeat(seat, newSeat);
+          if (success) {
+            this._roomCountsCache.set(room, currentCount + 1);
+            this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
+            return seat;
+          }
+        }
+      }
+      return null;
     } finally {
       release();
     }
@@ -808,7 +847,6 @@ export class ChatServer2 {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
       
-      // If user is already in a different room, leave that room first
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
         const oldSeatInfo = this.userToSeat.get(ws.idtarget);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
@@ -816,19 +854,17 @@ export class ChatServer2 {
             ws.idtarget, 
             currentRoomBeforeJoin, 
             oldSeatInfo.seat,
-            false  // Remove seat data
+            false
           );
         }
         this._removeFromRoomClients(ws, currentRoomBeforeJoin);
       }
       
-      // Check if user already has a seat in this room (from previous session)
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const storageManager = this.storageManagers.get(room);
         const seatData = await storageManager.getSeat(seatNum);
         
-        // Only occupy if seat data exists AND belongs to this user
         if (seatData && seatData.namauser === ws.idtarget) {
           ws.roomname = room;
           
@@ -855,13 +891,18 @@ export class ChatServer2 {
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           return true;
         } else {
-          // Seat data doesn't exist or belongs to someone else, remove stale mapping
           this.userToSeat.delete(ws.idtarget);
         }
       }
       
-      // NEW BEHAVIOR: DO NOT CREATE NEW SEAT DATA AUTOMATICALLY
-      // Just set the room without assigning a seat
+      const assignedSeat = await this._assignSeatOnly(room, ws.idtarget);
+      if (!assignedSeat) { 
+        await this.safeSend(ws, ["roomFull", room]); 
+        return false; 
+      }
+      
+      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+      this.userCurrentRoom.set(ws.idtarget, room);
       ws.roomname = room;
       
       let clientArray = this.roomClients.get(room);
@@ -880,16 +921,14 @@ export class ChatServer2 {
       }
       
       this._addUserConnection(ws.idtarget, ws);
-      this.userCurrentRoom.set(ws.idtarget, room);
       
-      // Send current room state (existing seats)
-      await this.sendAllStateTo(ws, room);
-      
-      // Send mute status
+      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
       
-      // Send success message - user must now call updateKursi manually
-      await this.safeSend(ws, ["rooMasuk", null, room]);
+      setTimeout(async () => {
+        await this.sendAllStateTo(ws, room);
+      }, 100);
       
       return true;
       
@@ -1704,8 +1743,6 @@ export class ChatServer2 {
           if (success) {
             this.broadcastToRoom(room, ["removeKursi", room, seat]);
             await this.updateRoomCount(room);
-            // Remove seat mapping after user removes their seat
-            this.userToSeat.delete(ws.idtarget);
           }
           break;
         }
@@ -1718,13 +1755,7 @@ export class ChatServer2 {
           if (namauser !== ws.idtarget) return;
           
           const storageManager = this.storageManagers.get(room);
-          
-          // Check if seat is already occupied by another user
           const existingSeat = await storageManager.getSeat(seat);
-          if (existingSeat && existingSeat.namauser && existingSeat.namauser !== "" && existingSeat.namauser !== namauser) {
-            await this.safeSend(ws, ["error", "Seat already occupied by another user"]);
-            return;
-          }
           
           const updatedSeat = {
             noimageUrl: noimageUrl?.slice(0, 255) || "", 
@@ -1745,9 +1776,10 @@ export class ChatServer2 {
             return;
           }
           
-          // Update user's seat mapping
-          this.userToSeat.set(namauser, { room, seat });
-          this.userCurrentRoom.set(namauser, room);
+          if (namauser === ws.idtarget) {
+            this.userToSeat.set(namauser, { room, seat });
+            this.userCurrentRoom.set(namauser, room);
+          }
           
           const kursiBatchData = [];
           kursiBatchData.push([seat, {
@@ -1762,9 +1794,6 @@ export class ChatServer2 {
           
           this.broadcastToRoom(room, ["kursiBatchUpdate", room, kursiBatchData]);
           await this.updateRoomCount(room);
-          
-          // Send confirmation to user
-          await this.safeSend(ws, ["numberKursiSaya", seat]);
           
           break;
         }
