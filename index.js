@@ -1454,57 +1454,55 @@ export class ChatServer2 {
           this.broadcastToRoom(room, ["removeKursi", room, seat]);
           this.updateRoomCount(room);
           break;
+        }
         case "updateKursi": {
-  const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
-  
-  if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
-  if (ws.roomname !== room || !roomList.includes(room)) return;
-  if (namauser !== ws.idtarget) return;
-  
-  const oldSeatInfo = this.roomSeats.get(room)?.get(seat);
-  
-  const updatedSeat = await this.updateSeatAtomic(room, seat, () => ({
-    noimageUrl: noimageUrl?.slice(0, 255) || "", 
-    namauser: namauser || "", 
-    color: color || "",
-    itembawah: itembawah || 0,
-    itematas: itematas || 0,
-    vip: vip || 0,
-    viptanda: viptanda || 0,
-    lastPoint: oldSeatInfo?.lastPoint || null,
-    lastUpdated: Date.now()
-  }));
-  
-  if (!updatedSeat) {
-    await this.safeSend(ws, ["error", "Failed to update seat"]);
-    return;
-  }
-  
-  if (namauser === ws.idtarget) {
-    this.userToSeat.set(namauser, { room, seat });
-    this.userCurrentRoom.set(namauser, room);
-  }
-  
-  // 🔥 KIRIM KE SEMUA USER DI ROOM menggunakan kursiBatchUpdate
-  const kursiBatchData = [];
-  kursiBatchData.push([seat, {
-    noimageUrl: noimageUrl || "",
-    namauser: namauser || "",
-    color: color || "",
-    itembawah: itembawah || 0,
-    itematas: itematas || 0,
-    vip: vip || 0,
-    viptanda: viptanda || 0
-  }]);
-  
-  // Broadcast ke semua client di room
-  this.broadcastToRoom(room, ["kursiBatchUpdate", room, kursiBatchData]);
-  
-  // Update room count
-  this.updateRoomCount(room);
-  
-  break;
-}
+          const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
+          
+          if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
+          if (ws.roomname !== room || !roomList.includes(room)) return;
+          if (namauser !== ws.idtarget) return;
+          
+          const oldSeatInfo = this.roomSeats.get(room)?.get(seat);
+          
+          const updatedSeat = await this.updateSeatAtomic(room, seat, () => ({
+            noimageUrl: noimageUrl?.slice(0, 255) || "", 
+            namauser: namauser || "", 
+            color: color || "",
+            itembawah: itembawah || 0,
+            itematas: itematas || 0,
+            vip: vip || 0,
+            viptanda: viptanda || 0,
+            lastPoint: oldSeatInfo?.lastPoint || null,
+            lastUpdated: Date.now()
+          }));
+          
+          if (!updatedSeat) {
+            await this.safeSend(ws, ["error", "Failed to update seat"]);
+            return;
+          }
+          
+          if (namauser === ws.idtarget) {
+            this.userToSeat.set(namauser, { room, seat });
+            this.userCurrentRoom.set(namauser, room);
+          }
+          
+          // HANYA KIRIM KURSI YANG DIUPDATE
+          const kursiBatchData = [];
+          kursiBatchData.push([seat, {
+            noimageUrl: noimageUrl || "",
+            namauser: namauser || "",
+            color: color || "",
+            itembawah: itembawah || 0,
+            itematas: itematas || 0,
+            vip: vip || 0,
+            viptanda: viptanda || 0
+          }]);
+          
+          this.broadcastToRoom(room, ["kursiBatchUpdate", room, kursiBatchData]);
+          this.updateRoomCount(room);
+          
+          break;
+        }
         case "gift": {
           const [, roomname, sender, receiver, giftName] = data;
           if (ws.roomname !== roomname || ws.idtarget !== sender) return;
