@@ -837,7 +837,7 @@ async sendAllStateTo(ws, room) {
 }
   
   // ==================== ROOM JOIN/LEAVE ====================
-  // ==================== ROOM JOIN/LEAVE ====================
+// ==================== ROOM JOIN/LEAVE ====================
 async handleJoinRoom(ws, room) {
   if (!ws?.idtarget) return false;
   if (!roomList.includes(room)) return false;
@@ -845,46 +845,7 @@ async handleJoinRoom(ws, room) {
   
   const release = await this._locks.acquire(`user_${ws.idtarget}`);
   try {
-    // CEK KAPASITAS ROOM (PALING AWAL)
-    const currentCount = await this.getRoomCount(room);
-    if (currentCount >= CONSTANTS.MAX_SEATS) {
-      await this.safeSend(ws, ["roomFull", room]);
-      return false;
-    }
-    
-    // Hapus data room lama jika ada
-    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
-    if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
-      const oldSeatInfo = this.userToSeat.get(ws.idtarget);
-      if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-        await this._removeUserFromCurrentRoom(ws.idtarget, currentRoomBeforeJoin, oldSeatInfo.seat, false);
-      }
-      this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-    }
-    
-    // Cek apakah user sudah punya kursi di room ini
-    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
-    if (existingSeatInfo && existingSeatInfo.room === room) {
-      const seatNum = existingSeatInfo.seat;
-      const storageManager = this.storageManagers.get(room);
-      const seatData = await storageManager.getSeat(seatNum);
-      
-      if (seatData && seatData.namauser === ws.idtarget) {
-        ws.roomname = room;
-        this._addToRoomClients(ws, room);
-        this._addUserConnection(ws.idtarget, ws);
-        this.userCurrentRoom.set(ws.idtarget, room);
-        
-        await this.safeSend(ws, ["rooMasuk", seatNum, room]);
-        // TIDAK PERLU kirim numberKursiSaya dan muteTypeResponse karena sudah di sendAllStateTo
-        await this.sendAllStateTo(ws, room);
-        return true;
-      } else {
-        this.userToSeat.delete(ws.idtarget);
-      }
-    }
-    
-    // Cari kursi kosong
+    // 1. PERTAMA: CARI KURSI KOSONG DI ROOM BARU
     const storageManager = this.storageManagers.get(room);
     const occupiedSeats = await storageManager.getOccupiedSeats();
     
@@ -896,7 +857,45 @@ async handleJoinRoom(ws, room) {
       }
     }
     
-    // Simpan data kursi
+    // KALAU TIDAK ADA KURSI KOSONG -> ROOM FULL, LANGSUNG RETURN
+    if (!assignedSeat) {
+      await this.safeSend(ws, ["roomFull", room]);
+      return false;
+    }
+    
+    // 2. KEDUA: HAPUS DATA KURSI LAMA DI ROOM LAMA (JIKA ADA)
+    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
+    if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
+      const oldSeatInfo = this.userToSeat.get(ws.idtarget);
+      if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
+        await this._removeUserFromCurrentRoom(ws.idtarget, currentRoomBeforeJoin, oldSeatInfo.seat, false);
+      }
+      this._removeFromRoomClients(ws, currentRoomBeforeJoin);
+    }
+    
+    // 3. KETIGA: CEK RECONNECT (user sudah punya kursi di room ini)
+    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
+    if (existingSeatInfo && existingSeatInfo.room === room) {
+      const seatNum = existingSeatInfo.seat;
+      const seatData = await storageManager.getSeat(seatNum);
+      
+      if (seatData && seatData.namauser === ws.idtarget) {
+        ws.roomname = room;
+        this._addToRoomClients(ws, room);
+        this._addUserConnection(ws.idtarget, ws);
+        this.userCurrentRoom.set(ws.idtarget, room);
+        
+        await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+        await this.safeSend(ws, ["numberKursiSaya", seatNum]);
+        await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
+        await this.sendAllStateTo(ws, room);
+        return true;
+      } else {
+        this.userToSeat.delete(ws.idtarget);
+      }
+    }
+    
+    // 4. KEEMPAT: SIMPAN DATA KURSI BARU
     const newSeat = {
       noimageUrl: "", namauser: ws.idtarget, color: "",
       itembawah: 0, itematas: 0, vip: 0, viptanda: 0,
@@ -905,20 +904,17 @@ async handleJoinRoom(ws, room) {
     
     await storageManager.replaceSeat(assignedSeat, newSeat);
     
-    // Update state
+    // 5. KELIMA: UPDATE STATE
     this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
     this.userCurrentRoom.set(ws.idtarget, room);
     ws.roomname = room;
     this._addToRoomClients(ws, room);
     this._addUserConnection(ws.idtarget, ws);
     
-    // Update count
-    await this.updateRoomCount(room, 1);
-    
-    // HANYA KIRIM rooMasuk saja, sisanya dari sendAllStateTo
+    // 6. KEENAM: KIRIM RESPONSE
     await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-    
-    // Kirim semua state (sudah include numberKursiSaya, muteTypeResponse, dll)
+    await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+    await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
     await this.sendAllStateTo(ws, room);
     
     return true;
