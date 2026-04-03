@@ -1,4 +1,4 @@
-name = "chat-cloudflare"
+name = "chatcloudflare"
 main = "index.js"
 compatibility_date = "2026-03-20"
 
@@ -8,4 +8,4 @@ class_name = "ChatServer"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ChatServer"]
+new_sqlite_classes = ["ChatServer2"]
