@@ -837,126 +837,99 @@ async sendAllStateTo(ws, room) {
 }
   
   // ==================== ROOM JOIN/LEAVE ====================
-  async handleJoinRoom(ws, room) {
-    if (!ws?.idtarget) { 
-      await this.safeSend(ws, ["error", "User ID not set"]); 
-      return false; 
-    }
-    if (!roomList.includes(room)) { 
-      await this.safeSend(ws, ["error", "Invalid room"]); 
-      return false; 
-    }
-    if (!this.rateLimiter.check(ws.idtarget)) { 
-      await this.safeSend(ws, ["error", "Too many requests"]); 
-      return false; 
+  // ==================== ROOM JOIN/LEAVE ====================
+async handleJoinRoom(ws, room) {
+  if (!ws?.idtarget) return false;
+  if (!roomList.includes(room)) return false;
+  if (!this.rateLimiter.check(ws.idtarget)) return false;
+  
+  const release = await this._locks.acquire(`user_${ws.idtarget}`);
+  try {
+    // CEK KAPASITAS ROOM (PALING AWAL)
+    const currentCount = await this.getRoomCount(room);
+    if (currentCount >= CONSTANTS.MAX_SEATS) {
+      await this.safeSend(ws, ["roomFull", room]);
+      return false;
     }
     
-    const release = await this._locks.acquire(`user_${ws.idtarget}`);
-    try {
-      const currentCount = await this.getRoomCount(room);
-      if (currentCount >= CONSTANTS.MAX_SEATS) {
-        await this.safeSend(ws, ["roomFull", room]);
-        return false;
+    // Hapus data room lama jika ada
+    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
+    if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
+      const oldSeatInfo = this.userToSeat.get(ws.idtarget);
+      if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
+        await this._removeUserFromCurrentRoom(ws.idtarget, currentRoomBeforeJoin, oldSeatInfo.seat, false);
       }
-      
-      this.cancelCleanup(ws.idtarget);
-      
-      const existingSeatInfo = this.userToSeat.get(ws.idtarget);
-      const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
-      
-      if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
-        const oldSeatInfo = this.userToSeat.get(ws.idtarget);
-        if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-          await this._removeUserFromCurrentRoom(
-            ws.idtarget, 
-            currentRoomBeforeJoin, 
-            oldSeatInfo.seat,
-            false
-          );
-        }
-        this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-      }
-      
-      if (existingSeatInfo && existingSeatInfo.room === room) {
-        const seatNum = existingSeatInfo.seat;
-        const storageManager = this.storageManagers.get(room);
-        const seatData = await storageManager.getSeat(seatNum);
-        
-        if (seatData && seatData.namauser === ws.idtarget) {
-          ws.roomname = room;
-          
-          let clientArray = this.roomClients.get(room);
-          if (!clientArray) {
-            clientArray = [];
-            this.roomClients.set(room, clientArray);
-          }
-          
-          if (!clientArray.includes(ws)) {
-            const nullIndex = clientArray.indexOf(null);
-            if (nullIndex > -1) {
-              clientArray[nullIndex] = ws;
-            } else {
-              clientArray.push(ws);
-            }
-          }
-          
-          this._addUserConnection(ws.idtarget, ws);
-          this.userCurrentRoom.set(ws.idtarget, room);
-          
-          await this.sendAllStateTo(ws, room);
-          await this.safeSend(ws, ["rooMasuk", seatNum, room]);
-          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
-          return true;
-        } else {
-          this.userToSeat.delete(ws.idtarget);
-        }
-      }
-      
-      const assignedSeat = await this._assignSeatOnly(room, ws.idtarget);
-      if (!assignedSeat) { 
-        await this.safeSend(ws, ["roomFull", room]); 
-        return false; 
-      }
-      
-      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
-      this.userCurrentRoom.set(ws.idtarget, room);
-      ws.roomname = room;
-      
-      let clientArray = this.roomClients.get(room);
-      if (!clientArray) {
-        clientArray = [];
-        this.roomClients.set(room, clientArray);
-      }
-      
-      if (!clientArray.includes(ws)) {
-        const nullIndex = clientArray.indexOf(null);
-        if (nullIndex > -1) {
-          clientArray[nullIndex] = ws;
-        } else {
-          clientArray.push(ws);
-        }
-      }
-      
-      this._addUserConnection(ws.idtarget, ws);
-      
-      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-      await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
-      
-      setTimeout(async () => {
-        await this.sendAllStateTo(ws, room);
-      }, 100);
-      
-      return true;
-      
-    } catch (error) {
-      console.error("Error joining room:", error);
-      await this.safeSend(ws, ["error", "Failed to join room"]);
-      return false;
-    } finally {
-      release();
+      this._removeFromRoomClients(ws, currentRoomBeforeJoin);
     }
+    
+    // Cek apakah user sudah punya kursi di room ini
+    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
+    if (existingSeatInfo && existingSeatInfo.room === room) {
+      const seatNum = existingSeatInfo.seat;
+      const storageManager = this.storageManagers.get(room);
+      const seatData = await storageManager.getSeat(seatNum);
+      
+      if (seatData && seatData.namauser === ws.idtarget) {
+        ws.roomname = room;
+        this._addToRoomClients(ws, room);
+        this._addUserConnection(ws.idtarget, ws);
+        this.userCurrentRoom.set(ws.idtarget, room);
+        
+        await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+        // TIDAK PERLU kirim numberKursiSaya dan muteTypeResponse karena sudah di sendAllStateTo
+        await this.sendAllStateTo(ws, room);
+        return true;
+      } else {
+        this.userToSeat.delete(ws.idtarget);
+      }
+    }
+    
+    // Cari kursi kosong
+    const storageManager = this.storageManagers.get(room);
+    const occupiedSeats = await storageManager.getOccupiedSeats();
+    
+    let assignedSeat = null;
+    for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
+      if (!occupiedSeats[seat]) {
+        assignedSeat = seat;
+        break;
+      }
+    }
+    
+    // Simpan data kursi
+    const newSeat = {
+      noimageUrl: "", namauser: ws.idtarget, color: "",
+      itembawah: 0, itematas: 0, vip: 0, viptanda: 0,
+      lastPoint: null, lastUpdated: Date.now()
+    };
+    
+    await storageManager.replaceSeat(assignedSeat, newSeat);
+    
+    // Update state
+    this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+    this.userCurrentRoom.set(ws.idtarget, room);
+    ws.roomname = room;
+    this._addToRoomClients(ws, room);
+    this._addUserConnection(ws.idtarget, ws);
+    
+    // Update count
+    await this.updateRoomCount(room, 1);
+    
+    // HANYA KIRIM rooMasuk saja, sisanya dari sendAllStateTo
+    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+    
+    // Kirim semua state (sudah include numberKursiSaya, muteTypeResponse, dll)
+    await this.sendAllStateTo(ws, room);
+    
+    return true;
+    
+  } catch (error) {
+    console.error("Error joining room:", error);
+    return false;
+  } finally {
+    release();
   }
+}
   
   async _removeUserFromCurrentRoom(userId, room, seatNumber, keepSeatData = false) {
     const storageManager = this.storageManagers.get(room);
