@@ -1,4 +1,4 @@
-// index.js - ChatServer2 untuk Durable Object (Optimized for Android Client)
+// index.js - ChatServer2 untuk Durable Object (FULL FIXED VERSION)
 import { LowCardGameManager } from "./lowcard.js";
 
 // Constants
@@ -138,6 +138,8 @@ export class ChatServer2 {
     // Storage
     this._roomCountsCache = new Map();
     this._roomSeatCounters = new Map();
+    this._lastCountUpdate = 0;
+    this._countCacheTTL = 1000;
     
     // Client storage
     this.clients = new Set();
@@ -307,12 +309,31 @@ export class ChatServer2 {
   }
 
   // Room count methods
-  getJumlahRoom() {
+  getJumlahRoom(forceRefresh = false) {
+    const now = Date.now();
+    
+    if (!forceRefresh && this._lastCountUpdate && (now - this._lastCountUpdate) < this._countCacheTTL) {
+      const cached = {};
+      for (const room of roomList) {
+        cached[room] = this._roomCountsCache.get(room) || 0;
+      }
+      return cached;
+    }
+    
     const counts = {};
     for (const room of roomList) {
-      counts[room] = this._roomSeatCounters.get(room) || 0;
+      const count = this._roomSeatCounters.get(room) || 0;
+      counts[room] = count;
+      this._roomCountsCache.set(room, count);
     }
+    
+    this._lastCountUpdate = now;
     return counts;
+  }
+  
+  getAllRoomCountsArray() {
+    const counts = this.getJumlahRoom();
+    return roomList.map(room => [room, counts[room]]);
   }
   
   updateRoomCount(room, delta = null) {
@@ -335,6 +356,7 @@ export class ChatServer2 {
     }
     
     this._roomCountsCache.set(room, count);
+    this._lastCountUpdate = Date.now();
     this.broadcastToRoom(room, ["roomUserCount", room, count]);
     return count;
   }
@@ -374,10 +396,12 @@ export class ChatServer2 {
         occupancyMap.set(seatNumber, null);
         const currentCount = this._roomSeatCounters.get(room) || 0;
         this._roomSeatCounters.set(room, Math.max(0, currentCount - 1));
+        this._roomCountsCache.set(room, this._roomSeatCounters.get(room));
       } else if (!wasOccupied && isOccupied) {
         occupancyMap.set(seatNumber, newUsername);
         const currentCount = this._roomSeatCounters.get(room) || 0;
         this._roomSeatCounters.set(room, currentCount + 1);
+        this._roomCountsCache.set(room, this._roomSeatCounters.get(room));
       } else if (wasOccupied && isOccupied && oldUsername !== newUsername) {
         occupancyMap.set(seatNumber, newUsername);
       }
@@ -415,6 +439,7 @@ export class ChatServer2 {
           
           this._roomSeatCounters.set(room, currentCount + 1);
           this._roomCountsCache.set(room, currentCount + 1);
+          this._lastCountUpdate = Date.now();
           return seat;
         }
       }
@@ -506,28 +531,25 @@ export class ChatServer2 {
   }
 
   broadcastToRoom(room, msg) {
-  if (!room || !roomList.includes(room)) return 0;
-  
-  const clientArray = this.roomClients.get(room);
-  if (!clientArray?.length) return 0;
-  
-  const message = JSON.stringify(msg);
-  let sentCount = 0;
-  
-  // Kirim ke semua client di room
-  for (let i = 0; i < clientArray.length; i++) {
-    const client = clientArray[i];
-    // Perhatikan: kirim ke SEMUA client, termasuk yang sedang update
-    if (client && client.readyState === 1 && !client._isClosing) {
-      try { 
-        client.send(message); 
-        sentCount++; 
-      } catch (e) {}
+    if (!room || !roomList.includes(room)) return 0;
+    
+    const clientArray = this.roomClients.get(room);
+    if (!clientArray?.length) return 0;
+    
+    const message = JSON.stringify(msg);
+    let sentCount = 0;
+    
+    for (let i = 0; i < clientArray.length; i++) {
+      const client = clientArray[i];
+      if (client && client.readyState === 1 && client.roomname === room && !client._isClosing) {
+        try { 
+          client.send(message); 
+          sentCount++; 
+        } catch (e) {}
+      }
     }
+    return sentCount;
   }
-  
-  return sentCount;
-}
 
   async sendAllStateTo(ws, room) {
     try {
@@ -573,7 +595,6 @@ export class ChatServer2 {
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       await this.safeSend(ws, ["muteTypeResponse", this.muteStatus.get(room), room]);
       
-      // Kirim nomor kursi user
       const seatInfo = this.userToSeat.get(ws.idtarget);
       if (seatInfo && seatInfo.room === room) {
         await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
@@ -651,6 +672,7 @@ export class ChatServer2 {
           
           const currentSeatCount = this._roomSeatCounters.get(room) || 0;
           this._roomSeatCounters.set(room, currentSeatCount + 1);
+          this._roomCountsCache.set(room, currentSeatCount + 1);
           
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
@@ -725,6 +747,7 @@ export class ChatServer2 {
         occupancyMap.set(seatNumber, null);
         const currentCount = this._roomSeatCounters.get(room) || 0;
         this._roomSeatCounters.set(room, Math.max(0, currentCount - 1));
+        this._roomCountsCache.set(room, this._roomSeatCounters.get(room));
       }
     }
     
@@ -833,6 +856,7 @@ export class ChatServer2 {
               this.broadcastToRoom(currentRoom, ["removeKursi", currentRoom, i]);
               const currentCount = this._roomSeatCounters.get(currentRoom) || 0;
               this._roomSeatCounters.set(currentRoom, Math.max(0, currentCount - 1));
+              this._roomCountsCache.set(currentRoom, this._roomSeatCounters.get(currentRoom));
               break;
             }
           }
@@ -1312,10 +1336,7 @@ export class ChatServer2 {
           break;
         }
         case "getAllRoomsUserCount": {
-          const result = [];
-          for (const room of roomList) {
-            result.push({ roomName: room, userCount: this.getRoomCount(room) });
-          }
+          const result = this.getAllRoomCountsArray();
           await this.safeSend(ws, ["allRoomsUserCount", result]);
           break;
         }
@@ -1434,55 +1455,45 @@ export class ChatServer2 {
           this.updateRoomCount(room);
           break;
         }
-       case "updateKursi": {
-  const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
-  
-  if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
-  if (ws.roomname !== room || !roomList.includes(room)) return;
-  if (namauser !== ws.idtarget) return;
-  
-  const oldSeatInfo = this.roomSeats.get(room)?.get(seat);
-  
-  const updatedSeat = await this.updateSeatAtomic(room, seat, () => ({
-    noimageUrl: noimageUrl?.slice(0, 255) || "", 
-    namauser: namauser || "", 
-    color: color || "",
-    itembawah: itembawah || 0,
-    itematas: itematas || 0,
-    vip: vip || 0,
-    viptanda: viptanda || 0,
-    lastPoint: oldSeatInfo?.lastPoint || null,
-    lastUpdated: Date.now()
-  }));
-  
-  if (!updatedSeat) {
-    await this.safeSend(ws, ["error", "Failed to update seat"]);
-    return;
-  }
-  
-  if (namauser === ws.idtarget) {
-    this.userToSeat.set(namauser, { room, seat });
-    this.userCurrentRoom.set(namauser, room);
-  }
-  
-  // 🔥 KIRIM KE SEMUA USER DI ROOM (termasuk pengirim)
-  // Gunakan event yang sama dengan allUpdateKursiList
-  const response = ["allUpdateKursiList", room, {
-    [seat]: {
-      noimageUrl: noimageUrl || "",
-      namauser: namauser || "",
-      color: color || "",
-      itembawah: itembawah || 0,
-      itematas: itematas || 0,
-      vip: vip || 0,
-      viptanda: viptanda || 0
-    }
-  }];
-  
-  this.broadcastToRoom(room, response);
-  
-  break;
-}
+        case "updateKursi": {
+          const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
+          
+          if (seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
+          if (ws.roomname !== room || !roomList.includes(room)) return;
+          if (namauser !== ws.idtarget) return;
+          
+          const oldSeatInfo = this.roomSeats.get(room)?.get(seat);
+          
+          const updatedSeat = await this.updateSeatAtomic(room, seat, () => ({
+            noimageUrl: noimageUrl?.slice(0, 255) || "", 
+            namauser: namauser || "", 
+            color: color || "",
+            itembawah: itembawah || 0,
+            itematas: itematas || 0,
+            vip: vip || 0,
+            viptanda: viptanda || 0,
+            lastPoint: oldSeatInfo?.lastPoint || null,
+            lastUpdated: Date.now()
+          }));
+          
+          if (!updatedSeat) {
+            await this.safeSend(ws, ["error", "Failed to update seat"]);
+            return;
+          }
+          
+          if (namauser === ws.idtarget) {
+            this.userToSeat.set(namauser, { room, seat });
+            this.userCurrentRoom.set(namauser, room);
+          }
+          
+          // Kirim ke semua user di room termasuk pengirim
+          const response = ["updateKursiResponse", room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda];
+          this.broadcastToRoom(room, response);
+          await this.safeSend(ws, response);
+          this.updateRoomCount(room);
+          
+          break;
+        }
         case "gift": {
           const [, roomname, sender, receiver, giftName] = data;
           if (ws.roomname !== roomname || ws.idtarget !== sender) return;
@@ -1540,6 +1551,20 @@ export class ChatServer2 {
           }), { 
             status: 200, 
             headers: { "content-type": "application/json" } 
+          });
+        }
+        
+        if (url.pathname === "/debug/roomcounts") {
+          const counts = {};
+          for (const room of roomList) {
+            counts[room] = this.getRoomCount(room);
+          }
+          return new Response(JSON.stringify({
+            counts: counts,
+            total: Object.values(counts).reduce((a,b) => a + b, 0),
+            seatCounters: Object.fromEntries(this._roomSeatCounters)
+          }), {
+            headers: { "content-type": "application/json" }
           });
         }
         
@@ -1622,7 +1647,7 @@ export default {
         return chatObj.fetch(req);
       }
       
-      if (url.pathname === "/health") {
+      if (url.pathname === "/health" || url.pathname === "/debug/roomcounts") {
         return chatObj.fetch(req);
       }
       
