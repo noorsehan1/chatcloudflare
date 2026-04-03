@@ -1918,20 +1918,21 @@ export default {
   async fetch(req, env) {
     try {
       const url = new URL(req.url);
-      
+      const chatId = env.CHAT_SERVER.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER.get(chatId);
+
+      // WebSocket upgrade
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        const id = env.CHAT_SERVER.idFromName("chat-room");
-        const obj = env.CHAT_SERVER.get(id);
-        return obj.fetch(req);
+        return chatObj.fetch(req);
       }
-      
-      if (url.pathname === "/health" || url.pathname === "/metrics" || url.pathname === "/rooms") {
-        const id = env.CHAT_SERVER.idFromName("chat-room");
-        const obj = env.CHAT_SERVER.get(id);
-        return obj.fetch(req);
+
+      // API paths
+      if (["/health", "/metrics", "/rooms"].includes(url.pathname)) {
+        return chatObj.fetch(req);
       }
-      
-      return new Response("WebSocket Chat Server - ChatServer2", { 
+
+      // Default response
+      return new Response("WebSocket Chat Server - ChatServer2", {
         status: 200,
         headers: { "content-type": "text/plain" }
       });
