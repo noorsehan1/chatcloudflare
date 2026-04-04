@@ -4,7 +4,7 @@ import { LowCardGameManager } from "./lowcard.js";
 // Constants
 const CONSTANTS = Object.freeze({
   MAX_SEATS: 35,
-  MAX_CONNECTIONS_PER_USER: 3,
+  MAX_CONNECTIONS_PER_USER: 1,
   GRACE_PERIOD: 5000,
   MAX_MESSAGE_SIZE: 10000,
   MAX_GLOBAL_CONNECTIONS: 500,
@@ -14,7 +14,7 @@ const CONSTANTS = Object.freeze({
   CLEANUP_INTERVAL: 30000,
   MAX_RATE_LIMIT: 100,
   RATE_WINDOW: 60000,
-  MAX_USER_IDLE: 30 * 60 * 1000,
+  MAX_USER_IDLE: 24 * 60 * 60 * 1000,  // 24 JAM - UNTUK USER OFFLINE
   MAX_ARRAY_SIZE: 500,
   MAX_TIMEOUT_MS: 10000,
   MAX_JSON_DEPTH: 100,
@@ -24,7 +24,7 @@ const CONSTANTS = Object.freeze({
   MAX_ACTIVE_CLIENTS_HISTORY: 2000,
   LOCK_TIMEOUT_MS: 5000,
   PROMISE_TIMEOUT_MS: 30000,
-  MAX_CONNECTION_AGE_MS: 24 * 60 * 60 * 1000,
+  // MAX_CONNECTION_AGE_MS: HAPUS! Tidak perlu
   MAX_HEAP_SIZE_MB: 512,
   GC_INTERVAL_MS: 5 * 60 * 1000
 });
@@ -64,7 +64,6 @@ class MemoryMonitor {
   
   check() {
     try {
-      // Force garbage collection if available (Node.js flag required)
       if (global.gc) {
         global.gc();
       }
@@ -84,9 +83,7 @@ class MemoryMonitor {
       } else {
         this.consecutiveHighMemory = 0;
       }
-    } catch(e) {
-      // Silently fail in environments without memory monitoring
-    }
+    } catch(e) {}
     return false;
   }
 }
@@ -214,7 +211,7 @@ class SeatData {
   }
 }
 
-// ==================== ROOM MANAGER (DIRECT MAP REPLACE) ====================
+// ==================== ROOM MANAGER ====================
 class RoomManager {
   constructor(roomName) {
     this.roomName = roomName;
@@ -1090,18 +1087,10 @@ export class ChatServer2 {
         }
       }
       
+      // HANYA UNTUK USER OFFLINE (sudah tidak punya koneksi)
       for (const [userId, lastSeen] of this.userLastSeen) {
         if (now - lastSeen > CONSTANTS.MAX_USER_IDLE) {
           await this.forceUserCleanup(userId);
-        }
-      }
-      
-      for (let i = 0; i < this._activeClients.length; i++) {
-        const ws = this._activeClients[i];
-        if (ws && ws._connectionTime && (now - ws._connectionTime) > CONSTANTS.MAX_CONNECTION_AGE_MS) {
-          console.log(`[CLEANUP] Closing old connection (${now - ws._connectionTime}ms old)`);
-          this.safeWebSocketCleanup(ws);
-          i--;
         }
       }
       
@@ -1814,7 +1803,6 @@ export class ChatServer2 {
     }
     this.lowcard = null;
     
-    const closePromises = [];
     for (const ws of this._activeClients) {
       if (ws && ws.readyState === 1 && !ws._isClosing) {
         try {
