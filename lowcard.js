@@ -1,5 +1,5 @@
 // ============================
-// LowCardGameManager (COMPLETELY FIXED - NO MEMORY LEAK, NO CRASH, NO RESTART)
+// LowCardGameManager (FIXED - DENGAN PERHITUNGAN BET YANG BENAR)
 // ============================
 export class LowCardGameManager {
   constructor(chatServer) {
@@ -62,6 +62,9 @@ export class LowCardGameManager {
       const now = Date.now();
       const staleGames = [];
       
+      // ✅ PERBAIKAN 1: Batasi jumlah game maksimal (100)
+      const MAX_GAMES = 100;
+      
       for (const [room, game] of this.activeGames.entries()) {
         if (!game) {
           staleGames.push(room);
@@ -70,9 +73,27 @@ export class LowCardGameManager {
         
         if (game._createdAt && (now - game._createdAt) > 3600000) {
           staleGames.push(room);
+          continue;
         }
         
         if (game.players && game.players.size === 0) {
+          staleGames.push(room);
+          continue;
+        }
+        
+        if (!game._isActive) {
+          staleGames.push(room);
+          continue;
+        }
+      }
+      
+      // ✅ Jika masih kelebihan, hapus yang paling tua
+      if (this.activeGames.size - staleGames.length > MAX_GAMES) {
+        const activeGamesList = Array.from(this.activeGames.entries())
+          .filter(([room]) => !staleGames.includes(room));
+        activeGamesList.sort((a, b) => (a[1]._createdAt || 0) - (b[1]._createdAt || 0));
+        const toRemove = activeGamesList.slice(0, activeGamesList.length - MAX_GAMES);
+        for (const [room] of toRemove) {
           staleGames.push(room);
         }
       }
@@ -169,6 +190,54 @@ export class LowCardGameManager {
     }
   }
 
+  _hasEnoughCoin(userId, amount) {
+    try {
+      if (this.chatServer && this.chatServer.getUserCoin) {
+        return this.chatServer.getUserCoin(userId) >= amount;
+      }
+      return true;
+    } catch (error) {
+      this._errorHandler(error, `hasEnoughCoin ${userId}`);
+      return false;
+    }
+  }
+
+  _deductCoin(userId, amount) {
+    try {
+      if (this.chatServer && this.chatServer.deductUserCoin) {
+        return this.chatServer.deductUserCoin(userId, amount);
+      }
+      return true;
+    } catch (error) {
+      this._errorHandler(error, `deductCoin ${userId}`);
+      return false;
+    }
+  }
+
+  _refundCoin(userId, amount) {
+    try {
+      if (this.chatServer && this.chatServer.addUserCoin) {
+        return this.chatServer.addUserCoin(userId, amount);
+      }
+      return true;
+    } catch (error) {
+      this._errorHandler(error, `refundCoin ${userId}`);
+      return false;
+    }
+  }
+
+  _awardCoin(userId, amount) {
+    try {
+      if (this.chatServer && this.chatServer.addUserCoin) {
+        return this.chatServer.addUserCoin(userId, amount);
+      }
+      return true;
+    } catch (error) {
+      this._errorHandler(error, `awardCoin ${userId}`);
+      return false;
+    }
+  }
+
   handleEvent(ws, data) {
     try {
       if (this._destroyed || !ws || !data || !Array.isArray(data) || data.length === 0) return;
@@ -225,6 +294,15 @@ export class LowCardGameManager {
         return;
       }
 
+      if (betAmount > 0 && !this._hasEnoughCoin(ws.idtarget, betAmount)) {
+        this._safeSend(ws, ["gameLowCardError", "Not enough coins"]);
+        return;
+      }
+
+      if (betAmount > 0) {
+        this._deductCoin(ws.idtarget, betAmount);
+      }
+
       const game = {
         room: room,
         players: new Map(),
@@ -236,9 +314,7 @@ export class LowCardGameManager {
         eliminated: new Set(),
         winner: null,
         betAmount: betAmount,
-        countdownTimers: [],
-        _botTimers: [],
-        _botDrawTimeouts: new Set(),
+        totalPot: betAmount,
         registrationTime: 25,
         drawTime: 30,
         hostId: ws.idtarget,
@@ -255,7 +331,8 @@ export class LowCardGameManager {
 
       game.players.set(ws.idtarget, { 
         id: ws.idtarget, 
-        name: ws.username || ws.idtarget 
+        name: ws.username || ws.idtarget,
+        bet: betAmount
       });
 
       this.activeGames.set(room, game);
@@ -351,8 +428,14 @@ export class LowCardGameManager {
         if (!game.players) game.players = new Map();
         if (!game.botPlayers) game.botPlayers = new Map();
         
-        game.players.set(botId, { id: botId, name: botName });
+        game.players.set(botId, { 
+          id: botId, 
+          name: botName,
+          bet: game.betAmount
+        });
         game.botPlayers.set(botId, botName);
+        
+        game.totalPot += game.betAmount;
         
         this._safeBroadcast(room, ["gameLowCardJoin", botName, game.betAmount]);
       }
@@ -374,6 +457,10 @@ export class LowCardGameManager {
       const playerCount = game.players.size;
       
       if (playerCount < 2) {
+        if (game.betAmount > 0 && game.hostId) {
+          this._refundCoin(game.hostId, game.betAmount);
+        }
+
         if (this.chatServer && this.chatServer.clients) {
           for (const client of this.chatServer.clients) {
             if (client && client.idtarget === game.hostId && client.readyState === 1) {
@@ -596,12 +683,26 @@ export class LowCardGameManager {
         return;
       }
 
+      const playerBet = game.betAmount;
+      
+      if (playerBet > 0 && !this._hasEnoughCoin(ws.idtarget, playerBet)) {
+        this._safeSend(ws, ["gameLowCardError", "Not enough coins"]);
+        return;
+      }
+
+      if (playerBet > 0) {
+        this._deductCoin(ws.idtarget, playerBet);
+      }
+
+      game.totalPot += playerBet;
+
       game.players.set(ws.idtarget, { 
         id: ws.idtarget, 
-        name: ws.username || ws.idtarget 
+        name: ws.username || ws.idtarget,
+        bet: playerBet
       });
 
-      this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
+      this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, playerBet]);
       
     } catch (error) {
       this._errorHandler(error, 'joinGame');
@@ -703,12 +804,24 @@ export class LowCardGameManager {
   }
 
   _evaluateRound(room) {
+    // ✅ PERBAIKAN 2: Timeout protection
+    const startTime = Date.now();
+    const MAX_EVALUATION_TIME = 10000;
+    
     try {
       const game = this._safeGetGame(room);
       if (!game || !game._isActive || this._destroyed) return;
       
-      if (game._evaluating) return;
+      if (game._evaluating) {
+        if (Date.now() - (game._evaluatingStart || 0) > 10000) {
+          console.log(`[LowCardGame] Force ending stuck game in ${room}`);
+          this.endGame(room);
+        }
+        return;
+      }
+      
       game._evaluating = true;
+      game._evaluatingStart = Date.now();
       
       try {
         if (!game.players || game.players.size === 0) {
@@ -721,11 +834,17 @@ export class LowCardGameManager {
         const players = game.players || new Map();
         const eliminated = game.eliminated || new Set();
         const round = game.round || 1;
-        const betAmount = game.betAmount || 0;
         
         if (!numbers || typeof numbers.entries !== 'function') {
           this._errorHandler(new Error('Invalid numbers map'), 'evaluateRound');
           this.activeGames.delete(room);
+          return;
+        }
+        
+        // ✅ CEK TIMEOUT
+        if (Date.now() - startTime > MAX_EVALUATION_TIME) {
+          console.log(`[LowCardGame] Evaluation timeout in ${room}`);
+          this.endGame(room);
           return;
         }
         
@@ -771,10 +890,16 @@ export class LowCardGameManager {
           const winnerId = entries[0][0];
           const winnerPlayer = players.get(winnerId);
           const winnerName = winnerPlayer?.name || winnerId;
-          const totalCoin = betAmount * players.size;
+          
+          // ✅ PERBAIKAN 3: Validasi totalPot tidak negatif
+          const totalPot = Math.max(0, game.totalPot || 0);
           game.winner = winnerId;
           
-          this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
+          if (totalPot > 0) {
+            this._awardCoin(winnerId, totalPot);
+          }
+          
+          this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalPot]);
           this.activeGames.delete(room);
           return;
         }
@@ -795,10 +920,16 @@ export class LowCardGameManager {
           const winnerId = newRemaining[0];
           const winnerPlayer = players.get(winnerId);
           const winnerName = winnerPlayer?.name || winnerId;
-          const totalCoin = betAmount * players.size;
+          
+          // ✅ PERBAIKAN 3: Validasi totalPot tidak negatif
+          const totalPot = Math.max(0, game.totalPot || 0);
           game.winner = winnerId;
           
-          this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
+          if (totalPot > 0) {
+            this._awardCoin(winnerId, totalPot);
+          }
+          
+          this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalPot]);
           this.activeGames.delete(room);
           return;
         }
@@ -839,14 +970,18 @@ export class LowCardGameManager {
         
       } finally {
         game._evaluating = false;
+        delete game._evaluatingStart;
       }
       
     } catch (error) {
       this._errorHandler(error, 'evaluateRound');
       try {
         const game = this.activeGames.get(room);
-        if (game) game._evaluating = false;
-        this.activeGames.delete(room);
+        if (game) {
+          game._evaluating = false;
+          delete game._evaluatingStart;
+        }
+        this.endGame(room);
       } catch (e) {}
     }
   }
