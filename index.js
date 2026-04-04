@@ -570,12 +570,12 @@ export class ChatServer2 {
     }
   }
   
-  _removeFromActiveClients(ws) {
-    const index = this._activeClients.indexOf(ws);
-    if (index > -1) {
-      this._activeClients[index] = null;
-    }
+ _removeFromActiveClients(ws) {
+  const index = this._activeClients.indexOf(ws);
+  if (index > -1) {
+    this._activeClients.splice(index, 1);  // ← LANGSUNG HAPUS, BUKAN SET NULL
   }
+}
   
   _cleanupNullClients(room) {
     const clientArray = this.roomClients.get(room);
@@ -585,17 +585,16 @@ export class ChatServer2 {
   }
 
   _removeFromRoomClients(ws, room) {
-    if (!ws || !room) return;
-    
-    const clientArray = this.roomClients.get(room);
-    if (clientArray) {
-      const index = clientArray.indexOf(ws);
-      if (index > -1) {
-        clientArray[index] = null;
-      }
+  if (!ws || !room) return;
+  
+  const clientArray = this.roomClients.get(room);
+  if (clientArray) {
+    const index = clientArray.indexOf(ws);
+    if (index > -1) {
+      clientArray.splice(index, 1);  // ← LANGSUNG HAPUS, BUKAN SET NULL
     }
   }
-
+}
   // ==================== OPTIMIZED WEB SOCKET METHODS ====================
   
   getCachedMessage(key, data) {
@@ -989,8 +988,9 @@ export class ChatServer2 {
         let changed = false;
         for (let i = 0; i < clientArray.length; i++) {
           if (clientArray[i]?.idtarget === userId) {
-            clientArray[i] = null;
+            clientArray.splice(i, 1);  // ← LANGSUNG HAPUS
             changed = true;
+            i--; // Adjust index after splice
           }
         }
         if (changed) {
@@ -1001,7 +1001,8 @@ export class ChatServer2 {
     
     for (let i = 0; i < this._activeClients.length; i++) {
       if (this._activeClients[i]?.idtarget === userId) {
-        this._activeClients[i] = null;
+        this._activeClients.splice(i, 1);  // ← LANGSUNG HAPUS
+        i--; // Adjust index after splice
       }
     }
     
@@ -1010,7 +1011,7 @@ export class ChatServer2 {
   } finally {
     release();
   }
-  }
+}
 
 async safeWebSocketCleanup(ws) {
   if (!ws) return;
