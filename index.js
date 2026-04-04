@@ -323,7 +323,7 @@ class StorageManager {
 }
 
 // ==================== MAIN CHATSERVER2 CLASS ====================
-export class ChatServer3 {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
