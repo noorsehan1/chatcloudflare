@@ -14,7 +14,7 @@ const CONSTANTS = Object.freeze({
   CLEANUP_INTERVAL: 30000,
   MAX_RATE_LIMIT: 100,
   RATE_WINDOW: 60000,
-  MAX_USER_IDLE: 24 * 60 * 60 * 1000,  // 24 JAM - UNTUK USER OFFLINE
+  MAX_USER_IDLE: 24 * 60 * 60 * 1000,
   MAX_ARRAY_SIZE: 500,
   MAX_TIMEOUT_MS: 10000,
   MAX_JSON_DEPTH: 100,
@@ -24,9 +24,6 @@ const CONSTANTS = Object.freeze({
   MAX_ACTIVE_CLIENTS_HISTORY: 2000,
   LOCK_TIMEOUT_MS: 5000,
   PROMISE_TIMEOUT_MS: 30000,
-  // MAX_CONNECTION_AGE_MS: HAPUS! Tidak perlu
-  MAX_HEAP_SIZE_MB: 512,
-  GC_INTERVAL_MS: 5 * 60 * 1000
 });
 
 // Room list
@@ -48,14 +45,17 @@ class MemoryMonitor {
     this.lastCheck = Date.now();
     this.consecutiveHighMemory = 0;
     this.gcInterval = null;
+    this.isRunning = false;
   }
   
   start() {
-    if (this.gcInterval) return;
-    this.gcInterval = setInterval(() => this.check(), CONSTANTS.GC_INTERVAL_MS);
+    if (this.isRunning) return;
+    this.isRunning = true;
+    this.gcInterval = setInterval(() => this.check(), 60000);
   }
   
   stop() {
+    this.isRunning = false;
     if (this.gcInterval) {
       clearInterval(this.gcInterval);
       this.gcInterval = null;
@@ -63,27 +63,26 @@ class MemoryMonitor {
   }
   
   check() {
+    if (!this.isRunning) return false;
+    
     try {
-      if (global.gc) {
-        global.gc();
-      }
-      
       const memoryUsage = process.memoryUsage?.() || { heapUsed: 0, heapTotal: 0 };
       const heapUsedMB = memoryUsage.heapUsed / 1024 / 1024;
       
-      if (heapUsedMB > CONSTANTS.MAX_HEAP_SIZE_MB) {
+      if (heapUsedMB > 400) {
         this.consecutiveHighMemory++;
         console.log(`[MEMORY] High memory usage: ${heapUsedMB.toFixed(2)} MB (${this.consecutiveHighMemory})`);
         
-        if (this.consecutiveHighMemory >= 3) {
-          console.log("[MEMORY] Triggering aggressive cleanup");
+        if (this.consecutiveHighMemory >= 5) {
+          console.log("[MEMORY] Persistent high memory detected");
           this.consecutiveHighMemory = 0;
-          return true;
         }
       } else {
         this.consecutiveHighMemory = 0;
       }
-    } catch(e) {}
+    } catch(e) {
+      // Ignore errors in memory monitoring
+    }
     return false;
   }
 }
@@ -94,10 +93,28 @@ class RateLimiter {
     this.windowMs = windowMs;
     this.maxRequests = maxRequests;
     this.requests = new Map();
-    this._cleanupInterval = setInterval(() => this.cleanup(), 60000);
+    this._cleanupInterval = null;
     this._isDestroyed = false;
+    // FIX: Jangan auto-start, biarkan ChatServer2 yang mengontrol
   }
-
+  
+  _startCleanup() {
+    if (this._cleanupInterval) clearInterval(this._cleanupInterval);
+    this._cleanupInterval = setInterval(() => this.cleanup(), 60000);
+  }
+  
+  start() {
+    if (this._isDestroyed) return;
+    this._startCleanup();
+  }
+  
+  stop() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+  }
+  
   check(userId) {
     if (!userId || this._isDestroyed) return true;
     
@@ -143,10 +160,7 @@ class RateLimiter {
   
   destroy() {
     this._isDestroyed = true;
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval);
-      this._cleanupInterval = null;
-    }
+    this.stop();
     this.requests.clear();
   }
 }
@@ -373,7 +387,7 @@ export class ChatServer2 {
     this._ipConnectionCount = new Map();
     
     this.rateLimiter = new RateLimiter();
-    this._wsEventListeners = new WeakMap();
+    this._wsEventListeners = new Map();
     this._cleanupInterval = null;
     this._promiseCleanupInterval = null;
     
@@ -401,6 +415,7 @@ export class ChatServer2 {
     this.startNumberTickTimer();
     this._startPeriodicCleanup();
     this._startPromiseCleanup();
+    this.rateLimiter.start();  // FIX: Start rate limiter
     this.memoryMonitor.start();
   }
   
@@ -850,9 +865,9 @@ export class ChatServer2 {
     this._promiseCleanupInterval = setInterval(() => {
       if (this._pendingPromises.size > 100) {
         const now = Date.now();
-        for (const [promise, timestamp] of this._pendingPromises) {
-          if (now - timestamp > CONSTANTS.PROMISE_TIMEOUT_MS) {
-            this._pendingPromises.delete(promise);
+        for (const [key, data] of this._pendingPromises) {
+          if (now - data.timestamp > CONSTANTS.PROMISE_TIMEOUT_MS) {
+            this._pendingPromises.delete(key);
           }
         }
       }
@@ -943,6 +958,7 @@ export class ChatServer2 {
     }
   }
   
+  // FIX: Perbaikan total untuk safeWebSocketCleanup - hapus semua event listeners dan timers
   async safeWebSocketCleanup(ws) {
     if (!ws) return;
     
@@ -953,6 +969,22 @@ export class ChatServer2 {
       ws._isClosing = true;
       this.clients.delete(ws);
       this._removeFromActiveClients(ws);
+      
+      // FIX: Hapus semua event listeners dari Map
+      const handlers = this._wsEventListeners.get(ws);
+      if (handlers) {
+        if (handlers.message) ws.removeEventListener("message", handlers.message);
+        if (handlers.error) ws.removeEventListener("error", handlers.error);
+        if (handlers.close) ws.removeEventListener("close", handlers.close);
+        this._wsEventListeners.delete(ws);
+      }
+      
+      // FIX: Hapus promise yang terkait dengan ws ini
+      for (const [key, data] of this._pendingPromises) {
+        if (data.userId === userId) {
+          this._pendingPromises.delete(key);
+        }
+      }
       
       if (userId) {
         this._removeUserConnection(userId, ws);
@@ -971,21 +1003,11 @@ export class ChatServer2 {
             });
           }
           
-          const timerId = setTimeout(async () => {
-            try {
-              this.disconnectedTimers.delete(userId);
-              this._pendingReconnections.delete(userId);
-              const stillNoConnection = !(await this.isUserStillConnected(userId));
-              if (stillNoConnection) {
-                await this.forceUserCleanup(userId);
-              }
-            } catch (error) {
-              console.error("Error in cleanup timer:", error);
-            }
-          }, CONSTANTS.GRACE_PERIOD);
-          
-          timerId._scheduledTime = Date.now();
-          this.disconnectedTimers.set(userId, timerId);
+          // FIX: Timer akan dihapus di _periodicCleanup() setelah timeout
+          // Tidak perlu clear manual di sini
+        } else {
+          // FIX: Jika masih ada koneksi lain, hapus data reconnection
+          this._pendingReconnections.delete(userId);
         }
       }
       
@@ -997,16 +1019,7 @@ export class ChatServer2 {
         try { ws.close(1000, "Normal closure"); } catch (e) {}
       }
       
-      const listeners = this._wsEventListeners.get(ws);
-      if (listeners) {
-        listeners.forEach(({ event, handler }) => {
-          try {
-            ws.removeEventListener(event, handler);
-          } catch(e) {}
-        });
-        this._wsEventListeners.delete(ws);
-      }
-      
+      // Cleanup properties
       ws._chatServer = null;
       ws._ip = null;
       ws._connectionTime = null;
@@ -1072,6 +1085,7 @@ export class ChatServer2 {
         }
       }
       
+      // FIX: Bersihkan semua timer yang sudah timeout
       for (const [userId, timer] of this.disconnectedTimers) {
         if (timer._scheduledTime && (now - timer._scheduledTime) > CONSTANTS.GRACE_PERIOD + 5000) {
           clearTimeout(timer);
@@ -1119,10 +1133,7 @@ export class ChatServer2 {
       
       this.rateLimiter.cleanup();
       
-      const needsCleanup = this.memoryMonitor.check();
-      if (needsCleanup) {
-        await this.forceGlobalCleanup();
-      }
+      this.memoryMonitor.check();
       
       if (!this._lastCleanupLog || now - this._lastCleanupLog > 3600000) {
         const activeReal = this._activeClients.filter(c => c?.readyState === 1).length;
@@ -1137,6 +1148,7 @@ export class ChatServer2 {
   async forceGlobalCleanup() {
     console.log("[CLEANUP] Forcing global cleanup due to high memory");
     
+    // FIX: Bersihkan semua timer di disconnectedTimers
     for (const [userId, timer] of this.disconnectedTimers) {
       clearTimeout(timer);
     }
@@ -1152,10 +1164,6 @@ export class ChatServer2 {
     }
     
     this.refreshRoomCounts();
-    
-    if (global.gc) {
-      global.gc();
-    }
   }
   
   setRoomMute(roomName, isMuted) {
@@ -1345,6 +1353,7 @@ export class ChatServer2 {
     }
   }
   
+  // FIX: Perbaikan handleMessage dengan validasi input yang lebih kuat dan promise tracking yang benar
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
     
@@ -1367,24 +1376,69 @@ export class ChatServer2 {
       return;
     }
     
-    if (messageStr.includes('__proto__') || messageStr.includes('constructor')) {
-      return;
-    }
-    
+    // FIX: Validasi input yang lebih kuat
     let data;
     try {
-      data = JSON.parse(messageStr);
+      const parsed = JSON.parse(messageStr);
+      
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        return;
+      }
+      
+      for (let i = 0; i < parsed.length; i++) {
+        const item = parsed[i];
+        const type = typeof item;
+        
+        if (type !== 'string' && type !== 'number' && type !== 'boolean' && item !== null) {
+          console.warn(`[SECURITY] Invalid message type at index ${i}: ${type}`);
+          return;
+        }
+        
+        if (type === 'string') {
+          const suspicious = ['__proto__', 'constructor', 'prototype', '__defineGetter__', '__defineSetter__'];
+          for (const pattern of suspicious) {
+            if (item.includes(pattern)) {
+              console.warn(`[SECURITY] Suspicious string detected: ${pattern}`);
+              return;
+            }
+          }
+        }
+      }
+      
+      data = parsed;
     } catch (e) {
       try { ws.close(1008, "Protocol error"); } catch {}
       return;
     }
     
-    if (!Array.isArray(data) || data.length === 0) return;
     const evt = data[0];
     
-    this._processMessage(ws, data, evt).catch(error => {
-      console.error("Message processing error:", error);
+    // FIX: Promise tracking dengan timeout yang benar
+    const promiseKey = Symbol('promise');
+    const timeoutId = setTimeout(() => {
+      if (this._pendingPromises.has(promiseKey)) {
+        console.error(`[PROMISE] Timeout for user ${ws.idtarget || 'unknown'}, event: ${evt}`);
+        this._pendingPromises.delete(promiseKey);
+      }
+    }, CONSTANTS.PROMISE_TIMEOUT_MS);
+    
+    this._pendingPromises.set(promiseKey, {
+      timestamp: Date.now(),
+      userId: ws.idtarget || 'unknown',
+      event: evt
     });
+    
+    try {
+      await this._processMessage(ws, data, evt);
+    } catch (error) {
+      console.error(`[ERROR] Processing event ${evt}:`, error);
+      try {
+        await this.safeSend(ws, ["error", "Failed to process message"]);
+      } catch (e) {}
+    } finally {
+      clearTimeout(timeoutId);
+      this._pendingPromises.delete(promiseKey);
+    }
   }
   
   async _processMessage(ws, data, evt) {
@@ -1710,6 +1764,7 @@ export class ChatServer2 {
       }
     } catch (error) {
       console.error("Error processing message:", error);
+      throw error;
     }
   }
   
@@ -1770,28 +1825,40 @@ export class ChatServer2 {
     };
   }
   
+  // FIX: Perbaikan shutdown - clear semua timer dan cleanup menyeluruh
   async shutdown() {
     if (this._isClosing) return;
     this._isClosing = true;
     
     console.log("[SHUTDOWN] Starting graceful shutdown...");
     
+    // Clear NUMBER tick timer
     if (this.numberTickTimer) {
       clearTimeout(this.numberTickTimer);
       this.numberTickTimer = null;
     }
     
+    // Clear CLEANUP interval
     if (this._cleanupInterval) {
       clearInterval(this._cleanupInterval);
       this._cleanupInterval = null;
     }
     
+    // Clear PROMISE cleanup interval
     if (this._promiseCleanupInterval) {
       clearInterval(this._promiseCleanupInterval);
       this._promiseCleanupInterval = null;
     }
     
-    this.memoryMonitor.stop();
+    // Clear MEMORY MONITOR interval
+    if (this.memoryMonitor) {
+      this.memoryMonitor.stop();
+    }
+    
+    // Stop RATE LIMITER
+    if (this.rateLimiter) {
+      this.rateLimiter.stop();
+    }
     
     if (this.lowcard && typeof this.lowcard.destroy === 'function') {
       try {
@@ -1803,6 +1870,7 @@ export class ChatServer2 {
     }
     this.lowcard = null;
     
+    // Tutup semua koneksi WebSocket yang masih aktif
     for (const ws of this._activeClients) {
       if (ws && ws.readyState === 1 && !ws._isClosing) {
         try {
@@ -1811,33 +1879,41 @@ export class ChatServer2 {
       }
     }
     
-    for (const timer of this.disconnectedTimers.values()) {
+    // FIX: Bersihkan semua timer di disconnectedTimers
+    for (const [userId, timer] of this.disconnectedTimers) {
       clearTimeout(timer);
     }
+    this.disconnectedTimers.clear();
+    this._pendingReconnections.clear();
     
-    if (this.rateLimiter) {
-      this.rateLimiter.destroy();
-      this.rateLimiter = null;
+    // Bersihkan semua event listeners
+    for (const [ws, handlers] of this._wsEventListeners) {
+      if (handlers) {
+        if (handlers.message) ws.removeEventListener("message", handlers.message);
+        if (handlers.error) ws.removeEventListener("error", handlers.error);
+        if (handlers.close) ws.removeEventListener("close", handlers.close);
+      }
     }
     
+    // Destroy all room managers
     for (const roomManager of this.roomManagers.values()) {
       roomManager.destroy();
     }
     
+    // Bersihkan semua Map dan Set
     this.clients.clear();
     this._activeClients = [];
     this.userToSeat.clear();
     this.userCurrentRoom.clear();
     this.userConnections.clear();
     this.roomClients.clear();
-    this.disconnectedTimers.clear();
-    this._pendingReconnections.clear();
     this.userLastSeen.clear();
     this.userIPs.clear();
     this._ipConnectionCount.clear();
     this._roomCountsCache.clear();
     this.roomManagers.clear();
     this._pendingPromises.clear();
+    this._wsEventListeners.clear();
     
     console.log("[SHUTDOWN] Shutdown complete");
   }
@@ -1930,8 +2006,7 @@ export class ChatServer2 {
       this.clients.add(ws);
       this._activeClients.push(ws);
       
-      const listeners = [];
-      
+      // Buat event handlers dengan referensi yang bisa di-cleanup nanti
       const messageHandler = (ev) => {
         this.handleMessage(ws, ev.data).catch(() => {});
       };
@@ -1948,12 +2023,12 @@ export class ChatServer2 {
       ws.addEventListener("error", errorHandler);
       ws.addEventListener("close", closeHandler);
       
-      listeners.push(
-        { event: "message", handler: messageHandler },
-        { event: "error", handler: errorHandler },
-        { event: "close", handler: closeHandler }
-      );
-      this._wsEventListeners.set(ws, listeners);
+      // Simpan semua handler di Map untuk cleanup nanti
+      this._wsEventListeners.set(ws, {
+        message: messageHandler,
+        error: errorHandler,
+        close: closeHandler
+      });
       
       return new Response(null, { status: 101, webSocket: client });
       
