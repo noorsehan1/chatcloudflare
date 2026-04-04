@@ -1,4 +1,4 @@
-/ index.js - ChatServer2 untuk Durable Object
+// index.js - ChatServer2 untuk Durable Object
 import { LowCardGameManager } from "./lowcard.js";
 
 
@@ -906,36 +906,32 @@ export class ChatServer2 {
   }
   
   scheduleCleanup(userId) {
-  if (!userId) return;
-  this.cancelCleanup(userId);
-  
-  const userData = {
-    seatInfo: this.userToSeat.get(userId),
-    currentRoom: this.userCurrentRoom.get(userId),
-    connections: this.userConnections.get(userId)
-  };
-  this._pendingReconnections.set(userId, userData);
-  
-  const timerId = setTimeout(async () => {
-    try {
-      // ✅ Bersihkan BEFORE force cleanup
-      this.disconnectedTimers.delete(userId);
-      this._pendingReconnections.delete(userId);
-      
-      const isStillConnected = await this.isUserStillConnected(userId);
-      if (!isStillConnected) {
-        await this.forceUserCleanup(userId);
+    if (!userId) return;
+    this.cancelCleanup(userId);
+    
+    const userData = {
+      seatInfo: this.userToSeat.get(userId),
+      currentRoom: this.userCurrentRoom.get(userId),
+      connections: this.userConnections.get(userId)
+    };
+    this._pendingReconnections.set(userId, userData);
+    
+    const timerId = setTimeout(async () => {
+      try {
+        this.disconnectedTimers.delete(userId);
+        this._pendingReconnections.delete(userId);
+        const isStillConnected = await this.isUserStillConnected(userId);
+        if (!isStillConnected) {
+          await this.forceUserCleanup(userId);
+        }
+      } catch (error) {
+        console.error("Schedule cleanup error:", error);
       }
-    } catch (error) {
-      console.error("Schedule cleanup error:", error);
-    }
-  }, CONSTANTS.GRACE_PERIOD);
-  
-  timerId._scheduledTime = Date.now();
-  this.disconnectedTimers.set(userId, timerId);
-}
-
-
+    }, CONSTANTS.GRACE_PERIOD);
+    
+    timerId._scheduledTime = Date.now();
+    this.disconnectedTimers.set(userId, timerId);
+  }
 
   cancelCleanup(userId) {
   if (!userId) return;
@@ -945,6 +941,7 @@ export class ChatServer2 {
     this.disconnectedTimers.delete(userId);
   }
   
+ this._pendingReconnections.delete(userId);
 }
 
   async isUserStillConnected(userId) {
@@ -958,62 +955,59 @@ export class ChatServer2 {
   }
 
   async forceUserCleanup(userId) {
-  if (!userId) return;
-  
-  const release = await this._locks.acquire(`user_${userId}`);
-  try {
-    this.cancelCleanup(userId);
-    const currentRoom = this.userCurrentRoom.get(userId);
+    if (!userId) return;
     
-    if (currentRoom) {
-      const seatMap = this.roomSeats.get(currentRoom);
-      if (seatMap) {
-        for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) {
-          const seatInfo = seatMap.get(i);
-          if (seatInfo?.namauser === userId) {
-            await this.cleanupUserFromSeat(currentRoom, i, userId, true);
-            break;
+    const release = await this._locks.acquire(`user_${userId}`);
+    try {
+      this.cancelCleanup(userId);
+      const currentRoom = this.userCurrentRoom.get(userId);
+      
+      if (currentRoom) {
+        const seatMap = this.roomSeats.get(currentRoom);
+        if (seatMap) {
+          for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) {
+            const seatInfo = seatMap.get(i);
+            if (seatInfo?.namauser === userId) {
+              await this.cleanupUserFromSeat(currentRoom, i, userId, true);
+              break;
+            }
           }
         }
       }
-    }
-    
-    this.userToSeat.delete(userId);
-    this.userCurrentRoom.delete(userId);
-    this.userConnections.delete(userId);
-    this.userLastSeen.delete(userId);
-    this.userIPs.delete(userId);
-    
-    for (const [room, clientArray] of this.roomClients) {
-      if (clientArray?.length > 0) {
-        let changed = false;
-        for (let i = 0; i < clientArray.length; i++) {
-          if (clientArray[i]?.idtarget === userId) {
-            clientArray[i] = null;
-            changed = true;
+      
+      this.userToSeat.delete(userId);
+      this.userCurrentRoom.delete(userId);
+      this.userConnections.delete(userId);
+      this.userLastSeen.delete(userId);
+      this.userIPs.delete(userId);
+      
+      for (const [room, clientArray] of this.roomClients) {
+        if (clientArray?.length > 0) {
+          let changed = false;
+          for (let i = 0; i < clientArray.length; i++) {
+            if (clientArray[i]?.idtarget === userId) {
+              clientArray[i] = null;
+              changed = true;
+            }
+          }
+          if (changed) {
+            this._cleanupNullClients(room);
           }
         }
-        if (changed) {
-          this._cleanupNullClients(room);
+      }
+      
+      for (let i = 0; i < this._activeClients.length; i++) {
+        if (this._activeClients[i]?.idtarget === userId) {
+          this._activeClients[i] = null;
         }
       }
+      
+      this._saveDebounced();
+      
+    } finally {
+      release();
     }
-    
-    for (let i = 0; i < this._activeClients.length; i++) {
-      if (this._activeClients[i]?.idtarget === userId) {
-        this._activeClients[i] = null;
-      }
-    }
-    
-    this._saveDebounced();
-    
-  } finally {
-    release();
   }
-  
-  // ✅ TAMBAHKAN INI - cleanup pending setelah force cleanup selesai
-  this._pendingReconnections.delete(userId);
-}
 
   // PERBAIKAN KOMPLIT - HANYA METHOD safeWebSocketCleanup YANG DIUBAH
 // File: index.js - ChatServer2 class
@@ -1031,7 +1025,8 @@ async safeWebSocketCleanup(ws) {
     
     if (userId) {
       this._removeUserConnection(userId, ws);
-      this.cancelCleanup(userId);  // ✅ UNCOMMENT - HARUS ADA!
+      // PERBAIKAN: HAPUS baris this.cancelCleanup(userId);
+      // this.cancelCleanup(userId);  ← BARIS INI DIHAPUS
       
       if (!ws._isDuplicate && ws.readyState !== 1) {
         this.scheduleCleanup(userId);
@@ -1060,83 +1055,80 @@ async safeWebSocketCleanup(ws) {
     this.clients.delete(ws);
   }
 }
- 
-
-
- async _periodicCleanup() {
-  const now = Date.now();
-  
-  // ✅ CLEANUP NULL VALUES DI ALL ROOMS (setiap kali)
-  for (const room of this.roomClients.keys()) {
-    this._cleanupNullClients(room);
-  }
-  
-  // ✅ CLEANUP NULL DI ACTIVE CLIENTS
-  const beforeActive = this._activeClients.length;
-  this._activeClients = this._activeClients.filter(c => c !== null && c !== undefined);
-  if (beforeActive !== this._activeClients.length && beforeActive > 100) {
-    console.log(`[CLEANUP] ActiveClients: ${beforeActive} -> ${this._activeClients.length}`);
-  }
-  
-  // ✅ CLEANUP NULL DI CLIENTS SET
-  for (const ws of this.clients) {
-    if (!ws || (ws.readyState !== 1 && ws.readyState !== 0) || ws._isClosing) {
-      this.clients.delete(ws);
-    }
-  }
-  
-  // ✅ CLEANUP USER CONNECTIONS (sudah ada, tapi perbaiki)
-  for (const [userId, connections] of this.userConnections) {
-    const alive = new Set();
-    for (const conn of connections) {
-      if (conn && conn.readyState === 1 && !conn._isClosing) {
-        alive.add(conn);
+  async _periodicCleanup() {
+    const now = Date.now();
+    
+    for (const ws of this.clients) {
+      if (!ws || (ws.readyState !== 1 && ws.readyState !== 0) || ws._isClosing) {
+        this.clients.delete(ws);
       }
     }
-    if (alive.size === 0) {
-      this.userConnections.delete(userId);
-    } else if (alive.size !== connections.size) {
-      this.userConnections.set(userId, alive);
+    
+    for (let i = 0; i < this._activeClients.length; i++) {
+      if (!this._activeClients[i] || this._activeClients[i]._isClosing) {
+        this._activeClients[i] = null;
+      }
+    }
+    
+    for (const [room, clients] of this.roomClients) {
+      let hasNull = false;
+      for (let i = 0; i < clients.length; i++) {
+        if (!clients[i] || clients[i].readyState !== 1 || clients[i]._isClosing) {
+          clients[i] = null;
+          hasNull = true;
+        }
+      }
+      if (hasNull) {
+        this._cleanupNullClients(room);
+      }
+    }
+    
+    for (const [userId, connections] of this.userConnections) {
+      const alive = new Set();
+      for (const conn of connections) {
+        if (conn && conn.readyState === 1 && !conn._isClosing) {
+          alive.add(conn);
+        }
+      }
+      if (alive.size === 0) {
+        this.userConnections.delete(userId);
+      } else if (alive.size !== connections.size) {
+        this.userConnections.set(userId, alive);
+      }
+    }
+    
+    for (const [userId, timer] of this.disconnectedTimers) {
+      if (timer._scheduledTime && (now - timer._scheduledTime) > CONSTANTS.GRACE_PERIOD + 5000) {
+        clearTimeout(timer);
+        this.disconnectedTimers.delete(userId);
+        this._pendingReconnections.delete(userId);
+        await this.forceUserCleanup(userId);
+      }
+    }
+    
+    for (const [userId, lastSeen] of this.userLastSeen) {
+      if (now - lastSeen > CONSTANTS.MAX_USER_IDLE) {
+        await this.forceUserCleanup(userId);
+      }
+    }
+    
+    for (const [userId, timestamps] of this._modWarningLimit) {
+      const recent = timestamps.filter(t => now - t < 60000);
+      if (recent.length === 0) {
+        this._modWarningLimit.delete(userId);
+      } else {
+        this._modWarningLimit.set(userId, recent);
+      }
+    }
+    
+    this.rateLimiter.cleanup();
+    
+    for (const [ip, timestamp] of this.userIPs) {
+      if (now - timestamp > CONSTANTS.RATE_WINDOW * 10) {
+        this.userIPs.delete(ip);
+      }
     }
   }
-  
-  // ✅ CLEANUP TIMER YANG SUDAH EXPIRED TAPI TIDAK TERHAPUS
-  for (const [userId, timer] of this.disconnectedTimers) {
-    if (timer._scheduledTime && (now - timer._scheduledTime) > CONSTANTS.GRACE_PERIOD + 5000) {
-      clearTimeout(timer);
-      this.disconnectedTimers.delete(userId);
-      this._pendingReconnections.delete(userId);
-      await this.forceUserCleanup(userId);
-    }
-  }
-  
-  // ✅ CLEANUP USER IDLE
-  for (const [userId, lastSeen] of this.userLastSeen) {
-    if (now - lastSeen > CONSTANTS.MAX_USER_IDLE) {
-      await this.forceUserCleanup(userId);
-    }
-  }
-  
-  // ✅ CLEANUP MOD WARNING LIMIT
-  for (const [userId, timestamps] of this._modWarningLimit) {
-    const recent = timestamps.filter(t => now - t < 60000);
-    if (recent.length === 0) {
-      this._modWarningLimit.delete(userId);
-    } else {
-      this._modWarningLimit.set(userId, recent);
-    }
-  }
-  
-  // ✅ CLEANUP RATE LIMITER
-  this.rateLimiter.cleanup();
-  
-  // ✅ CLEANUP USER IPS
-  for (const [ip, timestamp] of this.userIPs) {
-    if (now - timestamp > CONSTANTS.RATE_WINDOW * 10) {
-      this.userIPs.delete(ip);
-    }
-  }
-}
 
   // ==================== MUTE & ADMIN METHODS ====================
   
@@ -1934,4 +1926,5 @@ export default {
       console.error("Worker fetch error:", error);
       return new Response("Server error", { status: 500 });
     }
-  }}
+  }
+};
