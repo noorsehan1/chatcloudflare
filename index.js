@@ -1278,84 +1278,81 @@ async _handleJoinRoomInternal(ws, room) {
   }
   
 async handleSetIdTarget2(ws, id, baru) {
-  if (!id || !ws) return;
-  if (!this._validateUserId(id)) {
-    await this.safeSend(ws, ["error", "Invalid user ID"]);
-    return;
-  }
-  
-  try {
-    const existingConnections = this.userConnections.get(id);
-    if (existingConnections && existingConnections.size > 0) {
-      const oldWs = Array.from(existingConnections)[0];
-      if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
-        oldWs._isClosing = true;
-        try {
-          await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]);
-          oldWs.close(1000, "Replaced by new connection");
-        } catch(e) {}
-        this.clients.delete(oldWs);
-        this._removeFromActiveClients(oldWs);
-        if (oldWs.roomname) this._removeFromRoomClients(oldWs, oldWs.roomname);
-        this._removeUserConnection(id, oldWs, true);
-        this._cleanupWebSocketListeners(oldWs);
-      }
-    }
-    
-    // 🔥 FIX: baru === true -> HANYA SET ID, TIDAK KIRIM APAPUN
-    if (baru === true) {
-      ws.idtarget = id;
-      ws.roomname = undefined;
-      ws._isClosing = false;
-      ws._connectionTime = Date.now();
-      this._addUserConnection(id, ws);
-      this._addToActiveClients(ws);
-      // ✅ TIDAK KIRIM joinroomawal
-      // Biarkan client yang inisiatif berikutnya
+    if (!id || !ws) return;
+    if (!this._validateUserId(id)) {
+      await this.safeSend(ws, ["error", "Invalid user ID"]);
       return;
     }
     
-    // 🔥 LOGIKA UNTUK RECONNECT (baru = false / undefined)
-    ws.idtarget = id;
-    ws._isClosing = false;
-    ws._connectionTime = Date.now();
-    this._addToActiveClients(ws);
-    
-    const seatInfo = this.userToSeat.get(id);
-    if (seatInfo) {
-      const { room, seat } = seatInfo;
-      if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
-        const roomManager = this.roomManagers.get(room);
-        if (roomManager) {
-          const seatData = roomManager.getSeat(seat);
-          if (seatData && seatData.namauser === id) {
-            ws.roomname = room;
-            const clientArray = this.roomClients.get(room);
-            if (clientArray && !clientArray.includes(ws)) clientArray.push(ws);
-            this._addUserConnection(id, ws);
-            await this.sendAllStateTo(ws, room);
-            if (seatData.lastPoint) {
-              await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast ? 1 : 0]);
-            }
-            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-            await this.safeSend(ws, ["numberKursiSaya", seat]);
-            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-            return;
-          }
+    try {
+      const existingConnections = this.userConnections.get(id);
+      if (existingConnections && existingConnections.size > 0) {
+        const oldWs = Array.from(existingConnections)[0];
+        if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
+          oldWs._isClosing = true;
+          try {
+            await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]);
+            oldWs.close(1000, "Replaced by new connection");
+          } catch(e) {}
+          this.clients.delete(oldWs);
+          this._removeFromActiveClients(oldWs);
+          if (oldWs.roomname) this._removeFromRoomClients(oldWs, oldWs.roomname);
+          this._removeUserConnection(id, oldWs, true);
+          this._cleanupWebSocketListeners(oldWs);
         }
       }
-      this.userToSeat.delete(id);
-      this.userCurrentRoom.delete(id);
-      if (seatInfo.room) await this.forceUserCleanup(id);
+      
+      if (baru === true) {
+        ws.idtarget = id;
+        ws.roomname = undefined;
+        ws._isClosing = false;
+        ws._connectionTime = Date.now();
+        this._addUserConnection(id, ws);
+        this._addToActiveClients(ws);
+        await this.safeSend(ws, ["joinroomawal"]);
+        return;
+      }
+      
+      ws.idtarget = id;
+      ws._isClosing = false;
+      ws._connectionTime = Date.now();
+      this._addToActiveClients(ws);
+      
+      const seatInfo = this.userToSeat.get(id);
+      if (seatInfo) {
+        const { room, seat } = seatInfo;
+        if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
+          const roomManager = this.roomManagers.get(room);
+          if (roomManager) {
+            const seatData = roomManager.getSeat(seat);
+            if (seatData && seatData.namauser === id) {
+              ws.roomname = room;
+              const clientArray = this.roomClients.get(room);
+              if (clientArray && !clientArray.includes(ws)) clientArray.push(ws);
+              this._addUserConnection(id, ws);
+              await this.sendAllStateTo(ws, room);
+              if (seatData.lastPoint) {
+                await this.safeSend(ws, ["pointUpdated", room, seat, seatData.lastPoint.x, seatData.lastPoint.y, seatData.lastPoint.fast ? 1 : 0]);
+              }
+              await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+              await this.safeSend(ws, ["numberKursiSaya", seat]);
+              await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+              return;
+            }
+          }
+        }
+        this.userToSeat.delete(id);
+        this.userCurrentRoom.delete(id);
+        if (seatInfo.room) await this.forceUserCleanup(id);
+      }
+      
+      this._addUserConnection(id, ws);
+      await this.safeSend(ws, ["needJoinRoom"]);
+    } catch (error) {
+      console.error("Error in handleSetIdTarget2:", error);
+      await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
-    
-    this._addUserConnection(id, ws);
-    await this.safeSend(ws, ["needJoinRoom"]);
-  } catch (error) {
-    console.error("Error in handleSetIdTarget2:", error);
-    await this.safeSend(ws, ["error", "Reconnection failed"]);
-  }
-}
+  } jika flase  need join room  paakh benar
   
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
