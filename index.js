@@ -1120,11 +1120,10 @@ export class ChatServer2 {
           
           this._addUserConnection(ws.idtarget, ws);
           this.userCurrentRoom.set(ws.idtarget, room);
-          await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
-          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-          
+                    await this.sendAllStateTo(ws, room);
+
           return true;
         } else {
           this.userToSeat.delete(ws.idtarget);
@@ -1165,13 +1164,12 @@ export class ChatServer2 {
       if (!clientArray.includes(ws)) clientArray.push(ws);
       
       this._addUserConnection(ws.idtarget, ws);
-      await this.sendAllStateTo(ws, room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-      
+            await this.sendAllStateTo(ws, room);
+
       const roomManager = this.roomManagers.get(room);
-      await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+    
       
       return true;
     } catch (error) {
