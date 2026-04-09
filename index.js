@@ -530,7 +530,7 @@ class ChatBuffer {
 }
 
 // ==================== MAIN CHATSERVER2 CLASS ====================
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
