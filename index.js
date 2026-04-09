@@ -697,7 +697,7 @@ class LowCardGameManagerFixed {
 }
 
 // ==================== MAIN CHATSERVER CLASS ====================
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -1098,57 +1098,88 @@ export class ChatServer2 {
     return withTimeout(this._handleJoinRoomInternal(ws, room), CONSTANTS.PROMISE_TIMEOUT_MS, false);
   }
   
-async _handleJoinRoomInternal(ws, room) {
-  try {
-    // Cek room penuh paling awal
-    if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
-      await this.safeSend(ws, ["roomFull", room]);
+  async _handleJoinRoomInternal(ws, room) {
+    try {
+      const existingSeatInfo = this.userToSeat.get(ws.idtarget);
+      const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
+      
+      if (existingSeatInfo && existingSeatInfo.room === room) {
+        const seatNum = existingSeatInfo.seat;
+        const roomManager = this.roomManagers.get(room);
+        const seatData = roomManager.getSeat(seatNum);
+        
+        if (seatData && seatData.namauser === ws.idtarget) {
+          ws.roomname = room;
+          
+          let clientArray = this.roomClients.get(room);
+          if (!clientArray) {
+            clientArray = [];
+            this.roomClients.set(room, clientArray);
+          }
+          if (!clientArray.includes(ws)) clientArray.push(ws);
+          
+          this._addUserConnection(ws.idtarget, ws);
+          this.userCurrentRoom.set(ws.idtarget, room);
+          await this.sendAllStateTo(ws, room);
+          await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          
+          return true;
+        } else {
+          this.userToSeat.delete(ws.idtarget);
+        }
+      }
+      
+      if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
+        const oldSeatInfo = this.userToSeat.get(ws.idtarget);
+        if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
+          this.removeSeatDirect(currentRoomBeforeJoin, oldSeatInfo.seat);
+          this.broadcastToRoom(currentRoomBeforeJoin, ["removeKursi", currentRoomBeforeJoin, oldSeatInfo.seat]);
+        }
+        this._removeFromRoomClients(ws, currentRoomBeforeJoin);
+        this.userToSeat.delete(ws.idtarget);
+        this.userCurrentRoom.delete(ws.idtarget);
+      }
+      
+      if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
+        await this.safeSend(ws, ["roomFull", room]);
+        return false;
+      }
+      
+      const assignedSeat = this.assignNewSeat(room, ws.idtarget);
+      if (!assignedSeat) { 
+        await this.safeSend(ws, ["roomFull", room]); 
+        return false; 
+      }
+      
+      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+      this.userCurrentRoom.set(ws.idtarget, room);
+      ws.roomname = room;
+      
+      let clientArray = this.roomClients.get(room);
+      if (!clientArray) {
+        clientArray = [];
+        this.roomClients.set(room, clientArray);
+      }
+      if (!clientArray.includes(ws)) clientArray.push(ws);
+      
+      this._addUserConnection(ws.idtarget, ws);
+      await this.sendAllStateTo(ws, room);
+      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+      
+      const roomManager = this.roomManagers.get(room);
+      await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      
+      return true;
+    } catch (error) {
+      console.error("Error joining room:", error);
+      await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     }
-    
-    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
-    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
-    
-    // Keluar dari room lama
-    if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
-      const oldSeatInfo = this.userToSeat.get(ws.idtarget);
-      if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-        this.removeSeatDirect(currentRoomBeforeJoin, oldSeatInfo.seat);
-        this.broadcastToRoom(currentRoomBeforeJoin, ["removeKursi", currentRoomBeforeJoin, oldSeatInfo.seat]);
-      }
-      this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-      this.userToSeat.delete(ws.idtarget);
-      this.userCurrentRoom.delete(ws.idtarget);
-    }
-    
-    const assignedSeat = this.assignNewSeat(room, ws.idtarget);
-    
-    this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
-    this.userCurrentRoom.set(ws.idtarget, room);
-    ws.roomname = room;
-    
-    let clientArray = this.roomClients.get(room);
-    if (!clientArray) {
-      clientArray = [];
-      this.roomClients.set(room, clientArray);
-    }
-    if (!clientArray.includes(ws)) clientArray.push(ws);
-    
-    this._addUserConnection(ws.idtarget, ws);
-    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-    await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-    await this.sendAllStateTo(ws, room);
-
-    const roomManager = this.roomManagers.get(room);
-   
-    
-    return true;
-  } catch (error) {
-    console.error("Error joining room:", error);
-    await this.safeSend(ws, ["error", "Failed to join room"]);
-    return false;
   }
-}
   
   async cleanupFromRoom(ws, room) {
     if (!ws?.idtarget || !ws.roomname) return;
@@ -1277,7 +1308,7 @@ async _handleJoinRoomInternal(ws, room) {
     }
   }
   
-async handleSetIdTarget2(ws, id, baru) {
+  async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
     if (!this._validateUserId(id)) {
       await this.safeSend(ws, ["error", "Invalid user ID"]);
@@ -1352,7 +1383,7 @@ async handleSetIdTarget2(ws, id, baru) {
       console.error("Error in handleSetIdTarget2:", error);
       await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
-  } jika flase  need join room  paakh benar
+  }
   
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
