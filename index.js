@@ -1123,7 +1123,6 @@ export class ChatServer2 {
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
-          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           
           return true;
         } else {
@@ -1171,7 +1170,6 @@ export class ChatServer2 {
       
       const roomManager = this.roomManagers.get(room);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       
       return true;
     } catch (error) {
