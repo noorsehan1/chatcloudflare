@@ -3,9 +3,9 @@ main = "index.js"
 compatibility_date = "2026-04-03"
 
 [[durable_objects.bindings]]
-name = "CHAT_SERVER"
+name = "CHAT_SERVER_2"        # ← UBAH! BEDA dengan Worker 1
 class_name = "ChatServer2"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer2"]  # ← Gunakan new_classes!
+new_classes = ["ChatServer2"]
