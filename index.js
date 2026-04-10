@@ -12,7 +12,7 @@ const CONSTANTS = Object.freeze({
   MAX_CHAT_BUFFER_SIZE: 50,
   MESSAGE_TTL_MS: 8000,
   BUFFER_FLUSH_INTERVAL_MS: 50,
-  MAX_BUFFER_AGE_MS: 5000,  // Used for warning
+  MAX_BUFFER_AGE_MS: 5000,
   BUFFER_ROOM_TTL_MS: 60000,
   
   // CONNECTION LIMITS
@@ -236,13 +236,11 @@ class GlobalChatBuffer {
       return;
     }
     
-    // Jangan add jika queue penuh
     if (this._messageQueue.length >= this.maxQueueSize) {
       this._sendImmediate(room, message);
       return;
     }
     
-    // Warning jika buffer mendekati penuh
     if (this._messageQueue.length > this.WARNING_THRESHOLD) {
       const now = Date.now();
       if (now - this.lastWarningTime > 60000) {
@@ -253,7 +251,6 @@ class GlobalChatBuffer {
     
     const now = Date.now();
     
-    // FIX: Warning jika message sudah lama
     const oldestMessage = this._messageQueue[0];
     if (oldestMessage && now - oldestMessage.timestamp > this.maxAge) {
       const nowTime = Date.now();
@@ -305,12 +302,10 @@ class GlobalChatBuffer {
     
     if (this._messageQueue.length === 0 || !this._flushCallback) return;
     
-    // Cleanup expired messages first
     this._cleanupExpiredMessages();
     
     if (this._messageQueue.length === 0) return;
     
-    // FIX: Use object instead of Map for better performance
     const roomGroups = {};
     const batch = [...this._messageQueue];
     this._messageQueue = [];
@@ -323,7 +318,6 @@ class GlobalChatBuffer {
       roomGroups[item.room].push(item.message);
     }
     
-    // Send messages with error handling
     let errorCount = 0;
     for (const room in roomGroups) {
       const msgs = roomGroups[room];
@@ -341,7 +335,6 @@ class GlobalChatBuffer {
       console.warn(`[GlobalChatBuffer] ${errorCount} messages failed to flush`);
     }
     
-    // Restart timer if there are more messages
     if (this._messageQueue.length > 0 && !this._isDestroyed) {
       this._startTimer();
     }
@@ -385,12 +378,10 @@ class GlobalChatBuffer {
   async destroy() {
     this._isDestroyed = true;
     
-    // Batch flush all messages
     const messages = [...this._messageQueue];
     this._messageQueue = [];
     this._totalQueued = 0;
     
-    // Group by room for efficiency
     const roomGroups = {};
     for (const item of messages) {
       if (!roomGroups[item.room]) {
@@ -399,7 +390,6 @@ class GlobalChatBuffer {
       roomGroups[item.room].push(item.message);
     }
     
-    // Send per group
     for (const room in roomGroups) {
       const msgs = roomGroups[room];
       for (const msg of msgs) {
@@ -531,13 +521,13 @@ class SeatData {
   
   copyFrom(other) {
     if (other && typeof other === 'object') {
-      this.noimageUrl = other.noimageUrl?.slice(0, 255) || "";
-      this.namauser = other.namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || "";
-      this.color = other.color?.slice(0, 50) || "";
-      this.itembawah = Math.max(0, parseInt(other.itembawah) || 0);
-      this.itematas = Math.max(0, parseInt(other.itematas) || 0);
-      this.vip = Math.max(0, parseInt(other.vip) || 0);
-      this.viptanda = Math.max(0, parseInt(other.viptanda) || 0);
+      this.noimageUrl = other.noimageUrl?.slice(0, 255);
+      this.namauser = other.namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH);
+      this.color = other.color?.slice(0, 50);
+      this.itembawah = parseInt(other.itembawah);
+      this.itematas = parseInt(other.itematas);
+      this.vip = parseInt(other.vip);
+      this.viptanda = parseInt(other.viptanda);
       if (other.lastPoint) {
         this.lastPoint = {
           x: other.lastPoint.x,
@@ -661,13 +651,13 @@ class RoomManager {
     for (const [seatNum, seat] of this.seats) {
       if (!seat.isEmpty()) {
         meta[seatNum] = {
-          noimageUrl: seat.noimageUrl || "",
+          noimageUrl: seat.noimageUrl,
           namauser: seat.namauser,
-          color: seat.color || "",
-          itembawah: seat.itembawah || 0,
-          itematas: seat.itematas || 0,
-          vip: seat.vip || 0,
-          viptanda: seat.viptanda || 0
+          color: seat.color,
+          itembawah: seat.itembawah,
+          itematas: seat.itematas,
+          vip: seat.vip,
+          viptanda: seat.viptanda
         };
       }
     }
@@ -725,7 +715,7 @@ class RoomManager {
 }
 
 // ==================== MAIN CHATSERVER CLASS ====================
-export class ChatServer2{
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -752,7 +742,6 @@ export class ChatServer2{
     this.rateLimiter = new RateLimiter();
     this._cleanupInterval = null;
     
-    // GLOBAL CHAT BUFFER
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg) => {
       this._sendDirectToRoom(room, msg);
@@ -893,11 +882,20 @@ export class ChatServer2{
     for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
       const seatData = roomManager.getSeat(seat);
       if (!seatData || !seatData.namauser || seatData.namauser === "") {
-        const newSeat = new SeatData();
-        newSeat.namauser = userId;
-        newSeat.lastUpdated = Date.now();
+        const emptySeat = new SeatData();
+        emptySeat.namauser = "";
+        emptySeat.vip = 0;
+        emptySeat.noimageUrl = "";
+        emptySeat.color = "";
+        emptySeat.itembawah = 0;
+        emptySeat.itematas = 0;
+        emptySeat.viptanda = 0;
+        emptySeat.lastUpdated = Date.now();
         
-        if (roomManager.replaceSeat(seat, newSeat.toJSON())) {
+        if (roomManager.replaceSeat(seat, emptySeat.toJSON())) {
+          this.userToSeat.set(userId, { room, seat });
+          this.userCurrentRoom.set(userId, room);
+          
           this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
           this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
           return seat;
@@ -1418,7 +1416,6 @@ export class ChatServer2{
     }
   }
   
-  // FIX: Race condition fix for isPrimary check
   async _checkIsPrimary(username, ws) {
     const userConnections = this.userConnections.get(username);
     if (!userConnections || userConnections.size === 0) return true;
@@ -1633,7 +1630,6 @@ export class ChatServer2{
           const sanitizedUsername = username?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || "";
           if (sanitizedMessage.includes('\0') || sanitizedUsername.includes('\0')) return;
           
-          // FIX: Async check isPrimary to avoid race condition
           const isPrimary = await this._checkIsPrimary(username, ws);
           if (!isPrimary) return;
           
@@ -1680,13 +1676,13 @@ export class ChatServer2{
           const existingSeat = roomManager.getSeat(seat);
           
           const updatedSeat = {
-            noimageUrl: noimageUrl?.slice(0, 255) || "", 
-            namauser: namauser || "", 
-            color: color || "",
-            itembawah: itembawah || 0,
-            itematas: itematas || 0,
-            vip: vip || 0,
-            viptanda: viptanda || 0,
+            noimageUrl: noimageUrl?.slice(0, 255),
+            namauser: namauser,
+            color: color,
+            itembawah: itembawah,
+            itematas: itematas,
+            vip: vip,
+            viptanda: viptanda,
             lastPoint: existingSeat?.lastPoint || null,
             lastUpdated: Date.now()
           };
@@ -1702,13 +1698,13 @@ export class ChatServer2{
           }
           
           this.broadcastToRoom(room, ["kursiBatchUpdate", room, [[seat, {
-            noimageUrl: noimageUrl || "",
-            namauser: namauser || "",
-            color: color || "",
-            itembawah: itembawah || 0,
-            itematas: itematas || 0,
-            vip: vip || 0,
-            viptanda: viptanda || 0
+            noimageUrl: noimageUrl,
+            namauser: namauser,
+            color: color,
+            itembawah: itembawah,
+            itematas: itematas,
+            vip: vip,
+            viptanda: viptanda
           }]]]);
           this.updateRoomCount(room);
           break;
@@ -1744,8 +1740,6 @@ export class ChatServer2{
           }
           break;
         }
-        
-        // NO PING CASE - removed entirely
       }
     } catch (error) {}
   }
@@ -1871,7 +1865,6 @@ export class ChatServer2{
   }
   
   _mediumCleanup() {
-    // Cleanup user connections
     for (const [userId, connections] of this.userConnections) {
       const alive = new Set();
       for (const conn of connections) {
@@ -1892,10 +1885,8 @@ export class ChatServer2{
     this._cleanupEmptyRooms();
     this.rateLimiter.cleanup();
     
-    // Cleanup expired messages in global buffer
     this.chatBuffer._cleanupExpiredMessages();
     
-    // Cleanup zombie connections
     const now = Date.now();
     const zombies = [];
     for (const ws of this._activeClients) {
