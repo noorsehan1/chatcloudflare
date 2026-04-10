@@ -39,7 +39,7 @@ MAX_CONNECTIONS_PER_USER: 1,        // Tetap 1
   MAX_GIFT_NAME: 40,
   
   // CLEANUP
-  CLEANUP_INTERVAL: 15000,
+  CLEANUP_INTERVAL: 10000,
   MAX_USER_IDLE: 2 * 60 * 1000, // Masih ada tapi tidak digunakan untuk hapus user online
   ROOM_MANAGER_IDLE_TIMEOUT: 3 * 60 * 1000,
   CLEANUP_BATCH_SIZE: 10,
