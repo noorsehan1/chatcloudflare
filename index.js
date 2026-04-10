@@ -1087,7 +1087,7 @@ export class ChatServer2 {
     return this._sendDirectToRoom(room, msg);
   }
   
-  async sendAllStateTo(ws, room, excludeSelfSeat = true) {
+ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
     try {
       if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
       
@@ -1116,12 +1116,12 @@ export class ChatServer2 {
       if (filteredPoints.length > 0) {
         await this.safeSend(ws, ["allPointsList", room, filteredPoints]);
       }
-      await this.safeSend(ws, ["roomUserCount", room, this.getRoomCount(room)]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-      await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-      if (selfSeat) await this.safeSend(ws, ["numberKursiSaya", selfSeat]);
+      
+      // HAPUS SEMUA YANG SUDAH DIKIRIM DI HANDLE JOIN ROOM
+      // roomUserCount, currentNumber, muteTypeResponse, numberKursiSaya
+      
     } catch (error) {}
-  }
+}
   
   _validateUserId(userId) {
     if (!userId || typeof userId !== 'string') return false;
@@ -1145,9 +1145,9 @@ export class ChatServer2 {
     }
     
     return withTimeout(this._handleJoinRoomInternal(ws, room), CONSTANTS.PROMISE_TIMEOUT_MS, false);
-  }
-  
- async _handleJoinRoomInternal(ws, room) {
+}
+
+async _handleJoinRoomInternal(ws, room) {
     try {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
@@ -1162,8 +1162,13 @@ export class ChatServer2 {
           this._addToRoomClients(ws, room);
           this._addUserConnection(ws.idtarget, ws);
           this.userCurrentRoom.set(ws.idtarget, room);
+          
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
+          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
+          await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          
           return true;
         } else {
           this.userToSeat.delete(ws.idtarget);
@@ -1198,8 +1203,14 @@ export class ChatServer2 {
       this._addToRoomClients(ws, room);
       this._addUserConnection(ws.idtarget, ws);
       
+      const roomManager = this.roomManagers.get(room);
+      
       await this.sendAllStateTo(ws, room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+      await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      await this.safeSend(ws, ["roomUserCount", room, this.getRoomCount(room)]);
       
       return true;
     } catch (error) {
