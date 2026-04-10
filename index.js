@@ -1147,7 +1147,7 @@ export class ChatServer2 {
     return withTimeout(this._handleJoinRoomInternal(ws, room), CONSTANTS.PROMISE_TIMEOUT_MS, false);
   }
   
-  async _handleJoinRoomInternal(ws, room) {
+ async _handleJoinRoomInternal(ws, room) {
     try {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
@@ -1160,14 +1160,10 @@ export class ChatServer2 {
         if (seatData && seatData.namauser === ws.idtarget) {
           ws.roomname = room;
           this._addToRoomClients(ws, room);
-          
           this._addUserConnection(ws.idtarget, ws);
           this.userCurrentRoom.set(ws.idtarget, room);
           await this.sendAllStateTo(ws, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
-          await this.safeSend(ws, ["numberKursiSaya", seatNum]);
-          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-          
           return true;
         } else {
           this.userToSeat.delete(ws.idtarget);
@@ -1200,15 +1196,10 @@ export class ChatServer2 {
       this.userCurrentRoom.set(ws.idtarget, room);
       ws.roomname = room;
       this._addToRoomClients(ws, room);
-      
       this._addUserConnection(ws.idtarget, ws);
+      
       await this.sendAllStateTo(ws, room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-      
-      const roomManager = this.roomManagers.get(room);
-      await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       
       return true;
     } catch (error) {
@@ -1216,7 +1207,7 @@ export class ChatServer2 {
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     }
-  }
+}
   
   async cleanupFromRoom(ws, room) {
     if (!ws?.idtarget || !ws.roomname) return;
