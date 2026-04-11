@@ -1,8 +1,8 @@
-// lowcard.js - LowCardGameManager FINAL - NO EXTRA EVENTS
+// lowcard.js - LowCardGameManager FINAL - FULL CLASS
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal
-// TANPA event tambahan (hanya gameLowCardEnd dan gameLowCardWinner)
+// gameLowCardEnd akan mengirim pesan bahasa Inggris siapa yang kalah
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -88,7 +88,7 @@ export class LowCardGameManager {
     }
     
     for (const room of staleGames) {
-      this.endGame(room);
+      this.endGame(room, "Game timeout");
     }
   }
 
@@ -228,7 +228,7 @@ export class LowCardGameManager {
           await this.submitNumber(ws, data[1], data[2] || ""); 
           break;
         case "gameLowCardEnd": 
-          if (ws.roomname) this.endGame(ws.roomname); 
+          if (ws.roomname) this.endGame(ws.roomname, "Game ended by player"); 
           break;
       }
     } catch (error) { }
@@ -323,7 +323,7 @@ export class LowCardGameManager {
     
     if (game.players.size < 2) { 
       this._safeBroadcast(room, ["gameLowCardError", "Need at least 2 players", game.hostId]); 
-      this.endGame(room); 
+      this.endGame(room, "Not enough players"); 
       return; 
     }
     
@@ -522,7 +522,7 @@ export class LowCardGameManager {
       .filter(id => !game.eliminated.has(id));
     
     if (activePlayers.length === 0) {
-      this.endGame(room);
+      this.endGame(room, "All players eliminated");
       return;
     }
     
@@ -538,18 +538,26 @@ export class LowCardGameManager {
     }
     
     const allLosers = [];
+    const loserNames = [];
     
     // YANG TIDAK DRAW LANGSUNG KALAH
     if (notSubmittedPlayers.length > 0) {
       for (const playerId of notSubmittedPlayers) {
         game.eliminated.add(playerId);
         allLosers.push(playerId);
+        const player = game.players.get(playerId);
+        if (player && this._isHumanPlayer(playerId)) {
+          loserNames.push(player.name);
+        }
       }
+      const notSubmittedNames = notSubmittedPlayers.map(id => game.players.get(id)?.name || id);
+      this._safeBroadcast(room, ["gameLowCardRoundResultEliminated", notSubmittedNames]);
     }
     
     // JIKA TIDAK ADA YANG DRAW (SEMUA TIDAK DRAW)
     if (submittedPlayers.length === 0) {
-      this.endGame(room);
+      const message = loserNames.length > 0 ? `Player(s) ${loserNames.join(", ")} eliminated (no draw)` : "No one drew cards";
+      this.endGame(room, message);
       return;
     }
     
@@ -591,6 +599,10 @@ export class LowCardGameManager {
     for (const id of lowestPlayers) {
       game.eliminated.add(id);
       allLosers.push(id);
+      const player = game.players.get(id);
+      if (player && this._isHumanPlayer(id)) {
+        loserNames.push(player.name);
+      }
     }
     
     // HITUNG REMAINING
@@ -598,38 +610,34 @@ export class LowCardGameManager {
       .filter(id => !game.eliminated.has(id));
     
     // CEK APAKAH MASIH ADA USER MANUSIA
-    const hasHuman = this._hasHumanPlayer(game);
-    const remainingHasHuman = remaining.some(id => this._isHumanPlayer(id));
+    const remainingHumans = remaining.filter(id => this._isHumanPlayer(id));
     
-    // Jika tidak ada user manusia yang tersisa (hanya bot)
-    if (!remainingHasHuman && hasHuman) {
-      this.endGame(room);
+    // Jika TIDAK ADA user manusia yang tersisa (semua user sudah kalah)
+    if (remainingHumans.length === 0 && loserNames.length > 0) {
+      const message = `Player(s) ${loserNames.join(", ")} lost the game`;
+      this._safeBroadcast(room, ["gameLowCardEnd", message, loserNames]);
+      this.endGame(room, message);
       return;
     }
     
-    // Jika tidak ada user manusia dari awal
-    if (!hasHuman) {
-      this.endGame(room);
+    // Jika TIDAK ADA user manusia yang tersisa (tidak ada user dari awal)
+    if (remainingHumans.length === 0) {
+      this._safeBroadcast(room, ["gameLowCardEnd", "No human players remaining", []]);
+      this.endGame(room, "No human players remaining");
       return;
     }
     
-    // CEK PEMENANG
-    if (remaining.length === 1) {
-      const winnerId = remaining[0];
-      
-      if (this._isHumanPlayer(winnerId)) {
-        const winner = game.players.get(winnerId);
-        const totalCoin = game.betAmount * game.players.size;
-        this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
-        this.endGame(room);
-        return;
-      } else {
-        this.endGame(room);
-        return;
-      }
+    // Jika HANYA 1 user manusia yang tersisa dan tidak ada player lain
+    if (remainingHumans.length === 1 && remaining.length === 1) {
+      const winnerId = remainingHumans[0];
+      const winner = game.players.get(winnerId);
+      const totalCoin = game.betAmount * game.players.size;
+      this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
+      this.endGame(room, `${winner?.name} won the game`);
+      return;
     }
     
-    // JIKA MASIH ADA LEBIH DARI 1 PLAYER
+    // JIKA MASIH ADA LEBIH DARI 1 PLAYER (termasuk bot)
     if (remaining.length >= 2) {
       const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
         const player = game.players.get(id);
@@ -666,12 +674,13 @@ export class LowCardGameManager {
     
     // JIKA TIDAK ADA YANG TERSISA
     if (remaining.length === 0) {
-      this.endGame(room);
+      const message = loserNames.length > 0 ? `Player(s) ${loserNames.join(", ")} lost the game` : "All players eliminated";
+      this.endGame(room, message);
       return;
     }
   }
 
-  endGame(room) {
+  endGame(room, reason = "") {
     const game = this.activeGames.get(room);
     if (!game) return;
     
@@ -694,9 +703,9 @@ export class LowCardGameManager {
     if (game.tanda) { game.tanda.clear(); }
     if (game.eliminated) { game.eliminated.clear(); }
     
-    if (playersList.length > 0) {
-      this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
-    }
+    // Broadcast gameLowCardEnd dengan pesan reason (dalam bahasa Inggris)
+    const finalMessage = reason || "Game ended";
+    this._safeBroadcast(room, ["gameLowCardEnd", finalMessage, playersList]);
     
     this.activeGames.delete(room);
   }
@@ -710,7 +719,7 @@ export class LowCardGameManager {
     }
     
     for (const [room] of this.activeGames) {
-      this.endGame(room);
+      this.endGame(room, "Server destroyed");
     }
     this.activeGames.clear();
     this.chatServer = null;
