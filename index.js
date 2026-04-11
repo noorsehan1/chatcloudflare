@@ -6,7 +6,7 @@ import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
 const CONSTANTS = Object.freeze({
-  MAX_HEAP_SIZE_MB: 70,
+  MAX_HEAP_SIZE_MB: 120,
   GC_INTERVAL_MS: 3 * 60 * 1000,
   
   MAX_TOTAL_BUFFER_MESSAGES: 100,
@@ -20,7 +20,7 @@ const CONSTANTS = Object.freeze({
   MAX_ACTIVE_CLIENTS_LIMIT: 1000,
   MAX_ROOM_CLIENTS_LIMIT: 500,
   MAX_USER_CONNECTIONS_SIZE: 1000,
-  MAX_CONNECTIONS_PER_USER: 3,
+  MAX_CONNECTIONS_PER_USER: 1,
   
   MAX_ACTIVE_CLIENTS_ABS: 1000,
   MAX_USER_MAPS_SIZE: 2000,
