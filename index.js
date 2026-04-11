@@ -1,6 +1,7 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
 // NO RATE LIMIT - No connection limits
-// FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan
+// FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan (dengan lock)
+
 import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
@@ -545,6 +546,16 @@ class RoomManager {
     return seat && !seat.isEmpty() ? seat.namauser : null;
   }
   
+  getAvailableSeat() {
+    for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
+      const seatData = this.seats.get(seat);
+      if (!seatData || !seatData.namauser || seatData.namauser === "") {
+        return seat;
+      }
+    }
+    return null;
+  }
+  
   replaceSeat(seatNumber, seatData) {
     if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return false;
     const seat = this.seats.get(seatNumber);
@@ -678,7 +689,7 @@ class RoomManager {
 }
 
 // ==================== MAIN CHATSERVER CLASS ====================
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -689,6 +700,7 @@ export class ChatServer2 {
     this._lastCleanupLog = null;
     this._lastValidation = Date.now();
     this._connectionLocks = new Set();
+    this._seatLocks = new Set(); // LOCK UNTUK MENCEGAH DUPLIKAT KURSI
     
     this._activeClients = new Set();
     
@@ -749,6 +761,65 @@ export class ChatServer2 {
     
     this._lastHealthCheck = Date.now();
     this._consecutiveErrors = 0;
+  }
+  
+  // ============ ASSIGN NEW SEAT DENGAN LOCK ============
+  assignNewSeat(room, userId) {
+    const roomManager = this.roomManagers.get(room);
+    if (!roomManager) return null;
+    if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
+    
+    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
+    const existingSeatInfo = this.userToSeat.get(userId);
+    if (existingSeatInfo && existingSeatInfo.room === room) {
+      const seatNum = existingSeatInfo.seat;
+      // VERIFIKASI KURSI MASIH MILIK USER INI
+      const seatOwner = roomManager.getSeatOwner(seatNum);
+      if (seatOwner === userId) {
+        return seatNum;
+      } else {
+        // Kursi sudah diambil orang lain, hapus record lama
+        this.userToSeat.delete(userId);
+        this.userCurrentRoom.delete(userId);
+      }
+    }
+    
+    // LOCK UNTUK MENCEGAH RACE CONDITION
+    const lockKey = `seat_${room}`;
+    if (this._seatLocks.has(lockKey)) {
+      return null;
+    }
+    this._seatLocks.add(lockKey);
+    
+    try {
+      // CEK ULANG KONDISI SETELAH LOCK
+      if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
+      
+      // CARI KURSI KOSONG
+      const availableSeat = roomManager.getAvailableSeat();
+      if (!availableSeat) return null;
+      
+      // CEK APAKAH KURSI MASIH KOSONG (DOBEL CEK)
+      if (roomManager.isSeatOccupied(availableSeat)) {
+        return null;
+      }
+      
+      const emptySeat = new SeatData();
+      emptySeat.namauser = userId;
+      emptySeat.lastUpdated = Date.now();
+      
+      if (roomManager.replaceSeat(availableSeat, emptySeat.toJSON())) {
+        this.userToSeat.set(userId, { room, seat: availableSeat });
+        this.userCurrentRoom.set(userId, room);
+        
+        this.broadcastToRoom(room, ["userOccupiedSeat", room, availableSeat, userId]);
+        this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
+        return availableSeat;
+      }
+      return null;
+    } finally {
+      this._seatLocks.delete(lockKey);
+    }
   }
   
   // ============ MASTER TIMER ============
@@ -1079,43 +1150,6 @@ export class ChatServer2 {
       this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     }
     return success;
-  }
-  
-  assignNewSeat(room, userId) {
-    const roomManager = this.roomManagers.get(room);
-    if (!roomManager) return null;
-    if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
-    
-    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
-    const existingSeatInfo = this.userToSeat.get(userId);
-    if (existingSeatInfo && existingSeatInfo.room === room) {
-      return existingSeatInfo.seat;
-    }
-    
-    for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
-      const seatData = roomManager.getSeat(seat);
-      if (!seatData || !seatData.namauser || seatData.namauser === "") {
-        const emptySeat = new SeatData();
-        emptySeat.namauser = "";
-        emptySeat.vip = 0;
-        emptySeat.noimageUrl = "";
-        emptySeat.color = "";
-        emptySeat.itembawah = 0;
-        emptySeat.itematas = 0;
-        emptySeat.viptanda = 0;
-        emptySeat.lastUpdated = Date.now();
-        
-        if (roomManager.replaceSeat(seat, emptySeat.toJSON())) {
-          this.userToSeat.set(userId, { room, seat });
-          this.userCurrentRoom.set(userId, room);
-          
-          this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
-          this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
-          return seat;
-        }
-      }
-    }
-    return null;
   }
   
   _addUserConnection(userId, ws) {
@@ -2175,6 +2209,7 @@ export class ChatServer2 {
     this._clientWebSockets.clear();
     this._cleaningUp.clear();
     this._connectionLocks.clear();
+    this._seatLocks.clear();
   }
   
   async fetch(request) {
