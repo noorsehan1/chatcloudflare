@@ -1,4 +1,4 @@
-// lowcard.js - LowCardGameManager FINAL
+// lowcard.js - LowCardGameManager FINAL - FIXED VERSION
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal (normal, tidak diseting menang terus)
@@ -21,6 +21,7 @@ export class LowCardGameManager {
       const errorMsg = error?.message || String(error);
       this._errorLogs.push({ time: Date.now(), context, error: errorMsg });
       if (this._errorLogs.length > 100) this._errorLogs.shift();
+      console.error(`[LowCardGame] ${context}:`, errorMsg);
     };
   }
 
@@ -30,7 +31,9 @@ export class LowCardGameManager {
       if (this.chatServer && typeof this.chatServer.broadcastToRoom === 'function') {
         this.chatServer.broadcastToRoom(room, message);
       }
-    } catch (error) { this._errorHandler(error, `broadcast`); }
+    } catch (error) { 
+      this._errorHandler(error, `broadcast to ${room}`); 
+    }
   }
 
   _safeSend(ws, message) {
@@ -40,15 +43,19 @@ export class LowCardGameManager {
         return this.chatServer.safeSend(ws, message);
       }
       return false;
-    } catch (error) { return false; }
+    } catch (error) { 
+      return false; 
+    }
   }
 
   _safeGetGame(room) {
     try {
       if (this._destroyed || !room) return null;
       const game = this.activeGames.get(room);
-      return (game && game._active) ? game : null;
-    } catch (error) { return null; }
+      return (game && game._active && !game._ended) ? game : null;
+    } catch (error) { 
+      return null; 
+    }
   }
 
   cleanupStaleGames() {
@@ -60,26 +67,54 @@ export class LowCardGameManager {
       else if (game.createdAt && (now - game.createdAt) > CONSTANTS.GAME_TIMEOUT_HOURS * 3600000) staleGames.push(room);
       else if (game.players && game.players.size === 0) staleGames.push(room);
     }
-    for (const room of staleGames) this.endGame(room);
+    for (const room of staleGames) {
+      this.endGame(room);
+    }
   }
 
   _clearAllTimers(game) {
     if (!game) return;
-    if (game._regInterval) { clearInterval(game._regInterval); game._regInterval = null; }
-    if (game._drawInterval) { clearInterval(game._drawInterval); game._drawInterval = null; }
+    
+    if (game._regInterval) { 
+      clearInterval(game._regInterval); 
+      game._regInterval = null; 
+    }
+    if (game._drawInterval) { 
+      clearInterval(game._drawInterval); 
+      game._drawInterval = null; 
+    }
+    
     if (game.countdownTimers) {
       for (const timer of game.countdownTimers) {
-        if (timer) { if (timer.interval) clearInterval(timer.interval); if (timer.timeout) clearTimeout(timer.timeout); }
+        if (timer) {
+          if (timer.interval) clearInterval(timer.interval);
+          if (timer.timeout) clearTimeout(timer.timeout);
+        }
       }
       game.countdownTimers = null;
     }
-    if (game._botTimers) { for (const timer of game._botTimers) if (timer) clearTimeout(timer); game._botTimers = null; }
+    
+    if (game._botTimers) { 
+      for (const timer of game._botTimers) {
+        if (timer) clearTimeout(timer);
+      }
+      game._botTimers = null; 
+    }
+    
     if (game._botDrawTimeouts) {
-      for (const timeout of game._botDrawTimeouts) try { clearTimeout(timeout); } catch(e) {}
+      for (const timeout of game._botDrawTimeouts) {
+        try { clearTimeout(timeout); } catch(e) {}
+      }
       game._botDrawTimeouts.clear();
       game._botDrawTimeouts = null;
     }
-    if (game._timeouts) { for (const tid of game._timeouts) clearTimeout(tid); game._timeouts = null; }
+    
+    if (game._timeouts) { 
+      for (const tid of game._timeouts) {
+        if (tid) clearTimeout(tid);
+      }
+      game._timeouts = null; 
+    }
   }
 
   getRandomCardTanda() { 
@@ -98,7 +133,7 @@ export class LowCardGameManager {
       return Math.floor(Math.random() * 12) + 1;
     }
     
-    // Round 3 ke atas: 60% angka besar (8-12), 40% angka kecil (1-7)
+    // Round 3 ke atas: 70% angka besar (9-12), 30% angka kecil (1-8)
     // Ini sama persis dengan kode awal Anda!
     if (round >= 3) {
       const isGetHighNumber = Math.random() < 0.7;
@@ -120,7 +155,7 @@ export class LowCardGameManager {
     if (this._destroyed) return;
     
     for (const [room, game] of this.activeGames) {
-      if (!game || !game._active) continue;
+      if (!game || !game._active || game._ended) continue;
       
       // REGISTRATION COUNTDOWN (20 detik) - notifikasi di 20s, 10s, 5s
       if (game.registrationOpen && game.regTimeLeft > 0) {
@@ -153,7 +188,7 @@ export class LowCardGameManager {
             this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
             
             const evalTimeout = setTimeout(() => { 
-              if (!this._destroyed) this._evaluateRound(room); 
+              if (!this._destroyed && !game._ended) this._evaluateRound(room); 
             }, 2000);
             
             if (!game._timeouts) game._timeouts = [];
@@ -165,19 +200,32 @@ export class LowCardGameManager {
   }
 
   // ========== HANDLE EVENT ==========
-  handleEvent(ws, data) {
+  async handleEvent(ws, data) {
     if (this._destroyed || !ws || !data) return;
     const evt = data[0];
-    switch (evt) {
-      case "gameLowCardStart": this.startGame(ws, data[1]); break;
-      case "gameLowCardJoin": this.joinGame(ws); break;
-      case "gameLowCardNumber": this.submitNumber(ws, data[1], data[2] || ""); break;
-      case "gameLowCardEnd": if (ws.roomname) this.endGame(ws.roomname); break;
+    try {
+      switch (evt) {
+        case "gameLowCardStart": 
+          await this.startGame(ws, data[1]); 
+          break;
+        case "gameLowCardJoin": 
+          await this.joinGame(ws); 
+          break;
+        case "gameLowCardNumber": 
+          await this.submitNumber(ws, data[1], data[2] || ""); 
+          break;
+        case "gameLowCardEnd": 
+          if (ws.roomname) this.endGame(ws.roomname); 
+          break;
+      }
+    } catch (error) {
+      this._errorHandler(error, `handleEvent:${evt}`);
+      this._safeSend(ws, ["gameLowCardError", "Internal error"]);
     }
   }
 
   // ========== START GAME ==========
-  startGame(ws, bet) {
+  async startGame(ws, bet) {
     if (!ws?.roomname || !ws?.idtarget) { 
       this._safeSend(ws, ["gameLowCardError", "Invalid session"]); 
       return; 
@@ -215,7 +263,8 @@ export class LowCardGameManager {
       hostName: ws.username || ws.idtarget, 
       useBots: false, 
       createdAt: Date.now(),
-      _active: true, 
+      _active: true,
+      _ended: false,
       _timeouts: [], 
       _botTimers: [], 
       _botDrawTimeouts: new Set(),
@@ -239,7 +288,7 @@ export class LowCardGameManager {
   // ========== TAMBAH BOT MOZ ==========
   _addFourMozBots(room) {
     const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
+    if (!game || !game._active || game._ended) return;
     if (game.useBots || game.botPlayers.size > 0) return;
     
     game.useBots = true;
@@ -288,7 +337,7 @@ export class LowCardGameManager {
   // ========== START BOT DRAWS ==========
   _startBotDraws(room) {
     const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
+    if (!game || !game._active || game._ended) return;
     if (!game.useBots || !game.botPlayers) return;
     
     if (game._botTimers) { 
@@ -309,11 +358,13 @@ export class LowCardGameManager {
       const botTimeout = setTimeout(() => {
         if (this._destroyed) return;
         const currentGame = this._safeGetGame(room);
-        if (currentGame && currentGame._active && !currentGame.drawTimeExpired && !currentGame.evaluationLocked) {
+        if (currentGame && currentGame._active && !currentGame._ended && 
+            !currentGame.drawTimeExpired && !currentGame.evaluationLocked) {
           this._handleBotDraw(room, botId);
         }
       }, drawTime * 1000);
       
+      if (!game._botTimers) game._botTimers = [];
       game._botTimers.push(botTimeout);
       game._botDrawTimeouts.add(botTimeout);
     }
@@ -322,7 +373,7 @@ export class LowCardGameManager {
   // ========== HANDLE BOT DRAW ==========
   _handleBotDraw(room, botId) {
     const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
+    if (!game || !game._active || game._ended) return;
     if (game.eliminated.has(botId) || game.numbers.has(botId)) return;
     if (game.drawTimeExpired || game.evaluationLocked) return;
     
@@ -341,12 +392,12 @@ export class LowCardGameManager {
       .filter(id => !game.eliminated.has(id));
     const allDrawn = game.numbers.size === activePlayers.length;
     
-    if (!game.evaluationLocked && allDrawn) {
+    if (!game.evaluationLocked && allDrawn && !game.drawTimeExpired) {
       game.evaluationLocked = true;
       this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
       
       const evalTimeout = setTimeout(() => { 
-        if (!this._destroyed) this._evaluateRound(room); 
+        if (!this._destroyed && !game._ended) this._evaluateRound(room); 
       }, 2000);
       
       if (!game._timeouts) game._timeouts = [];
@@ -355,7 +406,7 @@ export class LowCardGameManager {
   }
 
   // ========== JOIN GAME ==========
-  joinGame(ws) {
+  async joinGame(ws) {
     if (!ws?.roomname || !ws?.idtarget) { 
       this._safeSend(ws, ["gameLowCardError", "Invalid session"]); 
       return; 
@@ -391,7 +442,7 @@ export class LowCardGameManager {
   }
 
   // ========== SUBMIT NUMBER ==========
-  submitNumber(ws, number, tanda = "") {
+  async submitNumber(ws, number, tanda = "") {
     if (!ws?.roomname || !ws?.idtarget) { 
       this._safeSend(ws, ["gameLowCardError", "Invalid session"]); 
       return; 
@@ -444,12 +495,12 @@ export class LowCardGameManager {
       .filter(id => !game.eliminated.has(id));
     const allDrawn = game.numbers.size === activePlayers.length;
     
-    if (!game.evaluationLocked && allDrawn) {
+    if (!game.evaluationLocked && allDrawn && !game.drawTimeExpired) {
       game.evaluationLocked = true;
       this._safeBroadcast(ws.roomname, ["gameLowCardWait", "Please wait for results..."]);
       
       const evalTimeout = setTimeout(() => { 
-        if (!this._destroyed) this._evaluateRound(ws.roomname); 
+        if (!this._destroyed && !game._ended) this._evaluateRound(ws.roomname); 
       }, 2000);
       
       if (!game._timeouts) game._timeouts = [];
@@ -460,7 +511,7 @@ export class LowCardGameManager {
   // ========== EVALUATE ROUND ==========
   _evaluateRound(room) {
     const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
+    if (!game || !game._active || game._ended) return;
     
     if (game.numbers.size === 0) { 
       this.endGame(room); 
@@ -523,7 +574,7 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
     this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
     
-    if (game.useBots && game.botPlayers.size > 0) {
+    if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
       this._startBotDraws(room);
     }
   }
@@ -533,7 +584,10 @@ export class LowCardGameManager {
     const game = this.activeGames.get(room);
     if (!game) return;
     
+    if (game._ended) return;
+    game._ended = true;
     game._active = false;
+    
     this._clearAllTimers(game);
     
     const playersList = [];
@@ -543,27 +597,24 @@ export class LowCardGameManager {
       } 
     }
     
+    // Clean up all maps and sets
     if (game.players) { 
       game.players.clear(); 
-      game.players = null; 
     }
     if (game.botPlayers) { 
       game.botPlayers.clear(); 
-      game.botPlayers = null; 
     }
     if (game.numbers) { 
       game.numbers.clear(); 
-      game.numbers = null; 
     }
     if (game.tanda) { 
       game.tanda.clear(); 
-      game.tanda = null; 
     }
     if (game.eliminated) { 
       game.eliminated.clear(); 
-      game.eliminated = null; 
     }
     
+    // Broadcast end game
     if (playersList.length > 0) {
       this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
     }
