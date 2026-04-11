@@ -1,4 +1,5 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
+// OPTIMIZED MEMORY - Target di bawah 128 MB
 // NO RATE LIMIT - No connection limits
 // FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan (dengan lock)
 
@@ -6,42 +7,50 @@ import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
 const CONSTANTS = Object.freeze({
-  MAX_HEAP_SIZE_MB: 120,
+  // MEMORY CONFIGURATION - OPTIMIZED
+  MAX_HEAP_SIZE_MB: 128,
   GC_INTERVAL_MS: 3 * 60 * 1000,
   
-  MAX_TOTAL_BUFFER_MESSAGES: 100,
-  MAX_CHAT_BUFFER_SIZE: 20,
+  // BUFFER CONFIGURATION - DIKURANGI
+  MAX_TOTAL_BUFFER_MESSAGES: 50,
+  MAX_CHAT_BUFFER_SIZE: 10,
   MESSAGE_TTL_MS: 5000,
   MAX_BUFFER_AGE_MS: 5000,
   BUFFER_FLUSH_INTERVAL_MS: 50,
   BUFFER_CLEANUP_INTERVAL_MS: 1000,
   
-  MAX_GLOBAL_CONNECTIONS: 1000,
-  MAX_ACTIVE_CLIENTS_LIMIT: 1000,
-  MAX_ROOM_CLIENTS_LIMIT: 500,
-  MAX_USER_CONNECTIONS_SIZE: 1000,
+  // CONNECTION LIMITS - DIKURANGI
+  MAX_GLOBAL_CONNECTIONS: 500,
+  MAX_ACTIVE_CLIENTS_LIMIT: 500,
+  MAX_ROOM_CLIENTS_LIMIT: 300,
+  MAX_USER_CONNECTIONS_SIZE: 500,
   MAX_CONNECTIONS_PER_USER: 1,
   
-  MAX_ACTIVE_CLIENTS_ABS: 1000,
-  MAX_USER_MAPS_SIZE: 2000,
+  // MEMORY LIMITS
+  MAX_ACTIVE_CLIENTS_ABS: 500,
+  MAX_USER_MAPS_SIZE: 1000,
   MAX_CLEANUP_BATCH: 50,
-  FORCE_CLEANUP_INTERVAL: 5 * 60 * 1000,
+  FORCE_CLEANUP_INTERVAL: 3 * 60 * 1000,
   
+  // SEATS
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   
+  // MESSAGE LIMITS
   MAX_MESSAGE_SIZE: 4000,
   MAX_MESSAGE_LENGTH: 200,
   MAX_USERNAME_LENGTH: 25,
   MAX_GIFT_NAME: 40,
   
-  CLEANUP_INTERVAL: 10000,
+  // CLEANUP - LEBIH SERING
+  CLEANUP_INTERVAL: 5000,
   MAX_USER_IDLE: 2 * 60 * 1000,
   ROOM_MANAGER_IDLE_TIMEOUT: 3 * 60 * 1000,
   CLEANUP_BATCH_SIZE: 10,
   CLEANUP_DELAY_MS: 5,
   MAX_CLEANUP_DURATION_MS: 30,
   
+  // TIMER
   NUMBER_TICK_INTERVAL: 15 * 60 * 1000,
   MASTER_TICK_INTERVAL_MS: 1000,
   LOCK_TIMEOUT_MS: 2000,
@@ -49,21 +58,29 @@ const CONSTANTS = Object.freeze({
   MAX_TIMEOUT_MS: 5000,
   MAX_TIMER_MS: 2147483647,
   
+  // LAINNYA
   MAX_JSON_DEPTH: 30,
   MAX_ARRAY_SIZE: 80,
   POINTS_CACHE_MS: 30,
   ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
   
-  MAX_USERS_BEFORE_CLEANUP: 200,
-  MAX_SEATS_BEFORE_CLEANUP: 500,
-  EMERGENCY_CLEANUP_INTERVAL_MS: 30000,
+  // MEMORY LIMITS FOR CLEANUP
+  MAX_USERS_BEFORE_CLEANUP: 100,
+  MAX_SEATS_BEFORE_CLEANUP: 300,
+  EMERGENCY_CLEANUP_INTERVAL_MS: 15000,
   
+  // TIMER SAFETY
   MASTER_TICK_TIMEOUT_MS: 3000,
   NUMBER_TICK_TIMEOUT_MS: 5000,
   MAX_CONSECUTIVE_ERRORS: 5,
   HEALTH_CHECK_INTERVAL: 60000,
   NUMBER_TICK_DEAD_THRESHOLD_MS: 180000,
   MASTER_TICK_STUCK_THRESHOLD_MS: 10000,
+  
+  // FORCE CLEANUP THRESHOLDS
+  FORCE_CLEANUP_CONNECTIONS: 400,
+  FORCE_CLEANUP_GAMES: 8,
+  FORCE_CLEANUP_BUFFER: 80,
 });
 
 const roomList = Object.freeze([
@@ -150,7 +167,8 @@ function isValidUsername(username) {
 
 // ==================== MEMORY MONITOR ====================
 class MemoryMonitor {
-  constructor() {
+  constructor(chatServer) {
+    this.chatServer = chatServer;
     this.lastCheck = Date.now();
     this.gcInterval = null;
     this._isDestroyed = false;
@@ -181,6 +199,14 @@ class MemoryMonitor {
     try {
       const now = Date.now();
       if (now - this.lastMemoryLog > 60000) {
+        // FORCE CLEANUP JIKA TERLALU BANYAK CONNECTION
+        if (this.chatServer && this.chatServer._activeClients) {
+          const activeCount = this.chatServer._activeClients.size;
+          if (activeCount > CONSTANTS.FORCE_CLEANUP_CONNECTIONS) {
+            console.log(`[MEMORY] High connections: ${activeCount}, forcing cleanup`);
+            this.chatServer._emergencyCleanup();
+          }
+        }
         this.lastMemoryLog = now;
       }
       return false;
@@ -202,7 +228,7 @@ class GlobalChatBuffer {
     this._flushCallback = null;
     this._totalQueued = 0;
     this.lastWarningTime = 0;
-    this.WARNING_THRESHOLD = 80;
+    this.WARNING_THRESHOLD = 40;
     
     this._lastFlushTime = Date.now();
     this._flushIntervalMs = CONSTANTS.BUFFER_FLUSH_INTERVAL_MS;
@@ -214,6 +240,10 @@ class GlobalChatBuffer {
     
     this._pendingMessages = new Map();
     this._nextMsgId = 0;
+    
+    // PER ROOM QUEUE TRACKING
+    this._roomQueueSizes = new Map();
+    this.MAX_PER_ROOM = 20;
   }
   
   setFlushCallback(callback) {
@@ -226,6 +256,13 @@ class GlobalChatBuffer {
   
   add(room, message) {
     if (this._isDestroyed) {
+      this._sendImmediate(room, message);
+      return;
+    }
+    
+    // CEK PER ROOM QUEUE SIZE
+    let roomSize = this._roomQueueSizes.get(room) || 0;
+    if (roomSize >= this.MAX_PER_ROOM) {
       this._sendImmediate(room, message);
       return;
     }
@@ -250,6 +287,7 @@ class GlobalChatBuffer {
       timestamp: Date.now()
     });
     this._totalQueued++;
+    this._roomQueueSizes.set(room, roomSize + 1);
     
     return msgId;
   }
@@ -286,12 +324,24 @@ class GlobalChatBuffer {
     }
     
     for (const idx of expiredIndices.reverse()) {
+      const item = this._messageQueue[idx];
+      if (item) {
+        const roomSize = this._roomQueueSizes.get(item.room) || 0;
+        this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
+      }
       this._messageQueue.splice(idx, 1);
       this._totalQueued--;
     }
     
     if (this._messageQueue.length > this.maxQueueSize * 0.8) {
       const toRemove = Math.floor(this._messageQueue.length * 0.3);
+      for (let i = 0; i < toRemove; i++) {
+        const item = this._messageQueue[i];
+        if (item) {
+          const roomSize = this._roomQueueSizes.get(item.room) || 0;
+          this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
+        }
+      }
       this._messageQueue.splice(0, toRemove);
     }
   }
@@ -349,6 +399,9 @@ class GlobalChatBuffer {
           roomGroups[item.room] = [];
         }
         roomGroups[item.room].push({ message: item.message, msgId: item.msgId });
+        // RESET ROOM QUEUE SIZE
+        const roomSize = this._roomQueueSizes.get(item.room) || 0;
+        this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
       }
       
       let errorCount = 0;
@@ -406,8 +459,7 @@ class GlobalChatBuffer {
       pendingAcks: this._pendingMessages.size,
       totalQueued: this._totalQueued,
       maxQueueSize: this.maxQueueSize,
-      flushIntervalMs: this._flushIntervalMs,
-      cleanupIntervalMs: this._cleanupIntervalMs
+      roomQueueSizes: Array.from(this._roomQueueSizes.entries())
     };
   }
   
@@ -418,6 +470,7 @@ class GlobalChatBuffer {
     this._messageQueue = [];
     this._retryQueue = [];
     this._totalQueued = 0;
+    this._roomQueueSizes.clear();
     
     const roomGroups = {};
     for (const item of messages) {
@@ -679,6 +732,15 @@ class RoomManager {
     return this.currentNumber;
   }
   
+  compressOldPoints() {
+    const now = Date.now();
+    for (const [seatNum, seat] of this.seats) {
+      if (seat.lastPoint && (now - seat.lastPoint.timestamp) > 300000) {
+        seat.lastPoint = null;
+      }
+    }
+  }
+  
   destroy() {
     for (const seat of this.seats.values()) {
       seat.clear();
@@ -700,7 +762,7 @@ export class ChatServer2 {
     this._lastCleanupLog = null;
     this._lastValidation = Date.now();
     this._connectionLocks = new Set();
-    this._seatLocks = new Set(); // LOCK UNTUK MENCEGAH DUPLIKAT KURSI
+    this._seatLocks = new Set();
     
     this._activeClients = new Set();
     
@@ -714,6 +776,7 @@ export class ChatServer2 {
     this._clientWebSockets = new Set();
     
     this._cleanupInterval = null;
+    this._memoryCheckInterval = null;
     
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg, msgId) => {
@@ -744,7 +807,7 @@ export class ChatServer2 {
       this.roomClients.set(room, []);
     }
     
-    this.memoryMonitor = new MemoryMonitor();
+    this.memoryMonitor = new MemoryMonitor(this);
     
     this.startNumberTickTimer();
     this.startMasterTimer();
@@ -759,8 +822,30 @@ export class ChatServer2 {
       this._forceMemoryCleanup();
     }, CONSTANTS.FORCE_CLEANUP_INTERVAL);
     
+    this._memoryCheckInterval = setInterval(() => {
+      this._checkMemoryAndForceCleanup();
+    }, 60000);
+    
     this._lastHealthCheck = Date.now();
     this._consecutiveErrors = 0;
+  }
+  
+  _checkMemoryAndForceCleanup() {
+    const activeCount = this._activeClients.size;
+    const gameCount = this.lowcard?.activeGames?.size || 0;
+    const bufferCount = this.chatBuffer?._messageQueue?.length || 0;
+    
+    if (activeCount > CONSTANTS.FORCE_CLEANUP_CONNECTIONS || 
+        gameCount > CONSTANTS.FORCE_CLEANUP_GAMES || 
+        bufferCount > CONSTANTS.FORCE_CLEANUP_BUFFER) {
+      console.log(`[MEMORY] Force cleanup: Connections=${activeCount}, Games=${gameCount}, Buffer=${bufferCount}`);
+      this._emergencyCleanup();
+    }
+    
+    // COMPRESS OLD POINTS DI SEMUA ROOM
+    for (const roomManager of this.roomManagers.values()) {
+      roomManager.compressOldPoints();
+    }
   }
   
   // ============ ASSIGN NEW SEAT DENGAN LOCK ============
@@ -769,22 +854,18 @@ export class ChatServer2 {
     if (!roomManager) return null;
     if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
     
-    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
     const existingSeatInfo = this.userToSeat.get(userId);
     if (existingSeatInfo && existingSeatInfo.room === room) {
       const seatNum = existingSeatInfo.seat;
-      // VERIFIKASI KURSI MASIH MILIK USER INI
       const seatOwner = roomManager.getSeatOwner(seatNum);
       if (seatOwner === userId) {
         return seatNum;
       } else {
-        // Kursi sudah diambil orang lain, hapus record lama
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
       }
     }
     
-    // LOCK UNTUK MENCEGAH RACE CONDITION
     const lockKey = `seat_${room}`;
     if (this._seatLocks.has(lockKey)) {
       return null;
@@ -792,14 +873,11 @@ export class ChatServer2 {
     this._seatLocks.add(lockKey);
     
     try {
-      // CEK ULANG KONDISI SETELAH LOCK
       if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
       
-      // CARI KURSI KOSONG
       const availableSeat = roomManager.getAvailableSeat();
       if (!availableSeat) return null;
       
-      // CEK APAKAH KURSI MASIH KOSONG (DOBEL CEK)
       if (roomManager.isSeatOccupied(availableSeat)) {
         return null;
       }
@@ -2156,6 +2234,10 @@ export class ChatServer2 {
     if (this._forceCleanupInterval) {
       clearInterval(this._forceCleanupInterval);
       this._forceCleanupInterval = null;
+    }
+    if (this._memoryCheckInterval) {
+      clearInterval(this._memoryCheckInterval);
+      this._memoryCheckInterval = null;
     }
     
     await this.chatBuffer.flushAll();
