@@ -2,6 +2,7 @@
 // OPTIMIZED MEMORY - Target di bawah 128 MB
 // NO RATE LIMIT - No connection limits
 // FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan (dengan lock)
+// BUFFER FLUSH: 1 detik (sudah optimal)
 
 import { LowCardGameManager } from "./lowcard.js";
 
@@ -11,12 +12,11 @@ const CONSTANTS = Object.freeze({
   MAX_HEAP_SIZE_MB: 128,
   GC_INTERVAL_MS: 3 * 60 * 1000,
   
-  // BUFFER CONFIGURATION - DIKURANGI
+  // BUFFER CONFIGURATION - FLUSH 1 DETIK
   MAX_TOTAL_BUFFER_MESSAGES: 50,
   MAX_CHAT_BUFFER_SIZE: 10,
   MESSAGE_TTL_MS: 5000,
   MAX_BUFFER_AGE_MS: 5000,
-  BUFFER_FLUSH_INTERVAL_MS: 50,
   BUFFER_CLEANUP_INTERVAL_MS: 1000,
   
   // CONNECTION LIMITS - DIKURANGI
@@ -199,11 +199,9 @@ class MemoryMonitor {
     try {
       const now = Date.now();
       if (now - this.lastMemoryLog > 60000) {
-        // FORCE CLEANUP JIKA TERLALU BANYAK CONNECTION
         if (this.chatServer && this.chatServer._activeClients) {
           const activeCount = this.chatServer._activeClients.size;
           if (activeCount > CONSTANTS.FORCE_CLEANUP_CONNECTIONS) {
-            console.log(`[MEMORY] High connections: ${activeCount}, forcing cleanup`);
             this.chatServer._emergencyCleanup();
           }
         }
@@ -230,18 +228,12 @@ class GlobalChatBuffer {
     this.lastWarningTime = 0;
     this.WARNING_THRESHOLD = 40;
     
-    this._lastFlushTime = Date.now();
-    this._flushIntervalMs = CONSTANTS.BUFFER_FLUSH_INTERVAL_MS;
-    this._flushCounter = 0;
-    this._ticksPerFlush = Math.max(1, Math.floor(this._flushIntervalMs / CONSTANTS.MASTER_TICK_INTERVAL_MS));
-    
     this._lastCleanupTime = Date.now();
     this._cleanupIntervalMs = CONSTANTS.BUFFER_CLEANUP_INTERVAL_MS;
     
     this._pendingMessages = new Map();
     this._nextMsgId = 0;
     
-    // PER ROOM QUEUE TRACKING
     this._roomQueueSizes = new Map();
     this.MAX_PER_ROOM = 20;
   }
@@ -260,7 +252,6 @@ class GlobalChatBuffer {
       return;
     }
     
-    // CEK PER ROOM QUEUE SIZE
     let roomSize = this._roomQueueSizes.get(room) || 0;
     if (roomSize >= this.MAX_PER_ROOM) {
       this._sendImmediate(room, message);
@@ -292,11 +283,11 @@ class GlobalChatBuffer {
     return msgId;
   }
   
+  // tick dipanggil setiap 1 detik oleh master timer
   tick(now) {
     if (this._isDestroyed) return;
     
-    this._flushCounter++;
-    
+    // CLEANUP EXPIRED MESSAGES
     if (now - this._lastCleanupTime >= this._cleanupIntervalMs) {
       this._cleanupExpiredMessages(now);
       this._processRetryQueue(now);
@@ -304,11 +295,8 @@ class GlobalChatBuffer {
       this._lastCleanupTime = now;
     }
     
-    if (this._flushCounter >= this._ticksPerFlush) {
-      this._flush();
-      this._flushCounter = 0;
-      this._lastFlushTime = now;
-    }
+    // FLUSH LANGSUNG SETIAP 1 DETIK
+    this._flush();
   }
   
   _cleanupExpiredMessages(now) {
@@ -399,7 +387,6 @@ class GlobalChatBuffer {
           roomGroups[item.room] = [];
         }
         roomGroups[item.room].push({ message: item.message, msgId: item.msgId });
-        // RESET ROOM QUEUE SIZE
         const roomSize = this._roomQueueSizes.get(item.room) || 0;
         this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
       }
@@ -442,16 +429,6 @@ class GlobalChatBuffer {
     }
   }
   
-  ackMessage(msgId, clientId) {
-    const pending = this._pendingMessages.get(msgId);
-    if (pending && pending.pendingClients) {
-      pending.pendingClients.delete(clientId);
-      if (pending.pendingClients.size === 0) {
-        this._pendingMessages.delete(msgId);
-      }
-    }
-  }
-  
   getStats() {
     return {
       queuedMessages: this._messageQueue.length,
@@ -459,7 +436,6 @@ class GlobalChatBuffer {
       pendingAcks: this._pendingMessages.size,
       totalQueued: this._totalQueued,
       maxQueueSize: this.maxQueueSize,
-      roomQueueSizes: Array.from(this._roomQueueSizes.entries())
     };
   }
   
@@ -838,17 +814,14 @@ export class ChatServer2 {
     if (activeCount > CONSTANTS.FORCE_CLEANUP_CONNECTIONS || 
         gameCount > CONSTANTS.FORCE_CLEANUP_GAMES || 
         bufferCount > CONSTANTS.FORCE_CLEANUP_BUFFER) {
-      console.log(`[MEMORY] Force cleanup: Connections=${activeCount}, Games=${gameCount}, Buffer=${bufferCount}`);
       this._emergencyCleanup();
     }
     
-    // COMPRESS OLD POINTS DI SEMUA ROOM
     for (const roomManager of this.roomManagers.values()) {
       roomManager.compressOldPoints();
     }
   }
   
-  // ============ ASSIGN NEW SEAT DENGAN LOCK ============
   assignNewSeat(room, userId) {
     const roomManager = this.roomManagers.get(room);
     if (!roomManager) return null;
@@ -900,7 +873,6 @@ export class ChatServer2 {
     }
   }
   
-  // ============ MASTER TIMER ============
   startMasterTimer() {
     if (this._masterTimerInterval) {
       clearInterval(this._masterTimerInterval);
@@ -972,7 +944,6 @@ export class ChatServer2 {
     }
   }
   
-  // ============ NUMBER TICK TIMER ============
   startNumberTickTimer() {
     if (this.numberTickTimer) {
       clearTimeout(this.numberTickTimer);
@@ -1109,7 +1080,6 @@ export class ChatServer2 {
     this.startNumberTickTimer();
   }
   
-  // ============ FORCE MEMORY CLEANUP ============
   _forceMemoryCleanup() {
     if (this._isClosing) return;
     
