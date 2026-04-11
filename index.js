@@ -1,4 +1,4 @@
-// index.js - ChatServer FIXED - NO MEMORY LEAK
+// index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
@@ -465,97 +465,95 @@ export class ChatServer2 {
     }
   }
   
-async handleJoinRoom(ws, room) {
-  if (!ws?.idtarget) return false;
-  if (!roomList.includes(room)) return false;
-  
-  this._idleTracking.set(ws, Date.now());
-  
-  // ✅ CASE 1: Sudah di room yang sama
-  if (ws.roomname === room) {
-    const seatInfo = this.userToSeat.get(ws.idtarget);
-    if (seatInfo && seatInfo.room === room) {
-      await this._sendRoomState(ws, room);
-      await this.safeSend(ws, ["rooMasuk", seatInfo.seat, room]);
-      await this.safeSend(ws, ["currentRoom", room]);
-      
-      // ✅ KIRIM JUMLAH USER
-      const rm = this.roomManagers.get(room);
-      await this.safeSend(ws, ["roomUserCount", room, rm?.getOccupiedCount() || 0]);
-      return true;
-    }
-  }
-  
-  try {
-    // ✅ CASE 2: Reconnect ke room yang sama
-    const existing = this.userToSeat.get(ws.idtarget);
-    if (existing && existing.room === room) {
-      const rm = this.roomManagers.get(room);
-      const seat = rm.getSeat(existing.seat);
-      if (seat && seat.namauser === ws.idtarget) {
-        ws.roomname = room;
-        this._addToRoom(ws, room);
+  async handleJoinRoom(ws, room) {
+    if (!ws?.idtarget) return false;
+    if (!roomList.includes(room)) return false;
+    
+    this._idleTracking.set(ws, Date.now());
+    
+    // Jika sudah di room yang sama, refresh state
+    if (ws.roomname === room) {
+      const seatInfo = this.userToSeat.get(ws.idtarget);
+      if (seatInfo && seatInfo.room === room) {
         await this._sendRoomState(ws, room);
-        await this.safeSend(ws, ["rooMasuk", existing.seat, room]);
-        await this.safeSend(ws, ["numberKursiSaya", existing.seat]);
+        await this.safeSend(ws, ["rooMasuk", seatInfo.seat, room]);
         await this.safeSend(ws, ["currentRoom", room]);
-        
-        // ✅ KIRIM JUMLAH USER
-        await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
+        const rm = this.roomManagers.get(room);
+        await this.safeSend(ws, ["roomUserCount", room, rm?.getOccupiedCount() || 0]);
         return true;
       }
-      this.userToSeat.delete(ws.idtarget);
     }
     
-    if (ws.roomname && ws.roomname !== room) await this._leaveRoom(ws, ws.roomname);
-    
-    const rm = this.roomManagers.get(room);
-    if (rm.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
-      await this.safeSend(ws, ["roomFull", room]);
-      return false;
-    }
-    
-    let assignedSeat = null;
-    for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) {
-      const seat = rm.getSeat(i);
-      if (!seat || !seat.namauser) {
-        assignedSeat = i;
-        break;
+    try {
+      // Cek existing seat untuk user ini di room yang sama
+      const existing = this.userToSeat.get(ws.idtarget);
+      if (existing && existing.room === room) {
+        const rm = this.roomManagers.get(room);
+        const seat = rm.getSeat(existing.seat);
+        if (seat && seat.namauser === ws.idtarget) {
+          ws.roomname = room;
+          this._addToRoom(ws, room);
+          await this._sendRoomState(ws, room);
+          await this.safeSend(ws, ["rooMasuk", existing.seat, room]);
+          await this.safeSend(ws, ["numberKursiSaya", existing.seat]);
+          await this.safeSend(ws, ["currentRoom", room]);
+          await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
+          return true;
+        }
+        this.userToSeat.delete(ws.idtarget);
       }
-    }
-    
-    if (!assignedSeat) {
-      await this.safeSend(ws, ["roomFull", room]);
+      
+      // Leave room sebelumnya jika ada
+      if (ws.roomname && ws.roomname !== room) await this._leaveRoom(ws, ws.roomname);
+      
+      const rm = this.roomManagers.get(room);
+      if (rm.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
+        await this.safeSend(ws, ["roomFull", room]);
+        return false;
+      }
+      
+      // Cari kursi kosong
+      let assignedSeat = null;
+      for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) {
+        const seat = rm.getSeat(i);
+        if (!seat || !seat.namauser) {
+          assignedSeat = i;
+          break;
+        }
+      }
+      
+      if (!assignedSeat) {
+        await this.safeSend(ws, ["roomFull", room]);
+        return false;
+      }
+      
+      const emptySeat = new SeatData();
+      emptySeat.namauser = ws.idtarget;
+      rm.replaceSeat(assignedSeat, emptySeat.toJSON());
+      
+      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+      this.userCurrentRoom.set(ws.idtarget, room);
+      ws.roomname = room;
+      
+      this._addToRoom(ws, room);
+      this._addUserConnection(ws.idtarget, ws);
+      
+      await this._sendRoomState(ws, room);
+      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+      await this.safeSend(ws, ["currentRoom", room]);
+      await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
+      
+      // Broadcast ke semua user di room
+      this._sendToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
+      this._sendToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
+      
+      return true;
+    } catch(e) {
+      console.error("handleJoinRoom error:", e);
       return false;
     }
-    
-    const emptySeat = new SeatData();
-    emptySeat.namauser = ws.idtarget;
-    rm.replaceSeat(assignedSeat, emptySeat.toJSON());
-    
-    this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
-    this.userCurrentRoom.set(ws.idtarget, room);
-    ws.roomname = room;
-    
-    this._addToRoom(ws, room);
-    this._addUserConnection(ws.idtarget, ws);
-    
-    await this._sendRoomState(ws, room);
-    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-    await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-    await this.safeSend(ws, ["currentRoom", room]);
-    await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
-    
-    // ✅ BROADCAST ke semua user lain
-    this._sendToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
-    this._sendToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
-    
-    return true;
-  } catch(e) {
-    console.error("handleJoinRoom error:", e);
-    return false;
   }
-}
   
   async _sendRoomState(ws, room) {
     const rm = this.roomManagers.get(room);
@@ -657,6 +655,7 @@ async handleJoinRoom(ws, room) {
           await this.safeSend(ws, ["numberKursiSaya", seat]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           await this.safeSend(ws, ["currentRoom", room]);
+          await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
           return;
         }
       }
