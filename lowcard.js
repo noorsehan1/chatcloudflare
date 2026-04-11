@@ -2,6 +2,7 @@
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal (normal, tidak diseting menang terus)
+// FIXED: Memory leaks, timer cleanup, bot timer management
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -17,12 +18,24 @@ export class LowCardGameManager {
     this.activeGames = new Map();
     this._destroyed = false;
     this._errorLogs = [];
+    this._cleanupInterval = null;
+    
+    // Start periodic cleanup for stale games
+    this._startPeriodicCleanup();
+    
     this._errorHandler = (error, context) => {
       const errorMsg = error?.message || String(error);
       this._errorLogs.push({ time: Date.now(), context, error: errorMsg });
       if (this._errorLogs.length > 100) this._errorLogs.shift();
       console.error(`[LowCardGame] ${context}:`, errorMsg);
     };
+  }
+
+  _startPeriodicCleanup() {
+    if (this._cleanupInterval) clearInterval(this._cleanupInterval);
+    this._cleanupInterval = setInterval(() => {
+      this.cleanupStaleGames();
+    }, 60000); // Cleanup every minute
   }
 
   _safeBroadcast(room, message) {
@@ -62,11 +75,17 @@ export class LowCardGameManager {
     if (this._destroyed) return;
     const now = Date.now();
     const staleGames = [];
+    
     for (const [room, game] of this.activeGames) {
-      if (!game || !game._active) staleGames.push(room);
-      else if (game.createdAt && (now - game.createdAt) > CONSTANTS.GAME_TIMEOUT_HOURS * 3600000) staleGames.push(room);
-      else if (game.players && game.players.size === 0) staleGames.push(room);
+      if (!game || !game._active) {
+        staleGames.push(room);
+      } else if (game.createdAt && (now - game.createdAt) > CONSTANTS.GAME_TIMEOUT_HOURS * 3600000) {
+        staleGames.push(room);
+      } else if (game.players && game.players.size === 0) {
+        staleGames.push(room);
+      }
     }
+    
     for (const room of staleGames) {
       this.endGame(room);
     }
@@ -75,15 +94,19 @@ export class LowCardGameManager {
   _clearAllTimers(game) {
     if (!game) return;
     
+    // Clear registration interval
     if (game._regInterval) { 
       clearInterval(game._regInterval); 
       game._regInterval = null; 
     }
+    
+    // Clear draw interval
     if (game._drawInterval) { 
       clearInterval(game._drawInterval); 
       game._drawInterval = null; 
     }
     
+    // Clear countdown timers
     if (game.countdownTimers) {
       for (const timer of game.countdownTimers) {
         if (timer) {
@@ -94,6 +117,7 @@ export class LowCardGameManager {
       game.countdownTimers = null;
     }
     
+    // Clear bot timers
     if (game._botTimers) { 
       for (const timer of game._botTimers) {
         if (timer) clearTimeout(timer);
@@ -101,6 +125,7 @@ export class LowCardGameManager {
       game._botTimers = null; 
     }
     
+    // Clear bot draw timeouts
     if (game._botDrawTimeouts) {
       for (const timeout of game._botDrawTimeouts) {
         try { clearTimeout(timeout); } catch(e) {}
@@ -109,6 +134,7 @@ export class LowCardGameManager {
       game._botDrawTimeouts = null;
     }
     
+    // Clear general timeouts
     if (game._timeouts) { 
       for (const tid of game._timeouts) {
         if (tid) clearTimeout(tid);
@@ -134,7 +160,6 @@ export class LowCardGameManager {
     }
     
     // Round 3 ke atas: 70% angka besar (9-12), 30% angka kecil (1-8)
-    // Ini sama persis dengan kode awal Anda!
     if (round >= 3) {
       const isGetHighNumber = Math.random() < 0.7;
       
@@ -340,6 +365,7 @@ export class LowCardGameManager {
     if (!game || !game._active || game._ended) return;
     if (!game.useBots || !game.botPlayers) return;
     
+    // Clear existing bot timers
     if (game._botTimers) { 
       for (const timer of game._botTimers) clearTimeout(timer); 
       game._botTimers = []; 
@@ -625,6 +651,14 @@ export class LowCardGameManager {
   // ========== DESTROY ==========
   destroy() {
     this._destroyed = true;
+    
+    // Clear cleanup interval
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+    
+    // End all active games
     for (const [room] of this.activeGames) {
       this.endGame(room);
     }
