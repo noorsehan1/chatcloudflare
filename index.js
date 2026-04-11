@@ -1,4 +1,4 @@
-// index.js - ChatServer2 - FIX ROOM USER COUNT
+// index.js - ChatServer2 - FIX ROOM USER COUNT KE SEMUA USER
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
@@ -392,7 +392,8 @@ export class ChatServer2 {
       if (rm && seatInfo.seat) {
         rm.removeSeat(seatInfo.seat);
         this._sendToRoom(targetRoom, ["removeKursi", targetRoom, seatInfo.seat]);
-        this._sendToRoom(targetRoom, ["roomUserCount", targetRoom, rm.getOccupiedCount()]);
+        // ✅ BROADCAST KE SEMUA USER DI ROOM
+        this.broadcastToRoom(targetRoom, ["roomUserCount", targetRoom, rm.getOccupiedCount()]);
       }
     }
     this.userToSeat.delete(userId);
@@ -468,7 +469,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           
-          // ✅ BROADCAST ROOM COUNT KE SEMUA USER
+          // ✅ BROADCAST KE SEMUA USER DI ROOM
           this.broadcastToRoom(room, ["roomUserCount", room, this.getRoomCount(room)]);
           
           return true;
@@ -553,8 +554,8 @@ export class ChatServer2 {
       if (rm) {
         rm.removeSeat(seatInfo.seat);
         this._sendToRoom(room, ["removeKursi", room, seatInfo.seat]);
-        // ✅ BROADCAST ROOM COUNT
-        this._sendToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
+        // ✅ BROADCAST KE SEMUA USER DI ROOM
+        this.broadcastToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
       }
     }
     
@@ -718,6 +719,7 @@ export class ChatServer2 {
             this.userToSeat.delete(ws.idtarget);
             this.userCurrentRoom.delete(ws.idtarget);
             this._sendToRoom(room, ["removeKursi", room, seat]);
+            // ✅ BROADCAST KE SEMUA USER DI ROOM
             this.broadcastToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
           }
           break;
