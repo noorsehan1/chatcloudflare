@@ -1,5 +1,5 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
-// DENGAN PROTEKSI CRASH DAN TIMER MATI
+// DENGAN PROTEKSI CRASH, TIMER MATI, DAN PV MESSAGE VALIDATION
 import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
@@ -67,6 +67,11 @@ const CONSTANTS = Object.freeze({
   HEALTH_CHECK_INTERVAL: 60000,
   NUMBER_TICK_DEAD_THRESHOLD_MS: 180000,
   MASTER_TICK_STUCK_THRESHOLD_MS: 10000,
+  
+  // CHAT SAFETY
+  MAX_CHAT_RETRIES: 3,
+  CHAT_ACK_TIMEOUT_MS: 2000,
+  CHAT_RETRY_DELAY_MS: 1000,
 });
 
 const roomList = Object.freeze([
@@ -143,6 +148,14 @@ function safeParseJSON(str, maxDepth = CONSTANTS.MAX_JSON_DEPTH) {
   }
 }
 
+function isValidUsername(username) {
+  if (!username || typeof username !== 'string') return false;
+  if (username.trim().length === 0) return false;
+  if (username.length > CONSTANTS.MAX_USERNAME_LENGTH) return false;
+  if (/[^\w\s\-_.@]/i.test(username)) return false;
+  return true;
+}
+
 // ==================== MEMORY MONITOR ====================
 class MemoryMonitor {
   constructor() {
@@ -186,11 +199,13 @@ class MemoryMonitor {
   }
 }
 
-// ==================== GLOBAL CHAT BUFFER ====================
+// ==================== GLOBAL CHAT BUFFER WITH RETRY ====================
 class GlobalChatBuffer {
   constructor() {
     this._messageQueue = [];
+    this._retryQueue = [];
     this._isDestroyed = false;
+    this._isFlushing = false;
     this.maxQueueSize = CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES;
     this.messageTTL = CONSTANTS.MESSAGE_TTL_MS;
     this._flushCallback = null;
@@ -205,10 +220,17 @@ class GlobalChatBuffer {
     
     this._lastCleanupTime = Date.now();
     this._cleanupIntervalMs = CONSTANTS.BUFFER_CLEANUP_INTERVAL_MS;
+    
+    this._pendingMessages = new Map(); // msgId -> { room, msg, pendingClients, retries, timestamp }
+    this._nextMsgId = 0;
   }
   
   setFlushCallback(callback) {
     this._flushCallback = callback;
+  }
+  
+  _generateMsgId() {
+    return `${Date.now()}_${++this._nextMsgId}_${Math.random().toString(36).substr(2, 6)}`;
   }
   
   add(room, message) {
@@ -230,12 +252,16 @@ class GlobalChatBuffer {
       }
     }
     
+    const msgId = this._generateMsgId();
     this._messageQueue.push({
       room,
       message,
+      msgId,
       timestamp: Date.now()
     });
     this._totalQueued++;
+    
+    return msgId;
   }
   
   tick(now) {
@@ -245,6 +271,8 @@ class GlobalChatBuffer {
     
     if (now - this._lastCleanupTime >= this._cleanupIntervalMs) {
       this._cleanupExpiredMessages(now);
+      this._processRetryQueue(now);
+      this._cleanupPendingAcks(now);
       this._lastCleanupTime = now;
     }
     
@@ -261,7 +289,8 @@ class GlobalChatBuffer {
     const expiredIndices = [];
     
     for (let i = this._messageQueue.length - 1; i >= 0; i--) {
-      if (now - this._messageQueue[i].timestamp > this.messageTTL) {
+      const msgAge = now - this._messageQueue[i].timestamp;
+      if (msgAge > this.messageTTL + 1000) {
         expiredIndices.push(i);
       }
     }
@@ -278,52 +307,119 @@ class GlobalChatBuffer {
     }
   }
   
-  _flush() {
-    if (this._messageQueue.length === 0 || !this._flushCallback) return;
-    
-    const roomGroups = {};
-    const batch = [...this._messageQueue];
-    this._messageQueue = [];
-    this._totalQueued = 0;
-    
-    for (const item of batch) {
-      if (!roomGroups[item.room]) {
-        roomGroups[item.room] = [];
+  _processRetryQueue(now) {
+    const toRetry = this._retryQueue.filter(item => now >= item.nextRetry);
+    for (const item of toRetry) {
+      if (item.retries >= CONSTANTS.MAX_CHAT_RETRIES) {
+        console.error(`[CHAT] Failed to send after ${CONSTANTS.MAX_CHAT_RETRIES} retries:`, item.msgId);
+        continue;
       }
-      roomGroups[item.room].push(item.message);
+      
+      const sent = this._sendWithCallback(item.room, item.message, item.msgId);
+      if (!sent) {
+        item.retries++;
+        item.nextRetry = now + (CONSTANTS.CHAT_RETRY_DELAY_MS * Math.pow(2, item.retries));
+        this._retryQueue.push(item);
+      }
     }
     
-    let errorCount = 0;
-    for (const room in roomGroups) {
-      const msgs = roomGroups[room];
-      for (const msg of msgs) {
-        try {
-          this._flushCallback(room, msg);
-        } catch (e) {
-          errorCount++;
+    this._retryQueue = this._retryQueue.filter(item => now < item.nextRetry);
+  }
+  
+  _cleanupPendingAcks(now) {
+    for (const [msgId, pending] of this._pendingMessages) {
+      if (now - pending.timestamp > CONSTANTS.CHAT_ACK_TIMEOUT_MS * 3) {
+        this._pendingMessages.delete(msgId);
+      }
+    }
+  }
+  
+  _sendWithCallback(room, message, msgId) {
+    if (!this._flushCallback) return false;
+    try {
+      this._flushCallback(room, message, msgId);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  
+  _flush() {
+    if (this._messageQueue.length === 0 || !this._flushCallback) return;
+    if (this._isFlushing) return;
+    
+    this._isFlushing = true;
+    
+    try {
+      const roomGroups = {};
+      const batch = [...this._messageQueue];
+      this._messageQueue = [];
+      this._totalQueued = 0;
+      
+      for (const item of batch) {
+        if (!roomGroups[item.room]) {
+          roomGroups[item.room] = [];
+        }
+        roomGroups[item.room].push({ message: item.message, msgId: item.msgId });
+      }
+      
+      let errorCount = 0;
+      for (const room in roomGroups) {
+        const items = roomGroups[room];
+        for (const item of items) {
+          try {
+            this._flushCallback(room, item.message, item.msgId);
+          } catch (e) {
+            errorCount++;
+            this._retryQueue.push({
+              room,
+              message: item.message,
+              msgId: item.msgId,
+              retries: 0,
+              nextRetry: Date.now() + CONSTANTS.CHAT_RETRY_DELAY_MS
+            });
+          }
         }
       }
+      
+      if (errorCount > 0) {
+        console.warn(`[BUFFER] ${errorCount} messages moved to retry queue`);
+      }
+    } finally {
+      this._isFlushing = false;
     }
   }
   
   _sendImmediate(room, message) {
     if (this._flushCallback) {
       try {
-        this._flushCallback(room, message);
+        this._flushCallback(room, message, this._generateMsgId());
       } catch (e) {}
     }
   }
   
   async flushAll() {
-    while (this._messageQueue.length > 0) {
+    while (this._messageQueue.length > 0 || this._retryQueue.length > 0) {
       this._flush();
       await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+  
+  ackMessage(msgId, clientId) {
+    const pending = this._pendingMessages.get(msgId);
+    if (pending && pending.pendingClients) {
+      pending.pendingClients.delete(clientId);
+      if (pending.pendingClients.size === 0) {
+        this._pendingMessages.delete(msgId);
+      }
     }
   }
   
   getStats() {
     return {
       queuedMessages: this._messageQueue.length,
+      retryQueue: this._retryQueue.length,
+      pendingAcks: this._pendingMessages.size,
       totalQueued: this._totalQueued,
       maxQueueSize: this.maxQueueSize,
       flushIntervalMs: this._flushIntervalMs,
@@ -334,8 +430,9 @@ class GlobalChatBuffer {
   async destroy() {
     this._isDestroyed = true;
     
-    const messages = [...this._messageQueue];
+    const messages = [...this._messageQueue, ...this._retryQueue];
     this._messageQueue = [];
+    this._retryQueue = [];
     this._totalQueued = 0;
     
     const roomGroups = {};
@@ -356,6 +453,7 @@ class GlobalChatBuffer {
     }
     
     this._flushCallback = null;
+    this._pendingMessages.clear();
   }
 }
 
@@ -691,8 +789,8 @@ export class ChatServer2 {
     this._cleanupInterval = null;
     
     this.chatBuffer = new GlobalChatBuffer();
-    this.chatBuffer.setFlushCallback((room, msg) => {
-      this._sendDirectToRoom(room, msg);
+    this.chatBuffer.setFlushCallback((room, msg, msgId) => {
+      this._sendDirectToRoom(room, msg, msgId);
     });
     
     try {
@@ -818,12 +916,11 @@ export class ChatServer2 {
       try {
         const bufferStats = this.chatBuffer.getStats();
         if (bufferStats.queuedMessages > 40) {
-          console.log(`[MASTER TICK] Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs`);
+          console.log(`[MASTER TICK] Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs, Retry: ${bufferStats.retryQueue}`);
         }
       } catch (e) {}
     }
     
-    // HEALTH CHECK setiap 60 tick
     if (this._tickCounter % 60 === 0) {
       await this._healthCheck();
     }
@@ -1347,23 +1444,26 @@ export class ChatServer2 {
     }
   }
   
-  _sendDirectToRoom(room, msg) {
+  _sendDirectToRoom(room, msg, msgId = null) {
     let clientArray = this.roomClients.get(room);
     if (!clientArray?.length) return 0;
     
-    const snapshot = clientArray.filter(ws => ws !== null);
+    const liveClients = clientArray.filter(ws => 
+      ws && ws.readyState === 1 && !ws._isClosing && ws.roomname === room
+    );
+    
+    if (liveClients.length === 0) return 0;
+    
     const messageStr = safeStringify(msg);
     let sentCount = 0;
     
-    for (let i = 0; i < snapshot.length; i++) {
-      const client = snapshot[i];
-      if (client && client.readyState === 1 && !client._isClosing && client.roomname === room) {
-        try {
-          client.send(messageStr);
-          sentCount++;
-        } catch (e) {
-          this.safeWebSocketCleanup(client).catch(() => {});
-        }
+    for (let i = 0; i < liveClients.length; i++) {
+      const client = liveClients[i];
+      try {
+        client.send(messageStr);
+        sentCount++;
+      } catch (e) {
+        this.safeWebSocketCleanup(client).catch(() => {});
       }
     }
     return sentCount;
@@ -1799,17 +1899,49 @@ export class ChatServer2 {
         
         case "private": {
           const [, idt, url, msg, sender] = data;
-          if (!this._validateUserId(idt)) break;
-          const out = ["private", idt, url, msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "", Date.now(), sender?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || ""];
+          
+          // VALIDASI: Jika username (sender) kosong, JANGAN KIRIM
+          if (!isValidUsername(sender)) {
+            console.warn(`[PV] Rejected private message from invalid sender: "${sender}"`);
+            await this.safeSend(ws, ["error", "Invalid sender username"]);
+            break;
+          }
+          
+          // VALIDASI: Jika target username kosong, JANGAN KIRIM
+          if (!isValidUsername(idt)) {
+            console.warn(`[PV] Rejected private message to invalid target: "${idt}"`);
+            await this.safeSend(ws, ["error", "Invalid target username"]);
+            break;
+          }
+          
+          // VALIDASI: Pesan tidak boleh kosong
+          const sanitizedMsg = msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "";
+          if (sanitizedMsg.trim().length === 0) {
+            await this.safeSend(ws, ["error", "Message cannot be empty"]);
+            break;
+          }
+          
+          const out = ["private", idt, url, sanitizedMsg, Date.now(), sender];
+          
+          // Kirim ke pengirim sebagai konfirmasi
           await this.safeSend(ws, out);
+          
+          // Kirim ke target jika online
           const targetConnections = this.userConnections.get(idt);
           if (targetConnections) {
+            let sentToTarget = false;
             for (const client of targetConnections) {
               if (client && client.readyState === 1 && !client._isClosing) {
                 await this.safeSend(client, out);
+                sentToTarget = true;
                 break;
               }
             }
+            if (!sentToTarget) {
+              await this.safeSend(ws, ["error", `User ${idt} is offline`]);
+            }
+          } else {
+            await this.safeSend(ws, ["error", `User ${idt} is offline`]);
           }
           break;
         }
@@ -2126,6 +2258,7 @@ export class ChatServer2 {
     console.log(`[STATS] Active: ${activeReal}/${this._activeClients.size}, ` +
                 `Users: ${this.userConnections.size}, ` +
                 `Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs, ` +
+                `Retry: ${bufferStats.retryQueue}, ` +
                 `Rooms: ${this.roomManagers.size}`);
   }
   
