@@ -700,6 +700,59 @@ class RoomManager {
   }
 }
 
+// ==================== LOW CARD GAME MANAGER (STUB) ====================
+// Jika Anda memiliki file lowcard.js, import di atas
+// Jika tidak, ini adalah stub minimal
+class LowCardGameManager {
+  constructor(chatServer) {
+    this.chatServer = chatServer;
+    this.games = new Map(); // room -> game state
+    console.log('[GAME] LowCardGameManager stub initialized');
+  }
+  
+  async handleEvent(ws, data) {
+    const event = data[0];
+    const room = ws.roomname;
+    
+    if (!room || !this.games.has(room)) {
+      if (event === 'gameLowCardStart') {
+        this.games.set(room, {
+          players: new Map(),
+          currentNumber: 1,
+          active: true,
+          startTime: Date.now()
+        });
+        await this.chatServer.safeSend(ws, ['gameLowCardStarted', room, 'Game started!']);
+      }
+      return;
+    }
+    
+    const game = this.games.get(room);
+    
+    switch(event) {
+      case 'gameLowCardJoin':
+        game.players.set(ws.idtarget, { ws, cards: [], joined: Date.now() });
+        await this.chatServer.safeSend(ws, ['gameLowCardJoined', room, 'You joined the game!']);
+        break;
+        
+      case 'gameLowCardNumber':
+        const number = data[2];
+        game.currentNumber = number;
+        this.chatServer.broadcastToRoom(room, ['gameLowCardNumberUpdate', room, number]);
+        break;
+        
+      case 'gameLowCardEnd':
+        this.games.delete(room);
+        this.chatServer.broadcastToRoom(room, ['gameLowCardEnded', room, 'Game ended!']);
+        break;
+    }
+  }
+  
+  async destroy() {
+    this.games.clear();
+  }
+}
+
 // ==================== MAIN CHATSERVER CLASS ====================
 export class ChatServer2 {
   constructor(state, env) {
@@ -770,11 +823,10 @@ export class ChatServer2 {
   
   async _keepAlive() {
     try {
-      // Ping ke health endpoint sendiri
-      const url = `https://${this.env?.__host || 'chat-cloudflare.chatmozapp.workers.dev'}/health`;
-      await fetch(url, { method: 'GET' });
+      // Keep-alive untuk Durable Object
+      await this.state.storage.put('lastAlive', Date.now());
     } catch (error) {
-      // Silent fail, keep-alive hanya preventif
+      // Silent fail
     }
   }
   
@@ -2231,16 +2283,16 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER_2.get(chatId);
+      const id = env.CHAT_SERVER_2.idFromName("chat-room");
+      const obj = env.CHAT_SERVER_2.get(id);
       
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        return chatObj.fetch(req);
+        return obj.fetch(req);
       }
       
       const url = new URL(req.url);
       if (["/health", "/debug/memory", "/debug/roomcounts", "/debug/leak", "/debug/gc", "/shutdown"].includes(url.pathname)) {
-        return chatObj.fetch(req);
+        return obj.fetch(req);
       }
       
       return new Response("ChatServer2 Running - Cloudflare Workers", {
