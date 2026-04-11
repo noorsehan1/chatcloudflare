@@ -1,15 +1,12 @@
-// index.js - ChatServer2 FINAL - NO MEMORY LEAK - 1 TIMER ONLY
+// index.js - ChatServer2 - NO FILTERS, NO LIMITS
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   MAX_MESSAGE_SIZE: 4000,
-  MAX_MESSAGE_LENGTH: 200,
-  MAX_USERNAME_LENGTH: 25,
-  MAX_GIFT_NAME: 40,
-  MAX_RATE_LIMIT: 10,
-  RATE_WINDOW: 10000,
+  MAX_RATE_LIMIT: 40,
+  RATE_WINDOW: 60000,
   MAX_JSON_DEPTH: 30,
   POINTS_CACHE_MS: 30,
   MESSAGE_TTL_MS: 3000,
@@ -42,7 +39,6 @@ function safeStringify(obj) {
         if (seen.has(value)) return '[Circular]';
         seen.add(value);
       }
-      if (typeof value === 'string' && value.length > 500) return value.substring(0, 500);
       return value;
     });
   } catch (e) {
@@ -272,7 +268,6 @@ export class ChatServer2 {
       this.roomClients.set(room, []);
     }
     
-    // SATU-SATUNYA TIMER
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TIMER_INTERVAL);
     this._tickCounter = 0;
   }
@@ -653,7 +648,7 @@ export class ChatServer2 {
           if (!roomList.includes(room)) return;
           const rm = this.roomManagers.get(room);
           if (rm && rm.getMute()) return;
-          this.broadcastToRoom(room, ["chat", room, noimg, user?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH), msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH), userColor, textColor]);
+          this.broadcastToRoom(room, ["chat", room, noimg, user, msg, userColor, textColor]);
           break;
         }
         case "updatePoint": {
@@ -749,7 +744,7 @@ export class ChatServer2 {
         }
         case "private": {
           const [, target, url, msg, sender] = data;
-          const out = ["private", target, url, msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH), Date.now(), sender?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH)];
+          const out = ["private", target, url, msg, Date.now(), sender];
           await this.safeSend(ws, out);
           const conns = this.userConnections.get(target);
           if (conns) {
@@ -799,7 +794,7 @@ export class ChatServer2 {
         case "gift": {
           const [, room, sender, receiver, gift] = data;
           if (ws.roomname !== room || ws.idtarget !== sender) return;
-          this.broadcastToRoom(room, ["gift", room, sender, receiver, gift?.slice(0, CONSTANTS.MAX_GIFT_NAME), Date.now()]);
+          this.broadcastToRoom(room, ["gift", room, sender, receiver, gift, Date.now()]);
           break;
         }
         case "rollangak": {
