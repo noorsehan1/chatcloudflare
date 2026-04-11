@@ -964,7 +964,7 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const id = env.CHAT_SERVER.idFromName("default");
+      const id = env.CHAT_SERVER_2.idFromName("default");
       const obj = env.CHAT_SERVER_2.get(id);
       return obj.fetch(req);
     } catch(e) {
