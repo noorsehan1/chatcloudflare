@@ -1,23 +1,19 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
-// FIX: User online tidak akan dihapus meskipun diam
-// FIX: All memory leaks addressed
+// DENGAN PROTEKSI CRASH DAN TIMER MATI
 import { LowCardGameManager } from "./lowcard.js";
 
-// ==================== CONSTANTS UNTUK CLOUDFLARE WORKERS ====================
+// ==================== CONSTANTS ====================
 const CONSTANTS = Object.freeze({
-  // MEMORY CONFIGURATION
   MAX_HEAP_SIZE_MB: 70,
   GC_INTERVAL_MS: 3 * 60 * 1000,
   
-  // BUFFER CONFIGURATION - GLOBAL BUFFER UNTUK SEMUA ROOM
-  MAX_TOTAL_BUFFER_MESSAGES: 50,
+  MAX_TOTAL_BUFFER_MESSAGES: 100,
   MAX_CHAT_BUFFER_SIZE: 20,
-  MESSAGE_TTL_MS: 8000,
-  BUFFER_FLUSH_INTERVAL_MS: 50,
+  MESSAGE_TTL_MS: 5000,
   MAX_BUFFER_AGE_MS: 5000,
-  BUFFER_ROOM_TTL_MS: 60000,
+  BUFFER_FLUSH_INTERVAL_MS: 50,
+  BUFFER_CLEANUP_INTERVAL_MS: 1000,
   
-  // CONNECTION LIMITS
   MAX_GLOBAL_CONNECTIONS: 250,
   MAX_ACTIVE_CLIENTS_LIMIT: 200,
   MAX_ROOM_CLIENTS_LIMIT: 200,
@@ -25,28 +21,22 @@ const CONSTANTS = Object.freeze({
   MAX_RATE_LIMITER_SIZE: 500,
   MAX_CONNECTIONS_PER_USER: 1,
   
-  // MEMORY LIMITS - TAMBAHAN UNTUK CEK MEMORY LEAK
   MAX_ACTIVE_CLIENTS_ABS: 500,
   MAX_USER_MAPS_SIZE: 1000,
-  MAX_LAST_SEEN_SIZE: 2000,
   MAX_CLEANUP_BATCH: 50,
-  FORCE_CLEANUP_INTERVAL: 5 * 60 * 1000, // 5 menit
+  FORCE_CLEANUP_INTERVAL: 5 * 60 * 1000,
   
-  // SEATS
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   
-  // RATE LIMIT
   MAX_RATE_LIMIT: 40,
   RATE_WINDOW: 60000,
   
-  // MESSAGE LIMITS
   MAX_MESSAGE_SIZE: 4000,
   MAX_MESSAGE_LENGTH: 200,
   MAX_USERNAME_LENGTH: 25,
   MAX_GIFT_NAME: 40,
   
-  // CLEANUP
   CLEANUP_INTERVAL: 10000,
   MAX_USER_IDLE: 2 * 60 * 1000,
   ROOM_MANAGER_IDLE_TIMEOUT: 3 * 60 * 1000,
@@ -54,7 +44,6 @@ const CONSTANTS = Object.freeze({
   CLEANUP_DELAY_MS: 5,
   MAX_CLEANUP_DURATION_MS: 30,
   
-  // TIMER
   NUMBER_TICK_INTERVAL: 15 * 60 * 1000,
   MASTER_TICK_INTERVAL_MS: 1000,
   LOCK_TIMEOUT_MS: 2000,
@@ -62,16 +51,22 @@ const CONSTANTS = Object.freeze({
   MAX_TIMEOUT_MS: 5000,
   MAX_TIMER_MS: 2147483647,
   
-  // LAINNYA
   MAX_JSON_DEPTH: 30,
   MAX_ARRAY_SIZE: 80,
   POINTS_CACHE_MS: 30,
   ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
   
-  // MEMORY LIMITS FOR CLEANUP
   MAX_USERS_BEFORE_CLEANUP: 100,
   MAX_SEATS_BEFORE_CLEANUP: 500,
   EMERGENCY_CLEANUP_INTERVAL_MS: 30000,
+  
+  // TIMER SAFETY
+  MASTER_TICK_TIMEOUT_MS: 3000,
+  NUMBER_TICK_TIMEOUT_MS: 5000,
+  MAX_CONSECUTIVE_ERRORS: 5,
+  HEALTH_CHECK_INTERVAL: 60000,
+  NUMBER_TICK_DEAD_THRESHOLD_MS: 180000,
+  MASTER_TICK_STUCK_THRESHOLD_MS: 10000,
 });
 
 const roomList = Object.freeze([
@@ -181,7 +176,7 @@ class MemoryMonitor {
     try {
       const now = Date.now();
       if (now - this.lastMemoryLog > 60000) {
-        console.log(`[MEMORY] Cloudflare Workers - memory monitoring disabled`);
+        console.log(`[MEMORY] Active clients: ${global._activeClients?.size || 0}`);
         this.lastMemoryLog = now;
       }
       return false;
@@ -191,34 +186,29 @@ class MemoryMonitor {
   }
 }
 
-// ==================== GLOBAL CHAT BUFFER (FIXED MEMORY LEAK) ====================
+// ==================== GLOBAL CHAT BUFFER ====================
 class GlobalChatBuffer {
   constructor() {
     this._messageQueue = [];
-    this._flushTimer = null;
     this._isDestroyed = false;
     this.maxQueueSize = CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES;
-    this.flushInterval = CONSTANTS.BUFFER_FLUSH_INTERVAL_MS;
-    this.maxAge = CONSTANTS.MAX_BUFFER_AGE_MS;
     this.messageTTL = CONSTANTS.MESSAGE_TTL_MS;
     this._flushCallback = null;
     this._totalQueued = 0;
     this.lastWarningTime = 0;
     this.WARNING_THRESHOLD = 80;
-    this.lastAgeWarningTime = 0;
+    
+    this._lastFlushTime = Date.now();
+    this._flushIntervalMs = CONSTANTS.BUFFER_FLUSH_INTERVAL_MS;
+    this._flushCounter = 0;
+    this._ticksPerFlush = Math.max(1, Math.floor(this._flushIntervalMs / CONSTANTS.MASTER_TICK_INTERVAL_MS));
+    
+    this._lastCleanupTime = Date.now();
+    this._cleanupIntervalMs = CONSTANTS.BUFFER_CLEANUP_INTERVAL_MS;
   }
   
   setFlushCallback(callback) {
     this._flushCallback = callback;
-  }
-  
-  _startTimer() {
-    if (this._flushTimer) clearTimeout(this._flushTimer);
-    if (this._isDestroyed) return;
-    
-    this._flushTimer = setTimeout(() => {
-      this._flush();
-    }, this.flushInterval);
   }
   
   add(room, message) {
@@ -240,33 +230,34 @@ class GlobalChatBuffer {
       }
     }
     
-    const now = Date.now();
-    
-    const oldestMessage = this._messageQueue[0];
-    if (oldestMessage && now - oldestMessage.timestamp > this.maxAge) {
-      const nowTime = Date.now();
-      if (nowTime - this.lastAgeWarningTime > 60000) {
-        console.warn(`[GlobalChatBuffer] Old message detected: ${now - oldestMessage.timestamp}ms`);
-        this.lastAgeWarningTime = nowTime;
-      }
-    }
-    
     this._messageQueue.push({
       room,
       message,
-      timestamp: now
+      timestamp: Date.now()
     });
     this._totalQueued++;
+  }
+  
+  tick(now) {
+    if (this._isDestroyed) return;
     
-    if (!this._flushTimer) {
-      this._startTimer();
+    this._flushCounter++;
+    
+    if (now - this._lastCleanupTime >= this._cleanupIntervalMs) {
+      this._cleanupExpiredMessages(now);
+      this._lastCleanupTime = now;
+    }
+    
+    if (this._flushCounter >= this._ticksPerFlush) {
+      this._flush();
+      this._flushCounter = 0;
+      this._lastFlushTime = now;
     }
   }
   
-  _cleanupExpiredMessages() {
+  _cleanupExpiredMessages(now) {
     if (this._isDestroyed) return;
     
-    const now = Date.now();
     const expiredIndices = [];
     
     for (let i = this._messageQueue.length - 1; i >= 0; i--) {
@@ -280,29 +271,15 @@ class GlobalChatBuffer {
       this._totalQueued--;
     }
     
-    // FORCE CLEANUP jika queue terlalu besar (>80%)
     if (this._messageQueue.length > this.maxQueueSize * 0.8) {
       const toRemove = Math.floor(this._messageQueue.length * 0.3);
       this._messageQueue.splice(0, toRemove);
       console.warn(`[BUFFER] Force cleaned ${toRemove} old messages`);
     }
-    
-    if (expiredIndices.length > 0) {
-      console.log(`[GlobalChatBuffer] Cleaned ${expiredIndices.length} expired messages`);
-    }
   }
   
   _flush() {
-    if (this._flushTimer) {
-      clearTimeout(this._flushTimer);
-      this._flushTimer = null;
-    }
-    
     if (this._messageQueue.length === 0 || !this._flushCallback) return;
-    
-    this._cleanupExpiredMessages();
-    
-    if (this._messageQueue.length === 0) return;
     
     const roomGroups = {};
     const batch = [...this._messageQueue];
@@ -324,17 +301,8 @@ class GlobalChatBuffer {
           this._flushCallback(room, msg);
         } catch (e) {
           errorCount++;
-          console.error(`[GlobalChatBuffer] Flush error for room ${room}:`, e);
         }
       }
-    }
-    
-    if (errorCount > 0) {
-      console.warn(`[GlobalChatBuffer] ${errorCount} messages failed to flush`);
-    }
-    
-    if (this._messageQueue.length > 0 && !this._isDestroyed) {
-      this._startTimer();
     }
   }
   
@@ -342,9 +310,7 @@ class GlobalChatBuffer {
     if (this._flushCallback) {
       try {
         this._flushCallback(room, message);
-      } catch (e) {
-        console.error(`[GlobalChatBuffer] Immediate send error:`, e);
-      }
+      } catch (e) {}
     }
   }
   
@@ -353,23 +319,15 @@ class GlobalChatBuffer {
       this._flush();
       await new Promise(resolve => setTimeout(resolve, 5));
     }
-    
-    if (this._flushTimer) {
-      clearTimeout(this._flushTimer);
-      this._flushTimer = null;
-    }
   }
   
   getStats() {
-    const estimatedMemoryKB = Math.round(
-      this._messageQueue.length * CONSTANTS.MAX_MESSAGE_SIZE / 1024
-    );
-    
     return {
       queuedMessages: this._messageQueue.length,
       totalQueued: this._totalQueued,
-      estimatedMemoryKB: Math.min(estimatedMemoryKB, 800),
-      maxQueueSize: this.maxQueueSize
+      maxQueueSize: this.maxQueueSize,
+      flushIntervalMs: this._flushIntervalMs,
+      cleanupIntervalMs: this._cleanupIntervalMs
     };
   }
   
@@ -393,22 +351,15 @@ class GlobalChatBuffer {
       for (const msg of msgs) {
         try {
           await this._flushCallback(room, msg);
-        } catch (e) {
-          console.error(`[GlobalChatBuffer] Destroy error:`, e);
-        }
+        } catch (e) {}
       }
-    }
-    
-    if (this._flushTimer) {
-      clearTimeout(this._flushTimer);
-      this._flushTimer = null;
     }
     
     this._flushCallback = null;
   }
 }
 
-// ==================== RATE LIMITER (FIXED MEMORY LEAK) ====================
+// ==================== RATE LIMITER ====================
 class RateLimiter {
   constructor(windowMs = CONSTANTS.RATE_WINDOW, maxRequests = CONSTANTS.MAX_RATE_LIMIT) {
     this.windowMs = windowMs;
@@ -455,7 +406,6 @@ class RateLimiter {
       }
     }
     
-    // FORCE CLEANUP jika masih terlalu besar
     if (this.requests.size > CONSTANTS.MAX_RATE_LIMITER_SIZE) {
       this._forceCleanup();
     }
@@ -470,14 +420,12 @@ class RateLimiter {
     }
     
     entries.sort((a, b) => a.timestamp - b.timestamp);
-    const keepCount = Math.floor(CONSTANTS.MAX_RATE_LIMITER_SIZE * 0.5); // Lebih agresif
+    const keepCount = Math.floor(CONSTANTS.MAX_RATE_LIMITER_SIZE * 0.5);
     
     const toDelete = entries.slice(keepCount);
     for (const item of toDelete) {
       this.requests.delete(item.userId);
     }
-    
-    console.log(`[RATE] Force cleaned to ${this.requests.size} entries`);
   }
   
   destroy() {
@@ -525,10 +473,10 @@ class SeatData {
       this.noimageUrl = other.noimageUrl?.slice(0, 255);
       this.namauser = other.namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH);
       this.color = other.color?.slice(0, 50);
-      this.itembawah = parseInt(other.itembawah);
-      this.itematas = parseInt(other.itematas);
-      this.vip = parseInt(other.vip);
-      this.viptanda = parseInt(other.viptanda);
+      this.itembawah = parseInt(other.itembawah) || 0;
+      this.itematas = parseInt(other.itematas) || 0;
+      this.vip = parseInt(other.vip) || 0;
+      this.viptanda = parseInt(other.viptanda) || 0;
       if (other.lastPoint) {
         this.lastPoint = {
           x: other.lastPoint.x,
@@ -715,7 +663,7 @@ class RoomManager {
   }
 }
 
-// ==================== MAIN CHATSERVER CLASS (FIXED MEMORY LEAKS) ====================
+// ==================== MAIN CHATSERVER CLASS ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -735,7 +683,6 @@ export class ChatServer2 {
     this.userToSeat = new Map();
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
-    this.userLastSeen = new Map();
     this.roomClients = new Map();
     this._activeListeners = new Map();
     this._clientWebSockets = new Set();
@@ -761,11 +708,13 @@ export class ChatServer2 {
     this.intervalMillis = Math.min(CONSTANTS.NUMBER_TICK_INTERVAL, CONSTANTS.MAX_TIMER_MS);
     this.numberTickTimer = null;
     this._tickRunning = false;
+    this._tickErrorCount = 0;
+    this._lastTickSuccess = Date.now();
     
-    // MASTER TIMER PROPERTIES
     this._masterTimerInterval = null;
     this._lastMasterTick = Date.now();
     this._tickCounter = 0;
+    this._masterTickRunning = false;
     
     for (const room of roomList) {
       this.roomManagers.set(room, new RoomManager(room));
@@ -783,77 +732,79 @@ export class ChatServer2 {
       this._emergencyCleanup();
     }, CONSTANTS.EMERGENCY_CLEANUP_INTERVAL_MS);
     
-    // FORCE CLEANUP INTERVAL untuk memory leak
     this._forceCleanupInterval = setInterval(() => {
       this._forceMemoryCleanup();
     }, CONSTANTS.FORCE_CLEANUP_INTERVAL);
+    
+    // GLOBAL ERROR HANDLER
+    if (typeof process !== 'undefined' && process.on) {
+      process.on('unhandledRejection', (reason, promise) => {
+        console.error('[GLOBAL] Unhandled Rejection:', reason);
+      });
+      process.on('uncaughtException', (error) => {
+        console.error('[GLOBAL] Uncaught Exception:', error);
+      });
+    }
+    
+    this._lastHealthCheck = Date.now();
+    this._consecutiveErrors = 0;
   }
   
-  // ============ FORCE MEMORY CLEANUP ============
-  _forceMemoryCleanup() {
-    if (this._isClosing) return;
-    
-    console.log('[FORCE CLEANUP] Starting aggressive memory cleanup...');
-    
-    // 1. Bersihkan userLastSeen yang sudah tidak memiliki koneksi
-    const now = Date.now();
-    for (const [userId, lastSeen] of this.userLastSeen) {
-      const hasConnection = this.userConnections.has(userId);
-      if (!hasConnection) {
-        this.userLastSeen.delete(userId);
-      }
-    }
-    
-    // 2. Batasi ukuran userLastSeen
-    if (this.userLastSeen.size > CONSTANTS.MAX_LAST_SEEN_SIZE) {
-      const entries = Array.from(this.userLastSeen.entries());
-      entries.sort((a, b) => a[1] - b[1]);
-      const toDelete = entries.slice(0, this.userLastSeen.size - CONSTANTS.MAX_LAST_SEEN_SIZE);
-      for (const [userId] of toDelete) {
-        this.userLastSeen.delete(userId);
-      }
-      console.log(`[FORCE CLEANUP] Trimmed userLastSeen to ${this.userLastSeen.size}`);
-    }
-    
-    // 3. Compress semua room clients
-    this._compressRoomClients();
-    
-    // 4. Bersihkan active clients yang zombie
-    const zombies = [];
-    for (const ws of this._activeClients) {
-      if (!ws || ws.readyState !== 1) {
-        zombies.push(ws);
-      }
-    }
-    for (const ws of zombies) {
-      this._activeClients.delete(ws);
-    }
-    
-    // 5. Force rate limiter cleanup
-    this.rateLimiter.cleanup();
-    
-    console.log(`[FORCE CLEANUP] Complete: Active=${this._activeClients.size}, Users=${this.userConnections.size}, LastSeen=${this.userLastSeen.size}`);
-  }
-  
-  // ============ MASTER TIMER METHODS ============
+  // ============ MASTER TIMER DENGAN PROTEKSI ============
   startMasterTimer() {
     if (this._masterTimerInterval) {
       clearInterval(this._masterTimerInterval);
     }
     
     this._masterTimerInterval = setInterval(() => {
-      this._masterTick();
+      this._safeMasterTick();
     }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
     
-    console.log('[MASTER TIMER] Started with interval:', CONSTANTS.MASTER_TICK_INTERVAL_MS, 'ms');
+    console.log('[MASTER TIMER] Started with safety wrapper');
   }
   
-  _masterTick() {
+  async _safeMasterTick() {
     if (this._isClosing) return;
+    if (this._masterTickRunning) {
+      console.warn('[MASTER TIMER] Previous tick still running, skipping');
+      return;
+    }
     
+    this._masterTickRunning = true;
+    const startTime = Date.now();
+    
+    try {
+      await Promise.race([
+        this._masterTickInternal(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Master tick timeout')), CONSTANTS.MASTER_TICK_TIMEOUT_MS)
+        )
+      ]);
+    } catch (error) {
+      console.error('[MASTER TIMER] CRITICAL ERROR:', error);
+      this._consecutiveErrors++;
+    } finally {
+      this._masterTickRunning = false;
+      
+      const duration = Date.now() - startTime;
+      if (duration > 5000) {
+        console.warn(`[MASTER TIMER] Slow tick detected: ${duration}ms`);
+      }
+    }
+  }
+  
+  async _masterTickInternal() {
     const now = Date.now();
     this._lastMasterTick = now;
     this._tickCounter++;
+    
+    if (this.chatBuffer && typeof this.chatBuffer.tick === 'function') {
+      try {
+        this.chatBuffer.tick(now);
+      } catch (error) {
+        console.error('[MASTER TICK] Buffer error:', error);
+      }
+    }
     
     if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
       try {
@@ -864,8 +815,215 @@ export class ChatServer2 {
     }
     
     if (this._tickCounter % 60 === 0) {
-      // Optional logging
+      try {
+        const bufferStats = this.chatBuffer.getStats();
+        if (bufferStats.queuedMessages > 40) {
+          console.log(`[MASTER TICK] Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs`);
+        }
+      } catch (e) {}
     }
+    
+    // HEALTH CHECK setiap 60 tick
+    if (this._tickCounter % 60 === 0) {
+      await this._healthCheck();
+    }
+  }
+  
+  async _healthCheck() {
+    const now = Date.now();
+    const timeSinceLastNumberTick = now - (this._lastTickSuccess || now);
+    
+    if (timeSinceLastNumberTick > CONSTANTS.NUMBER_TICK_DEAD_THRESHOLD_MS) {
+      console.error('[HEALTH] Number tick appears DEAD! Forcing restart...');
+      this._emergencyNumberRecovery();
+    }
+    
+    const timeSinceLastMasterTick = now - this._lastMasterTick;
+    if (timeSinceLastMasterTick > CONSTANTS.MASTER_TICK_STUCK_THRESHOLD_MS) {
+      console.error('[HEALTH] Master tick appears STUCK!');
+      if (this._masterTimerInterval) {
+        clearInterval(this._masterTimerInterval);
+        this._masterTimerInterval = null;
+      }
+      this.startMasterTimer();
+    }
+    
+    const activeCount = this._activeClients.size;
+    if (activeCount > CONSTANTS.MAX_ACTIVE_CLIENTS_ABS * 0.9) {
+      console.warn(`[HEALTH] High connection count: ${activeCount}`);
+      this._emergencyCleanup();
+    }
+  }
+  
+  // ============ NUMBER TICK TIMER DENGAN AUTO-RECOVERY ============
+  startNumberTickTimer() {
+    if (this.numberTickTimer) {
+      clearTimeout(this.numberTickTimer);
+      this.numberTickTimer = null;
+    }
+    
+    this._tickRunning = false;
+    this._tickErrorCount = 0;
+    this._lastTickSuccess = Date.now();
+    
+    const scheduleNext = () => {
+      if (this._isClosing) return;
+      
+      const timeSinceLastSuccess = Date.now() - this._lastTickSuccess;
+      if (timeSinceLastSuccess > 120000) {
+        console.error('[NUMBER TICK] No successful tick for 2 minutes! Forcing recovery...');
+        this._forceRecovery();
+      }
+      
+      let interval = this.intervalMillis;
+      if (interval > CONSTANTS.MAX_TIMER_MS) {
+        interval = CONSTANTS.MAX_TIMER_MS;
+      }
+      
+      this.numberTickTimer = setTimeout(async () => {
+        await this._safeTickWithRetry();
+        scheduleNext();
+      }, interval);
+    };
+    
+    scheduleNext();
+    console.log('[NUMBER TIMER] Started with auto-recovery');
+  }
+  
+  async _safeTickWithRetry() {
+    const MAX_RETRIES = 3;
+    let lastError = null;
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await Promise.race([
+          this._safeTick(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Number tick timeout')), CONSTANTS.NUMBER_TICK_TIMEOUT_MS)
+          )
+        ]);
+        this._tickErrorCount = 0;
+        this._lastTickSuccess = Date.now();
+        return;
+      } catch (error) {
+        lastError = error;
+        this._tickErrorCount++;
+        console.error(`[NUMBER TICK] Attempt ${attempt}/${MAX_RETRIES} failed:`, error);
+        
+        if (attempt < MAX_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+        }
+      }
+    }
+    
+    console.error('[NUMBER TICK] All retries failed! Running emergency recovery...');
+    this._emergencyNumberRecovery();
+  }
+  
+  async _safeTick() {
+    if (this._tickRunning || this._isClosing) return;
+    this._tickRunning = true;
+    
+    try {
+      this.currentNumber = this.currentNumber < this.maxNumber ? this.currentNumber + 1 : 1;
+      
+      for (const roomManager of this.roomManagers.values()) {
+        try {
+          roomManager.setCurrentNumber(this.currentNumber);
+        } catch (e) {
+          console.error(`[NUMBER TICK] Failed to update room ${roomManager.roomName}:`, e);
+        }
+      }
+      
+      const message = safeStringify(["currentNumber", this.currentNumber]);
+      const clientsToNotify = [];
+      
+      for (const client of this._activeClients) {
+        if (client && client.readyState === 1 && client.roomname && !client._isClosing) {
+          clientsToNotify.push(client);
+        }
+      }
+      
+      const batchSize = 50;
+      for (let i = 0; i < clientsToNotify.length; i += batchSize) {
+        const batch = clientsToNotify.slice(i, i + batchSize);
+        for (const client of batch) {
+          try {
+            client.send(message);
+          } catch (e) {}
+        }
+        if (i + batchSize < clientsToNotify.length) {
+          await new Promise(resolve => setTimeout(resolve, 1));
+        }
+      }
+      
+    } catch (error) {
+      console.error('[NUMBER TICK] Tick failed:', error);
+      throw error;
+    } finally {
+      this._tickRunning = false;
+    }
+  }
+  
+  _emergencyNumberRecovery() {
+    console.log('[EMERGENCY] Recovering number tick timer...');
+    
+    this._tickRunning = false;
+    this._tickErrorCount = 0;
+    
+    this.currentNumber = 1;
+    for (const roomManager of this.roomManagers.values()) {
+      try {
+        roomManager.setCurrentNumber(1);
+      } catch (e) {}
+    }
+    
+    if (this.numberTickTimer) {
+      clearTimeout(this.numberTickTimer);
+      this.numberTickTimer = null;
+    }
+    this.startNumberTickTimer();
+    
+    const recoveryMsg = safeStringify(["currentNumber", 1]);
+    for (const client of this._activeClients) {
+      if (client && client.readyState === 1 && !client._isClosing) {
+        try {
+          client.send(recoveryMsg);
+        } catch (e) {}
+      }
+    }
+  }
+  
+  _forceRecovery() {
+    console.log('[FORCE RECOVERY] Forcing timer recovery...');
+    if (this.numberTickTimer) {
+      clearTimeout(this.numberTickTimer);
+      this.numberTickTimer = null;
+    }
+    this._tickRunning = false;
+    this.startNumberTickTimer();
+  }
+  
+  // ============ FORCE MEMORY CLEANUP ============
+  _forceMemoryCleanup() {
+    if (this._isClosing) return;
+    
+    console.log('[FORCE CLEANUP] Starting aggressive memory cleanup...');
+    this._compressRoomClients();
+    
+    const zombies = [];
+    for (const ws of this._activeClients) {
+      if (!ws || ws.readyState !== 1) {
+        zombies.push(ws);
+      }
+    }
+    for (const ws of zombies) {
+      this._activeClients.delete(ws);
+    }
+    
+    this.rateLimiter.cleanup();
+    
+    console.log(`[FORCE CLEANUP] Complete: Active=${this._activeClients.size}, Users=${this.userConnections.size}`);
   }
   
   _hasLiveConnection(userId) {
@@ -903,39 +1061,6 @@ export class ChatServer2 {
     }
     
     this._compressRoomClients();
-    this._checkMemoryAndCleanup();
-  }
-  
-  _checkMemoryAndCleanup() {
-    const totalUsers = this.userConnections.size;
-    const totalSeats = this._getTotalOccupiedSeats();
-    
-    if (totalUsers > CONSTANTS.MAX_USERS_BEFORE_CLEANUP || totalSeats > CONSTANTS.MAX_SEATS_BEFORE_CLEANUP) {
-      console.log(`[MEMORY] High load: ${totalUsers} users, ${totalSeats} seats. Cleaning up...`);
-      
-      const usersWithNoConnection = [];
-      for (const [userId, connections] of this.userConnections) {
-        let hasLiveConnection = false;
-        for (const conn of connections) {
-          if (conn && conn.readyState === 1 && !conn._isClosing) {
-            hasLiveConnection = true;
-            break;
-          }
-        }
-        if (!hasLiveConnection) {
-          usersWithNoConnection.push(userId);
-        }
-      }
-      
-      usersWithNoConnection.sort((a, b) => {
-        return (this.userLastSeen.get(a) || 0) - (this.userLastSeen.get(b) || 0);
-      });
-      
-      const toRemove = Math.floor(usersWithNoConnection.length * 0.5);
-      for (let i = 0; i < toRemove; i++) {
-        this.forceUserCleanup(usersWithNoConnection[i]).catch(() => {});
-      }
-    }
   }
   
   _getTotalOccupiedSeats() {
@@ -1109,7 +1234,6 @@ export class ChatServer2 {
   }
   
   _addToActiveClients(ws) {
-    // Batasi ukuran active clients
     if (this._activeClients.size > CONSTANTS.MAX_ACTIVE_CLIENTS_ABS) {
       this._emergencyCleanup();
     }
@@ -1134,8 +1258,7 @@ export class ChatServer2 {
     if (clientArray) {
       const index = clientArray.indexOf(ws);
       if (index > -1) {
-        // Mark as null instead of splice to avoid array shift
-        clientArray[index] = null;
+        clientArray.splice(index, 1);
       }
     }
   }
@@ -1150,6 +1273,11 @@ export class ChatServer2 {
   }
   
   _cleanupWebSocketListeners(ws) {
+    if (ws._abortController) {
+      try { ws._abortController.abort(); } catch(e) {}
+      ws._abortController = null;
+    }
+    
     const listeners = this._activeListeners.get(ws);
     if (listeners) {
       for (const { event, handler } of listeners) {
@@ -1158,7 +1286,6 @@ export class ChatServer2 {
       this._activeListeners.delete(ws);
     }
     
-    // Hapus semua event listener secara manual
     const events = ['message', 'error', 'close', 'open'];
     for (const event of events) {
       try {
@@ -1168,26 +1295,16 @@ export class ChatServer2 {
       } catch(e) {}
     }
     
-    if (ws._abortController) {
-      try { ws._abortController.abort(); } catch(e) {}
-      ws._abortController = null;
-    }
-    
     const propsToDelete = [
       'roomname', 'idtarget', '_isClosing', '_connectionTime', 
-      '_isCleaningUp', '_lastPing', '_pingTimeout', 'username', 
-      'sessionId', '_reconnectAttempts', '_messageQueue',
-      '_lastMessageTime', '_bytesReceived', '_bytesSent', '_abortController'
+      '_isCleaningUp', 'username', 'sessionId', '_reconnectAttempts',
+      '_messageQueue', '_lastMessageTime', '_bytesReceived', '_bytesSent', '_abortController'
     ];
     
     for (const prop of propsToDelete) {
       try { delete ws[prop]; } catch(e) {
         try { ws[prop] = null; } catch(e2) {}
       }
-    }
-    
-    if (typeof ws.readyState !== 'number') {
-      try { ws.readyState = 3; } catch(e) {}
     }
   }
   
@@ -1208,13 +1325,22 @@ export class ChatServer2 {
       const message = typeof msg === "string" ? msg : safeStringify(msg);
       if (message.length > CONSTANTS.MAX_MESSAGE_SIZE) return false;
       
-      if (ws.readyState === 1 && !ws._isClosing) {
+      try {
         ws.send(message);
         return true;
+      } catch (sendError) {
+        if (sendError.code === 'ECONNRESET' || 
+            sendError.message?.includes('ECONNRESET') ||
+            sendError.message?.includes('CLOSED')) {
+          await this.safeWebSocketCleanup(ws);
+          return false;
+        }
+        throw sendError;
       }
-      return false;
     } catch (error) {
-      if (error.code === 'ERR_INVALID_STATE' || error.message?.includes('CLOSED')) {
+      if (error.code === 'ERR_INVALID_STATE' || 
+          error.message?.includes('CLOSED') ||
+          error.message?.includes('ECONNRESET')) {
         this.safeWebSocketCleanup(ws).catch(() => {});
       }
       return false;
@@ -1225,7 +1351,6 @@ export class ChatServer2 {
     let clientArray = this.roomClients.get(room);
     if (!clientArray?.length) return 0;
     
-    // Filter null values
     const snapshot = clientArray.filter(ws => ws !== null);
     const messageStr = safeStringify(msg);
     let sentCount = 0;
@@ -1409,6 +1534,13 @@ export class ChatServer2 {
     
     try {
       ws._isClosing = true;
+      
+      if (ws.readyState === 1) {
+        try {
+          ws.send(JSON.stringify(["connectionClosed", "Server cleanup"]));
+        } catch (e) {}
+      }
+      
       this.clients.delete(ws);
       this._removeFromActiveClients(ws);
       this._clientWebSockets.delete(ws);
@@ -1423,7 +1555,6 @@ export class ChatServer2 {
         
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
-        this.userLastSeen.delete(userId);
         this._removeUserConnection(userId, ws);
       }
       
@@ -1432,7 +1563,14 @@ export class ChatServer2 {
       }
       
       this._cleanupWebSocketListeners(ws);
-      this._safeCloseWebSocket(ws, 1000, "Normal closure");
+      
+      if (ws.readyState === 1) {
+        try {
+          ws.close(1000, "Normal closure");
+        } catch(e) {
+          try { ws.close(); } catch(e2) {}
+        }
+      }
       
     } catch (error) {} finally {
       this._cleaningUp.delete(ws);
@@ -1450,60 +1588,6 @@ export class ChatServer2 {
   getRoomMute(roomName) {
     if (!roomName || !roomList.includes(roomName)) return false;
     return this.roomManagers.get(roomName).getMute();
-  }
-  
-  startNumberTickTimer() {
-    if (this.numberTickTimer) clearTimeout(this.numberTickTimer);
-    
-    const scheduleNext = () => {
-      if (this._isClosing) return;
-      
-      let interval = this.intervalMillis;
-      if (interval > CONSTANTS.MAX_TIMER_MS) {
-        interval = CONSTANTS.MAX_TIMER_MS;
-      }
-      
-      this.numberTickTimer = setTimeout(async () => {
-        if (this._isClosing) return;
-        
-        try {
-          await this._safeTick();
-        } catch (error) {} finally {
-          scheduleNext();
-        }
-      }, interval);
-    };
-    
-    scheduleNext();
-  }
-  
-  async _safeTick() {
-    if (this._tickRunning || this._isClosing) return;
-    this._tickRunning = true;
-    try {
-      this.currentNumber = this.currentNumber < this.maxNumber ? this.currentNumber + 1 : 1;
-      for (const roomManager of this.roomManagers.values()) {
-        roomManager.setCurrentNumber(this.currentNumber);
-      }
-      
-      const message = safeStringify(["currentNumber", this.currentNumber]);
-      const notifiedUsers = new Set();
-      const clients = Array.from(this._activeClients);
-      
-      for (let i = 0; i < clients.length; i++) {
-        const client = clients[i];
-        if (client?.readyState === 1 && client.roomname && !client._isClosing) {
-          if (!notifiedUsers.has(client.idtarget)) {
-            try {
-              client.send(message);
-              notifiedUsers.add(client.idtarget);
-            } catch (e) {}
-          }
-        }
-      }
-    } finally {
-      this._tickRunning = false;
-    }
   }
   
   async handleSetIdTarget2(ws, id, baru) {
@@ -1618,14 +1702,26 @@ export class ChatServer2 {
       return;
     }
     
-    const data = safeParseJSON(messageStr);
-    if (!data) {
-      this._safeCloseWebSocket(ws, 1008, "Protocol error");
+    let data;
+    try {
+      data = safeParseJSON(messageStr);
+    } catch (e) {
       return;
     }
     
-    if (!Array.isArray(data) || data.length === 0) return;
-    this._processMessage(ws, data, data[0]).catch(error => {});
+    if (!data || !Array.isArray(data) || data.length === 0) return;
+    
+    try {
+      await Promise.race([
+        this._processMessage(ws, data, data[0]),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Message processing timeout')), 5000)
+        )
+      ]);
+    } catch (error) {
+      console.error(`[MESSAGE] Error processing ${data[0]}:`, error);
+      await this.safeSend(ws, ["error", "Processing failed"]);
+    }
   }
   
   async _processMessage(ws, data, evt) {
@@ -1935,26 +2031,9 @@ export class ChatServer2 {
       
       this.userToSeat.delete(userId);
       this.userCurrentRoom.delete(userId);
-      this.userLastSeen.delete(userId);
       this.userConnections.delete(userId);
       
     } catch (error) {}
-  }
-  
-  _cleanupUserLastSeen() {
-    const now = Date.now();
-    const expired = [];
-    
-    for (const [userId, lastSeen] of this.userLastSeen) {
-      const hasLiveConnection = this._hasLiveConnection(userId);
-      if (!hasLiveConnection) {
-        expired.push(userId);
-      }
-    }
-    
-    for (let i = 0; i < expired.length; i++) {
-      this.userLastSeen.delete(expired[i]);
-    }
   }
   
   _cleanupEmptyRooms() {
@@ -1992,11 +2071,6 @@ export class ChatServer2 {
         this._mediumCleanup();
       }
       
-      if (Date.now() - startTime < CONSTANTS.MAX_CLEANUP_DURATION_MS && 
-          this._needsHeavyCleanup()) {
-        await this._heavyCleanup();
-      }
-      
       const now = Date.now();
       if (!this._lastCleanupLog || now - this._lastCleanupLog > 3600000) {
         this._logCleanupStats();
@@ -2009,7 +2083,6 @@ export class ChatServer2 {
   }
   
   _mediumCleanup() {
-    // Bersihkan user connections
     for (const [userId, connections] of this.userConnections) {
       const alive = new Set();
       for (const conn of connections) {
@@ -2026,13 +2099,9 @@ export class ChatServer2 {
     }
     
     this._compressRoomClients();
-    this._cleanupUserLastSeen();
     this._cleanupEmptyRooms();
     this.rateLimiter.cleanup();
     
-    this.chatBuffer._cleanupExpiredMessages();
-    
-    const now = Date.now();
     const zombies = [];
     for (const ws of this._activeClients) {
       if (ws && ws.readyState !== 1) {
@@ -2048,34 +2117,6 @@ export class ChatServer2 {
     }
   }
   
-  async _heavyCleanup() {
-    const now = Date.now();
-    const expiredUsers = [];
-    
-    for (const [userId, connections] of this.userConnections) {
-      let hasLiveConnection = false;
-      for (const conn of connections) {
-        if (conn && conn.readyState === 1 && !conn._isClosing) {
-          hasLiveConnection = true;
-          break;
-        }
-      }
-      if (!hasLiveConnection) {
-        expiredUsers.push(userId);
-      }
-    }
-    
-    for (let i = 0; i < Math.min(expiredUsers.length, CONSTANTS.CLEANUP_BATCH_SIZE * 2); i++) {
-      await this.forceUserCleanup(expiredUsers[i]);
-    }
-  }
-  
-  _needsHeavyCleanup() {
-    const totalClients = this._activeClients.size;
-    const totalUsers = this.userLastSeen.size;
-    return totalClients > 100 || totalUsers > 200;
-  }
-  
   _logCleanupStats() {
     let activeReal = 0;
     for (const c of this._activeClients) {
@@ -2085,8 +2126,7 @@ export class ChatServer2 {
     console.log(`[STATS] Active: ${activeReal}/${this._activeClients.size}, ` +
                 `Users: ${this.userConnections.size}, ` +
                 `Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs, ` +
-                `BufferMem: ${bufferStats.estimatedMemoryKB}KB, ` +
-                `LastSeen: ${this.userLastSeen.size}`);
+                `Rooms: ${this.roomManagers.size}`);
   }
   
   async getMemoryStats() {
@@ -2104,21 +2144,15 @@ export class ChatServer2 {
     return {
       timestamp: Date.now(),
       uptime: Date.now() - this._startTime,
-      memoryUsage: {
-        heapUsedMB: "N/A (Cloudflare Workers)",
-        heapTotalMB: "N/A (Cloudflare Workers)"
-      },
       activeClients: {
         total: this._activeClients.size,
         real: activeReal,
         waste: this._activeClients.size - activeReal
       },
       roomClients: { total: totalRoomClients },
-      clientsSet: this.clients.size,
       userConnections: this.userConnections.size,
       userToSeatSize: this.userToSeat.size,
       userCurrentRoomSize: this.userCurrentRoom.size,
-      userLastSeenSize: this.userLastSeen.size,
       chatBuffer: bufferStats,
       rateLimiterSize: this.rateLimiter?.requests?.size || 0
     };
@@ -2129,7 +2163,6 @@ export class ChatServer2 {
     this._isClosing = true;
     console.log("[SHUTDOWN] Starting graceful shutdown...");
     
-    // Clear all timers
     if (this._masterTimerInterval) {
       clearInterval(this._masterTimerInterval);
       this._masterTimerInterval = null;
@@ -2191,7 +2224,6 @@ export class ChatServer2 {
     this.userToSeat.clear();
     this.userCurrentRoom.clear();
     this.userConnections.clear();
-    this.userLastSeen.clear();
     this._activeListeners.clear();
     this._clientWebSockets.clear();
     this._cleaningUp.clear();
@@ -2217,10 +2249,11 @@ export class ChatServer2 {
             connections: activeCount,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
-            memory: { heapUsedMB: "N/A (Cloudflare Workers)" },
             buffer: bufferStats,
             masterTimer: this._masterTimerInterval ? "running" : "stopped",
-            lastSeenSize: this.userLastSeen.size
+            numberTimer: this.numberTickTimer ? "running" : "stopped",
+            lastTickSuccess: this._lastTickSuccess,
+            tickErrorCount: this._tickErrorCount
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         
@@ -2239,19 +2272,6 @@ export class ChatServer2 {
             counts: counts,
             total: Object.values(counts).reduce((a,b) => a + b, 0)
           }), { headers: { "content-type": "application/json" } });
-        }
-        
-        if (url.pathname === "/debug/leak") {
-          const stats = await this.getMemoryStats();
-          const warnings = [];
-          if (stats.activeClients.waste > 30) warnings.push(`High zombie connections: ${stats.activeClients.waste}`);
-          if (stats.chatBuffer.queuedMessages > 80) warnings.push(`High buffered messages: ${stats.chatBuffer.queuedMessages}`);
-          if (stats.userLastSeenSize > 500) warnings.push(`High userLastSeen size: ${stats.userLastSeenSize}`);
-          if (stats.rateLimiterSize > 400) warnings.push(`High rate limiter size: ${stats.rateLimiterSize}`);
-          return new Response(JSON.stringify({ ...stats, warnings }, null, 2), {
-            status: 200,
-            headers: { "content-type": "application/json" }
-          });
         }
         
         if (url.pathname === "/debug/gc") {
@@ -2345,7 +2365,7 @@ export default {
       }
       
       const url = new URL(req.url);
-      if (["/health", "/debug/memory", "/debug/roomcounts", "/debug/leak", "/debug/gc", "/shutdown"].includes(url.pathname)) {
+      if (["/health", "/debug/memory", "/debug/roomcounts", "/debug/gc", "/shutdown"].includes(url.pathname)) {
         return chatObj.fetch(req);
       }
       
