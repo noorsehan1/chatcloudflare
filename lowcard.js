@@ -2,7 +2,8 @@
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal
-// gameLowCardEnd akan mengirim pesan bahasa Inggris siapa yang kalah
+// KHUSUS lawan bot kalah: kirim gameLowCardClosed + gameLowCardError
+// gameLowCardWinner hanya mengirim 2 parameter - compatible dengan client Java
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -70,6 +71,11 @@ export class LowCardGameManager {
       if (this._isHumanPlayer(playerId)) return true;
     }
     return false;
+  }
+
+  _isBotGame(game) {
+    if (!game) return false;
+    return game.useBots === true && game.botPlayers.size > 0;
   }
 
   cleanupStaleGames() {
@@ -556,8 +562,17 @@ export class LowCardGameManager {
     
     // JIKA TIDAK ADA YANG DRAW (SEMUA TIDAK DRAW)
     if (submittedPlayers.length === 0) {
-      const message = loserNames.length > 0 ? `Player(s) ${loserNames.join(", ")} eliminated (no draw)` : "No one drew cards";
-      this.endGame(room, message);
+      const isBotGame = this._isBotGame(game);
+      if (isBotGame && loserNames.length > 0) {
+        // KHUSUS VS BOT: kirim gameLowCardClosed + gameLowCardError
+        this._safeBroadcast(room, ["gameLowCardClosed", loserNames]);
+        this._safeBroadcast(room, ["gameLowCardError", "You lost against bots"]);
+      } else if (loserNames.length > 0) {
+        this._safeBroadcast(room, ["gameLowCardEnd", `Player(s) ${loserNames.join(", ")} lost the game`, loserNames]);
+      } else {
+        this._safeBroadcast(room, ["gameLowCardEnd", "No one drew cards", []]);
+      }
+      this.endGame(room, "Game ended");
       return;
     }
     
@@ -611,19 +626,25 @@ export class LowCardGameManager {
     
     // CEK APAKAH MASIH ADA USER MANUSIA
     const remainingHumans = remaining.filter(id => this._isHumanPlayer(id));
+    const isBotGame = this._isBotGame(game);
     
     // Jika TIDAK ADA user manusia yang tersisa (semua user sudah kalah)
     if (remainingHumans.length === 0 && loserNames.length > 0) {
-      const message = `Player(s) ${loserNames.join(", ")} lost the game`;
-      this._safeBroadcast(room, ["gameLowCardEnd", message, loserNames]);
-      this.endGame(room, message);
+      if (isBotGame) {
+        // KHUSUS VS BOT: kirim gameLowCardClosed + gameLowCardError
+        this._safeBroadcast(room, ["gameLowCardClosed", loserNames]);
+        this._safeBroadcast(room, ["gameLowCardError", "You lost against bots"]);
+      } else {
+        this._safeBroadcast(room, ["gameLowCardEnd", `Player(s) ${loserNames.join(", ")} lost the game`, loserNames]);
+      }
+      this.endGame(room, "Game ended");
       return;
     }
     
-    // Jika TIDAK ADA user manusia yang tersisa (tidak ada user dari awal)
+    // Jika TIDAK ADA user manusia yang tersisa
     if (remainingHumans.length === 0) {
       this._safeBroadcast(room, ["gameLowCardEnd", "No human players remaining", []]);
-      this.endGame(room, "No human players remaining");
+      this.endGame(room, "Game ended");
       return;
     }
     
@@ -632,7 +653,10 @@ export class LowCardGameManager {
       const winnerId = remainingHumans[0];
       const winner = game.players.get(winnerId);
       const totalCoin = game.betAmount * game.players.size;
+      
+      // HANYA 2 PARAMETER - COMPATIBLE DENGAN CLIENT JAVA
       this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
+      
       this.endGame(room, `${winner?.name} won the game`);
       return;
     }
@@ -674,8 +698,15 @@ export class LowCardGameManager {
     
     // JIKA TIDAK ADA YANG TERSISA
     if (remaining.length === 0) {
-      const message = loserNames.length > 0 ? `Player(s) ${loserNames.join(", ")} lost the game` : "All players eliminated";
-      this.endGame(room, message);
+      if (isBotGame && loserNames.length > 0) {
+        this._safeBroadcast(room, ["gameLowCardClosed", loserNames]);
+        this._safeBroadcast(room, ["gameLowCardError", "You lost against bots"]);
+      } else if (loserNames.length > 0) {
+        this._safeBroadcast(room, ["gameLowCardEnd", `Player(s) ${loserNames.join(", ")} lost the game`, loserNames]);
+      } else {
+        this._safeBroadcast(room, ["gameLowCardEnd", "All players eliminated", []]);
+      }
+      this.endGame(room, "Game ended");
       return;
     }
   }
@@ -702,10 +733,6 @@ export class LowCardGameManager {
     if (game.numbers) { game.numbers.clear(); }
     if (game.tanda) { game.tanda.clear(); }
     if (game.eliminated) { game.eliminated.clear(); }
-    
-    // Broadcast gameLowCardEnd dengan pesan reason (dalam bahasa Inggris)
-    const finalMessage = reason || "Game ended";
-    this._safeBroadcast(room, ["gameLowCardEnd", finalMessage, playersList]);
     
     this.activeGames.delete(room);
   }
