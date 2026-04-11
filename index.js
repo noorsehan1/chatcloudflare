@@ -1,5 +1,6 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
-// DENGAN PROTEKSI CRASH, TIMER MATI, DAN PV MESSAGE VALIDATION
+// NO RATE LIMIT - No connection limits
+// FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan
 import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
@@ -14,23 +15,19 @@ const CONSTANTS = Object.freeze({
   BUFFER_FLUSH_INTERVAL_MS: 50,
   BUFFER_CLEANUP_INTERVAL_MS: 1000,
   
-  MAX_GLOBAL_CONNECTIONS: 250,
-  MAX_ACTIVE_CLIENTS_LIMIT: 200,
-  MAX_ROOM_CLIENTS_LIMIT: 200,
-  MAX_USER_CONNECTIONS_SIZE: 250,
-  MAX_RATE_LIMITER_SIZE: 500,
-  MAX_CONNECTIONS_PER_USER: 1,
+  MAX_GLOBAL_CONNECTIONS: 1000,
+  MAX_ACTIVE_CLIENTS_LIMIT: 1000,
+  MAX_ROOM_CLIENTS_LIMIT: 500,
+  MAX_USER_CONNECTIONS_SIZE: 1000,
+  MAX_CONNECTIONS_PER_USER: 3,
   
-  MAX_ACTIVE_CLIENTS_ABS: 500,
-  MAX_USER_MAPS_SIZE: 1000,
+  MAX_ACTIVE_CLIENTS_ABS: 1000,
+  MAX_USER_MAPS_SIZE: 2000,
   MAX_CLEANUP_BATCH: 50,
   FORCE_CLEANUP_INTERVAL: 5 * 60 * 1000,
   
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
-  
-  MAX_RATE_LIMIT: 40,
-  RATE_WINDOW: 60000,
   
   MAX_MESSAGE_SIZE: 4000,
   MAX_MESSAGE_LENGTH: 200,
@@ -56,22 +53,16 @@ const CONSTANTS = Object.freeze({
   POINTS_CACHE_MS: 30,
   ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
   
-  MAX_USERS_BEFORE_CLEANUP: 100,
+  MAX_USERS_BEFORE_CLEANUP: 200,
   MAX_SEATS_BEFORE_CLEANUP: 500,
   EMERGENCY_CLEANUP_INTERVAL_MS: 30000,
   
-  // TIMER SAFETY
   MASTER_TICK_TIMEOUT_MS: 3000,
   NUMBER_TICK_TIMEOUT_MS: 5000,
   MAX_CONSECUTIVE_ERRORS: 5,
   HEALTH_CHECK_INTERVAL: 60000,
   NUMBER_TICK_DEAD_THRESHOLD_MS: 180000,
   MASTER_TICK_STUCK_THRESHOLD_MS: 10000,
-  
-  // CHAT SAFETY
-  MAX_CHAT_RETRIES: 3,
-  CHAT_ACK_TIMEOUT_MS: 2000,
-  CHAT_RETRY_DELAY_MS: 1000,
 });
 
 const roomList = Object.freeze([
@@ -189,7 +180,6 @@ class MemoryMonitor {
     try {
       const now = Date.now();
       if (now - this.lastMemoryLog > 60000) {
-        console.log(`[MEMORY] Active clients: ${global._activeClients?.size || 0}`);
         this.lastMemoryLog = now;
       }
       return false;
@@ -199,7 +189,7 @@ class MemoryMonitor {
   }
 }
 
-// ==================== GLOBAL CHAT BUFFER WITH RETRY ====================
+// ==================== GLOBAL CHAT BUFFER ====================
 class GlobalChatBuffer {
   constructor() {
     this._messageQueue = [];
@@ -221,7 +211,7 @@ class GlobalChatBuffer {
     this._lastCleanupTime = Date.now();
     this._cleanupIntervalMs = CONSTANTS.BUFFER_CLEANUP_INTERVAL_MS;
     
-    this._pendingMessages = new Map(); // msgId -> { room, msg, pendingClients, retries, timestamp }
+    this._pendingMessages = new Map();
     this._nextMsgId = 0;
   }
   
@@ -247,7 +237,6 @@ class GlobalChatBuffer {
     if (this._messageQueue.length > this.WARNING_THRESHOLD) {
       const now = Date.now();
       if (now - this.lastWarningTime > 60000) {
-        console.warn(`[GlobalChatBuffer] Queue at ${this._messageQueue.length}/${this.maxQueueSize}`);
         this.lastWarningTime = now;
       }
     }
@@ -303,22 +292,20 @@ class GlobalChatBuffer {
     if (this._messageQueue.length > this.maxQueueSize * 0.8) {
       const toRemove = Math.floor(this._messageQueue.length * 0.3);
       this._messageQueue.splice(0, toRemove);
-      console.warn(`[BUFFER] Force cleaned ${toRemove} old messages`);
     }
   }
   
   _processRetryQueue(now) {
     const toRetry = this._retryQueue.filter(item => now >= item.nextRetry);
     for (const item of toRetry) {
-      if (item.retries >= CONSTANTS.MAX_CHAT_RETRIES) {
-        console.error(`[CHAT] Failed to send after ${CONSTANTS.MAX_CHAT_RETRIES} retries:`, item.msgId);
+      if (item.retries >= 3) {
         continue;
       }
       
       const sent = this._sendWithCallback(item.room, item.message, item.msgId);
       if (!sent) {
         item.retries++;
-        item.nextRetry = now + (CONSTANTS.CHAT_RETRY_DELAY_MS * Math.pow(2, item.retries));
+        item.nextRetry = now + (1000 * Math.pow(2, item.retries));
         this._retryQueue.push(item);
       }
     }
@@ -328,7 +315,7 @@ class GlobalChatBuffer {
   
   _cleanupPendingAcks(now) {
     for (const [msgId, pending] of this._pendingMessages) {
-      if (now - pending.timestamp > CONSTANTS.CHAT_ACK_TIMEOUT_MS * 3) {
+      if (now - pending.timestamp > 6000) {
         this._pendingMessages.delete(msgId);
       }
     }
@@ -376,14 +363,10 @@ class GlobalChatBuffer {
               message: item.message,
               msgId: item.msgId,
               retries: 0,
-              nextRetry: Date.now() + CONSTANTS.CHAT_RETRY_DELAY_MS
+              nextRetry: Date.now() + 1000
             });
           }
         }
-      }
-      
-      if (errorCount > 0) {
-        console.warn(`[BUFFER] ${errorCount} messages moved to retry queue`);
       }
     } finally {
       this._isFlushing = false;
@@ -454,85 +437,6 @@ class GlobalChatBuffer {
     
     this._flushCallback = null;
     this._pendingMessages.clear();
-  }
-}
-
-// ==================== RATE LIMITER ====================
-class RateLimiter {
-  constructor(windowMs = CONSTANTS.RATE_WINDOW, maxRequests = CONSTANTS.MAX_RATE_LIMIT) {
-    this.windowMs = windowMs;
-    this.maxRequests = maxRequests;
-    this.requests = new Map();
-    this._isDestroyed = false;
-    this._cleanupInterval = setInterval(() => {
-      this.cleanup();
-    }, 30000);
-  }
-
-  check(userId) {
-    if (!userId || this._isDestroyed) return true;
-    const now = Date.now();
-    let data = this.requests.get(userId);
-    
-    if (!data) {
-      if (this.requests.size >= CONSTANTS.MAX_RATE_LIMITER_SIZE) {
-        this._forceCleanup();
-      }
-      this.requests.set(userId, { count: 1, windowStart: now });
-      return true;
-    }
-    
-    if (now - data.windowStart >= this.windowMs) {
-      data.count = 1;
-      data.windowStart = now;
-      return true;
-    }
-    
-    if (data.count >= this.maxRequests) return false;
-    data.count++;
-    return true;
-  }
-
-  cleanup() {
-    if (this._isDestroyed) return;
-    const now = Date.now();
-    const staleTimeout = this.windowMs;
-    
-    for (const [userId, data] of this.requests) {
-      if (now - data.windowStart >= staleTimeout) {
-        this.requests.delete(userId);
-      }
-    }
-    
-    if (this.requests.size > CONSTANTS.MAX_RATE_LIMITER_SIZE) {
-      this._forceCleanup();
-    }
-  }
-  
-  _forceCleanup() {
-    if (this.requests.size <= CONSTANTS.MAX_RATE_LIMITER_SIZE) return;
-    
-    const entries = [];
-    for (const [userId, data] of this.requests) {
-      entries.push({ userId, timestamp: data.windowStart });
-    }
-    
-    entries.sort((a, b) => a.timestamp - b.timestamp);
-    const keepCount = Math.floor(CONSTANTS.MAX_RATE_LIMITER_SIZE * 0.5);
-    
-    const toDelete = entries.slice(keepCount);
-    for (const item of toDelete) {
-      this.requests.delete(item.userId);
-    }
-  }
-  
-  destroy() {
-    this._isDestroyed = true;
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval);
-      this._cleanupInterval = null;
-    }
-    this.requests.clear();
   }
 }
 
@@ -627,6 +531,18 @@ class RoomManager {
   
   isIdle() {
     return Date.now() - this.lastActivity > CONSTANTS.ROOM_MANAGER_IDLE_TIMEOUT && this.getOccupiedCount() === 0;
+  }
+  
+  isSeatOccupied(seatNumber) {
+    if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return true;
+    const seat = this.seats.get(seatNumber);
+    return seat && !seat.isEmpty();
+  }
+  
+  getSeatOwner(seatNumber) {
+    if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return null;
+    const seat = this.seats.get(seatNumber);
+    return seat && !seat.isEmpty() ? seat.namauser : null;
   }
   
   replaceSeat(seatNumber, seatData) {
@@ -785,7 +701,6 @@ export class ChatServer2 {
     this._activeListeners = new Map();
     this._clientWebSockets = new Set();
     
-    this.rateLimiter = new RateLimiter();
     this._cleanupInterval = null;
     
     this.chatBuffer = new GlobalChatBuffer();
@@ -795,9 +710,7 @@ export class ChatServer2 {
     
     try {
       this.lowcard = new LowCardGameManager(this);
-      console.log('[GAME] LowCardGameManager initialized');
     } catch (error) {
-      console.error('[GAME] Failed to initialize:', error);
       this.lowcard = null;
     }
     
@@ -834,21 +747,11 @@ export class ChatServer2 {
       this._forceMemoryCleanup();
     }, CONSTANTS.FORCE_CLEANUP_INTERVAL);
     
-    // GLOBAL ERROR HANDLER
-    if (typeof process !== 'undefined' && process.on) {
-      process.on('unhandledRejection', (reason, promise) => {
-        console.error('[GLOBAL] Unhandled Rejection:', reason);
-      });
-      process.on('uncaughtException', (error) => {
-        console.error('[GLOBAL] Uncaught Exception:', error);
-      });
-    }
-    
     this._lastHealthCheck = Date.now();
     this._consecutiveErrors = 0;
   }
   
-  // ============ MASTER TIMER DENGAN PROTEKSI ============
+  // ============ MASTER TIMER ============
   startMasterTimer() {
     if (this._masterTimerInterval) {
       clearInterval(this._masterTimerInterval);
@@ -857,16 +760,11 @@ export class ChatServer2 {
     this._masterTimerInterval = setInterval(() => {
       this._safeMasterTick();
     }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
-    
-    console.log('[MASTER TIMER] Started with safety wrapper');
   }
   
   async _safeMasterTick() {
     if (this._isClosing) return;
-    if (this._masterTickRunning) {
-      console.warn('[MASTER TIMER] Previous tick still running, skipping');
-      return;
-    }
+    if (this._masterTickRunning) return;
     
     this._masterTickRunning = true;
     const startTime = Date.now();
@@ -879,15 +777,9 @@ export class ChatServer2 {
         )
       ]);
     } catch (error) {
-      console.error('[MASTER TIMER] CRITICAL ERROR:', error);
       this._consecutiveErrors++;
     } finally {
       this._masterTickRunning = false;
-      
-      const duration = Date.now() - startTime;
-      if (duration > 5000) {
-        console.warn(`[MASTER TIMER] Slow tick detected: ${duration}ms`);
-      }
     }
   }
   
@@ -899,26 +791,13 @@ export class ChatServer2 {
     if (this.chatBuffer && typeof this.chatBuffer.tick === 'function') {
       try {
         this.chatBuffer.tick(now);
-      } catch (error) {
-        console.error('[MASTER TICK] Buffer error:', error);
-      }
+      } catch (error) {}
     }
     
     if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
       try {
         this.lowcard.masterTick();
-      } catch (error) {
-        console.error('[MASTER TICK] Game manager error:', error);
-      }
-    }
-    
-    if (this._tickCounter % 60 === 0) {
-      try {
-        const bufferStats = this.chatBuffer.getStats();
-        if (bufferStats.queuedMessages > 40) {
-          console.log(`[MASTER TICK] Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs, Retry: ${bufferStats.retryQueue}`);
-        }
-      } catch (e) {}
+      } catch (error) {}
     }
     
     if (this._tickCounter % 60 === 0) {
@@ -931,28 +810,20 @@ export class ChatServer2 {
     const timeSinceLastNumberTick = now - (this._lastTickSuccess || now);
     
     if (timeSinceLastNumberTick > CONSTANTS.NUMBER_TICK_DEAD_THRESHOLD_MS) {
-      console.error('[HEALTH] Number tick appears DEAD! Forcing restart...');
       this._emergencyNumberRecovery();
     }
     
     const timeSinceLastMasterTick = now - this._lastMasterTick;
     if (timeSinceLastMasterTick > CONSTANTS.MASTER_TICK_STUCK_THRESHOLD_MS) {
-      console.error('[HEALTH] Master tick appears STUCK!');
       if (this._masterTimerInterval) {
         clearInterval(this._masterTimerInterval);
         this._masterTimerInterval = null;
       }
       this.startMasterTimer();
     }
-    
-    const activeCount = this._activeClients.size;
-    if (activeCount > CONSTANTS.MAX_ACTIVE_CLIENTS_ABS * 0.9) {
-      console.warn(`[HEALTH] High connection count: ${activeCount}`);
-      this._emergencyCleanup();
-    }
   }
   
-  // ============ NUMBER TICK TIMER DENGAN AUTO-RECOVERY ============
+  // ============ NUMBER TICK TIMER ============
   startNumberTickTimer() {
     if (this.numberTickTimer) {
       clearTimeout(this.numberTickTimer);
@@ -968,7 +839,6 @@ export class ChatServer2 {
       
       const timeSinceLastSuccess = Date.now() - this._lastTickSuccess;
       if (timeSinceLastSuccess > 120000) {
-        console.error('[NUMBER TICK] No successful tick for 2 minutes! Forcing recovery...');
         this._forceRecovery();
       }
       
@@ -984,12 +854,10 @@ export class ChatServer2 {
     };
     
     scheduleNext();
-    console.log('[NUMBER TIMER] Started with auto-recovery');
   }
   
   async _safeTickWithRetry() {
     const MAX_RETRIES = 3;
-    let lastError = null;
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -1003,9 +871,7 @@ export class ChatServer2 {
         this._lastTickSuccess = Date.now();
         return;
       } catch (error) {
-        lastError = error;
         this._tickErrorCount++;
-        console.error(`[NUMBER TICK] Attempt ${attempt}/${MAX_RETRIES} failed:`, error);
         
         if (attempt < MAX_RETRIES) {
           await new Promise(resolve => setTimeout(resolve, 100 * attempt));
@@ -1013,7 +879,6 @@ export class ChatServer2 {
       }
     }
     
-    console.error('[NUMBER TICK] All retries failed! Running emergency recovery...');
     this._emergencyNumberRecovery();
   }
   
@@ -1027,9 +892,7 @@ export class ChatServer2 {
       for (const roomManager of this.roomManagers.values()) {
         try {
           roomManager.setCurrentNumber(this.currentNumber);
-        } catch (e) {
-          console.error(`[NUMBER TICK] Failed to update room ${roomManager.roomName}:`, e);
-        }
+        } catch (e) {}
       }
       
       const message = safeStringify(["currentNumber", this.currentNumber]);
@@ -1055,7 +918,6 @@ export class ChatServer2 {
       }
       
     } catch (error) {
-      console.error('[NUMBER TICK] Tick failed:', error);
       throw error;
     } finally {
       this._tickRunning = false;
@@ -1063,8 +925,6 @@ export class ChatServer2 {
   }
   
   _emergencyNumberRecovery() {
-    console.log('[EMERGENCY] Recovering number tick timer...');
-    
     this._tickRunning = false;
     this._tickErrorCount = 0;
     
@@ -1092,7 +952,6 @@ export class ChatServer2 {
   }
   
   _forceRecovery() {
-    console.log('[FORCE RECOVERY] Forcing timer recovery...');
     if (this.numberTickTimer) {
       clearTimeout(this.numberTickTimer);
       this.numberTickTimer = null;
@@ -1105,7 +964,6 @@ export class ChatServer2 {
   _forceMemoryCleanup() {
     if (this._isClosing) return;
     
-    console.log('[FORCE CLEANUP] Starting aggressive memory cleanup...');
     this._compressRoomClients();
     
     const zombies = [];
@@ -1117,10 +975,6 @@ export class ChatServer2 {
     for (const ws of zombies) {
       this._activeClients.delete(ws);
     }
-    
-    this.rateLimiter.cleanup();
-    
-    console.log(`[FORCE CLEANUP] Complete: Active=${this._activeClients.size}, Users=${this.userConnections.size}`);
   }
   
   _hasLiveConnection(userId) {
@@ -1135,8 +989,6 @@ export class ChatServer2 {
   }
   
   _emergencyCleanup() {
-    console.log(`[EMERGENCY] Running cleanup`);
-    
     this.chatBuffer.flushAll().catch(() => {});
     
     const toCleanup = [];
@@ -1158,14 +1010,6 @@ export class ChatServer2 {
     }
     
     this._compressRoomClients();
-  }
-  
-  _getTotalOccupiedSeats() {
-    let total = 0;
-    for (const roomManager of this.roomManagers.values()) {
-      total += roomManager.getOccupiedCount();
-    }
-    return total;
   }
   
   getJumlahRoom() {
@@ -1241,6 +1085,12 @@ export class ChatServer2 {
     const roomManager = this.roomManagers.get(room);
     if (!roomManager) return null;
     if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
+    
+    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
+    const existingSeatInfo = this.userToSeat.get(userId);
+    if (existingSeatInfo && existingSeatInfo.room === room) {
+      return existingSeatInfo.seat;
+    }
     
     for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
       const seatData = roomManager.getSeat(seat);
@@ -1528,10 +1378,6 @@ export class ChatServer2 {
       await this.safeSend(ws, ["error", "Invalid room"]); 
       return false; 
     }
-    if (!this.rateLimiter.check(ws.idtarget)) { 
-      await this.safeSend(ws, ["error", "Too many requests"]); 
-      return false; 
-    }
     
     return withTimeout(this._handleJoinRoomInternal(ws, room), CONSTANTS.PROMISE_TIMEOUT_MS, false);
   }
@@ -1603,7 +1449,6 @@ export class ChatServer2 {
       
       return true;
     } catch (error) {
-      console.error("Error joining room:", error);
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     }
@@ -1761,7 +1606,6 @@ export class ChatServer2 {
       this._addUserConnection(id, ws);
       await this.safeSend(ws, ["needJoinRoom"]);
     } catch (error) {
-      console.error("Error in handleSetIdTarget2:", error);
       await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
   }
@@ -1783,10 +1627,6 @@ export class ChatServer2 {
   
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
-    if (ws.idtarget && !this.rateLimiter.check(ws.idtarget)) {
-      await this.safeSend(ws, ["error", "Too many requests"]);
-      return;
-    }
     
     let messageStr = raw;
     if (raw instanceof ArrayBuffer) {
@@ -1819,7 +1659,6 @@ export class ChatServer2 {
         )
       ]);
     } catch (error) {
-      console.error(`[MESSAGE] Error processing ${data[0]}:`, error);
       await this.safeSend(ws, ["error", "Processing failed"]);
     }
   }
@@ -1900,21 +1739,16 @@ export class ChatServer2 {
         case "private": {
           const [, idt, url, msg, sender] = data;
           
-          // VALIDASI: Jika username (sender) kosong, JANGAN KIRIM
           if (!isValidUsername(sender)) {
-            console.warn(`[PV] Rejected private message from invalid sender: "${sender}"`);
             await this.safeSend(ws, ["error", "Invalid sender username"]);
             break;
           }
           
-          // VALIDASI: Jika target username kosong, JANGAN KIRIM
           if (!isValidUsername(idt)) {
-            console.warn(`[PV] Rejected private message to invalid target: "${idt}"`);
             await this.safeSend(ws, ["error", "Invalid target username"]);
             break;
           }
           
-          // VALIDASI: Pesan tidak boleh kosong
           const sanitizedMsg = msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "";
           if (sanitizedMsg.trim().length === 0) {
             await this.safeSend(ws, ["error", "Message cannot be empty"]);
@@ -1923,10 +1757,8 @@ export class ChatServer2 {
           
           const out = ["private", idt, url, sanitizedMsg, Date.now(), sender];
           
-          // Kirim ke pengirim sebagai konfirmasi
           await this.safeSend(ws, out);
           
-          // Kirim ke target jika online
           const targetConnections = this.userConnections.get(idt);
           if (targetConnections) {
             let sentToTarget = false;
@@ -2176,7 +2008,6 @@ export class ChatServer2 {
         if (idleTime > CONSTANTS.ROOM_IDLE_BEFORE_CLEANUP) {
           roomManager.destroy();
           this.roomManagers.delete(room);
-          console.log(`[CLEANUP] Removed empty room: ${room}`);
           this.roomManagers.set(room, new RoomManager(room));
         }
       }
@@ -2232,7 +2063,6 @@ export class ChatServer2 {
     
     this._compressRoomClients();
     this._cleanupEmptyRooms();
-    this.rateLimiter.cleanup();
     
     const zombies = [];
     for (const ws of this._activeClients) {
@@ -2243,10 +2073,6 @@ export class ChatServer2 {
     for (const ws of zombies) {
       this._removeFromActiveClients(ws);
     }
-    
-    if (zombies.length > 0) {
-      console.log(`[CLEANUP] Removed ${zombies.length} zombie connections`);
-    }
   }
   
   _logCleanupStats() {
@@ -2255,11 +2081,6 @@ export class ChatServer2 {
       if (c?.readyState === 1) activeReal++;
     }
     const bufferStats = this.chatBuffer.getStats();
-    console.log(`[STATS] Active: ${activeReal}/${this._activeClients.size}, ` +
-                `Users: ${this.userConnections.size}, ` +
-                `Buffer: ${bufferStats.queuedMessages}/${bufferStats.maxQueueSize} msgs, ` +
-                `Retry: ${bufferStats.retryQueue}, ` +
-                `Rooms: ${this.roomManagers.size}`);
   }
   
   async getMemoryStats() {
@@ -2287,14 +2108,12 @@ export class ChatServer2 {
       userToSeatSize: this.userToSeat.size,
       userCurrentRoomSize: this.userCurrentRoom.size,
       chatBuffer: bufferStats,
-      rateLimiterSize: this.rateLimiter?.requests?.size || 0
     };
   }
   
   async shutdown() {
     if (this._isClosing) return;
     this._isClosing = true;
-    console.log("[SHUTDOWN] Starting graceful shutdown...");
     
     if (this._masterTimerInterval) {
       clearInterval(this._masterTimerInterval);
@@ -2341,11 +2160,6 @@ export class ChatServer2 {
       }
     }
     
-    if (this.rateLimiter) {
-      this.rateLimiter.destroy();
-      this.rateLimiter = null;
-    }
-    
     for (const roomManager of this.roomManagers.values()) {
       roomManager.destroy();
     }
@@ -2361,8 +2175,6 @@ export class ChatServer2 {
     this._clientWebSockets.clear();
     this._cleaningUp.clear();
     this._connectionLocks.clear();
-    
-    console.log("[SHUTDOWN] Shutdown complete");
   }
   
   async fetch(request) {
@@ -2385,8 +2197,6 @@ export class ChatServer2 {
             buffer: bufferStats,
             masterTimer: this._masterTimerInterval ? "running" : "stopped",
             numberTimer: this.numberTickTimer ? "running" : "stopped",
-            lastTickSuccess: this._lastTickSuccess,
-            tickErrorCount: this._tickErrorCount
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         
@@ -2480,7 +2290,6 @@ export class ChatServer2 {
       
       return new Response(null, { status: 101, webSocket: client });
     } catch (error) {
-      console.error("Fetch error:", error);
       return new Response("Internal server error", { status: 500 });
     }
   }
@@ -2507,7 +2316,6 @@ export default {
         headers: { "content-type": "text/plain" }
       });
     } catch (error) {
-      console.error("Worker error:", error);
       return new Response("Server error", { status: 500 });
     }
   }
