@@ -1,330 +1,876 @@
-// lowcard.js - LowCardGameManager FINAL
-const CONSTANTS = {
-  GAME_TIMEOUT_HOURS: 1,
-  REGISTRATION_TIME: 25,
-  DRAW_TIME: 30,
-  BOT_DRAW_MIN_SECONDS: 3,
-  BOT_DRAW_MAX_SECONDS: 25,
-};
+// index.js - ChatServer2 FINAL - NO RATE LIMITER
+import { LowCardGameManager } from "./lowcard.js";
 
-export class LowCardGameManager {
-  constructor(chatServer) {
-    this.chatServer = chatServer;
-    this.activeGames = new Map();
-    this._destroyed = false;
-    this._errorLogs = [];
-    this._errorHandler = (error, context) => {
-      const errorMsg = error?.message || String(error);
-      this._errorLogs.push({ time: Date.now(), context, error: errorMsg });
-      if (this._errorLogs.length > 100) this._errorLogs.shift();
-    };
-  }
+const CONSTANTS = Object.freeze({
+  MAX_SEATS: 35,
+  MAX_NUMBER: 6,
+  MAX_MESSAGE_SIZE: 4000,
+  MAX_JSON_DEPTH: 30,
+  POINTS_CACHE_MS: 30,
+  MESSAGE_TTL_MS: 3000,
+  MAX_TOTAL_BUFFER_MESSAGES: 20,
+  MAX_SEND_PER_TICK: 20,
+  MASTER_TIMER_INTERVAL: 1000,
+  MAX_USER_CONNECTIONS: 500,
+  MAX_ROOM_CLIENTS: 300,
+  MAX_CHAT_BUFFER_QUEUE: 100,
+});
 
-  _safeBroadcast(room, message) {
-    try {
-      if (this._destroyed) return;
-      if (this.chatServer && typeof this.chatServer.broadcastToRoom === 'function') {
-        this.chatServer.broadcastToRoom(room, message);
+const roomList = Object.freeze([
+  "LowCard 1", "LowCard 2", "Gacor", "General", "Pakistan", "Philippines", 
+  "India", "Indonesia", "Birthday Party", "Heart Lovers", "Cat lovers",
+  "Chikahan Tambayan", "Lounge Talk", "Noxxeliverothcifsa", "One Side Love", 
+  "BLUE DYNASTY", "Relax & Chat", "The Chatter Room"
+]);
+
+const GAME_ROOMS = Object.freeze([
+  "LowCard 1", "LowCard 2", "Noxxeliverothcifsa", 
+  "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers"
+]);
+
+function safeStringify(obj) {
+  try {
+    const seen = new WeakSet();
+    return JSON.stringify(obj, (key, value) => {
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return '[Circular]';
+        seen.add(value);
       }
-    } catch (error) { this._errorHandler(error, `broadcast`); }
-  }
-
-  _safeSend(ws, message) {
-    try {
-      if (this._destroyed) return false;
-      if (ws && ws.readyState === 1 && this.chatServer && typeof this.chatServer.safeSend === 'function') {
-        return this.chatServer.safeSend(ws, message);
-      }
-      return false;
-    } catch (error) { return false; }
-  }
-
-  _safeGetGame(room) {
-    try {
-      if (this._destroyed || !room) return null;
-      const game = this.activeGames.get(room);
-      return (game && game._active) ? game : null;
-    } catch (error) { return null; }
-  }
-
-  cleanupStaleGames() {
-    if (this._destroyed) return;
-    const now = Date.now();
-    const staleGames = [];
-    for (const [room, game] of this.activeGames) {
-      if (!game || !game._active) staleGames.push(room);
-      else if (game.createdAt && (now - game.createdAt) > CONSTANTS.GAME_TIMEOUT_HOURS * 3600000) staleGames.push(room);
-      else if (game.players && game.players.size === 0) staleGames.push(room);
-    }
-    for (const room of staleGames) this.endGame(room);
-  }
-
-  _clearAllTimers(game) {
-    if (!game) return;
-    if (game._regInterval) { clearInterval(game._regInterval); game._regInterval = null; }
-    if (game._drawInterval) { clearInterval(game._drawInterval); game._drawInterval = null; }
-    if (game.countdownTimers) {
-      for (const timer of game.countdownTimers) {
-        if (timer) { if (timer.interval) clearInterval(timer.interval); if (timer.timeout) clearTimeout(timer.timeout); }
-      }
-      game.countdownTimers = null;
-    }
-    if (game._botTimers) { for (const timer of game._botTimers) if (timer) clearTimeout(timer); game._botTimers = null; }
-    if (game._botDrawTimeouts) {
-      for (const timeout of game._botDrawTimeouts) try { clearTimeout(timeout); } catch(e) {}
-      game._botDrawTimeouts.clear();
-      game._botDrawTimeouts = null;
-    }
-    if (game._timeouts) { for (const tid of game._timeouts) clearTimeout(tid); game._timeouts = null; }
-  }
-
-  getRandomCardTanda() { const tandaOptions = ["C1", "C2", "C3", "C4"]; return tandaOptions[Math.floor(Math.random() * tandaOptions.length)]; }
-  getRandomDrawTime() { return Math.floor(Math.random() * (CONSTANTS.BOT_DRAW_MAX_SECONDS - CONSTANTS.BOT_DRAW_MIN_SECONDS + 1)) + CONSTANTS.BOT_DRAW_MIN_SECONDS; }
-  getBotNumberByRound(round) {
-    if (round <= 2) return Math.floor(Math.random() * 12) + 1;
-    if (round >= 3) {
-      const isGetHighNumber = Math.random() < 0.6;
-      if (isGetHighNumber) { const bigNumbers = [8, 9, 10, 11, 12]; return bigNumbers[Math.floor(Math.random() * bigNumbers.length)]; }
-      else { const smallNumbers = [1, 2, 3, 4, 5, 6, 7]; return smallNumbers[Math.floor(Math.random() * smallNumbers.length)]; }
-    }
-    return Math.floor(Math.random() * 12) + 1;
-  }
-
-  masterTick() {
-    if (this._destroyed) return;
-    for (const [room, game] of this.activeGames) {
-      if (!game || !game._active) continue;
-      if (game.registrationOpen && game.regTimeLeft > 0) {
-        game.regTimeLeft--;
-        if (game.regTimeLeft === 20 || game.regTimeLeft === 10 || game.regTimeLeft === 5) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.regTimeLeft}s`]);
-        }
-        if (game.regTimeLeft <= 0) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
-          this._closeRegistration(room);
-        }
-      }
-      if (!game.registrationOpen && !game.drawTimeExpired && game.drawTimeLeft > 0) {
-        game.drawTimeLeft--;
-        if (game.drawTimeLeft === 20 || game.drawTimeLeft === 10 || game.drawTimeLeft === 5) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
-        }
-        if (game.drawTimeLeft <= 0 && !game.drawTimeExpired) {
-          game.drawTimeExpired = true;
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
-          if (!game.evaluationLocked) {
-            game.evaluationLocked = true;
-            this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
-            const evalTimeout = setTimeout(() => { if (!this._destroyed) this._evaluateRound(room); }, 2000);
-            if (!game._timeouts) game._timeouts = [];
-            game._timeouts.push(evalTimeout);
-          }
-        }
-      }
-    }
-  }
-
-  handleEvent(ws, data) {
-    if (this._destroyed || !ws || !data) return;
-    const evt = data[0];
-    switch (evt) {
-      case "gameLowCardStart": this.startGame(ws, data[1]); break;
-      case "gameLowCardJoin": this.joinGame(ws); break;
-      case "gameLowCardNumber": this.submitNumber(ws, data[1], data[2] || ""); break;
-      case "gameLowCardEnd": if (ws.roomname) this.endGame(ws.roomname); break;
-    }
-  }
-
-  startGame(ws, bet) {
-    if (!ws?.roomname || !ws?.idtarget) { this._safeSend(ws, ["gameLowCardError", "Invalid session"]); return; }
-    const room = ws.roomname;
-    if (this.activeGames.has(room)) { this._safeSend(ws, ["gameLowCardError", "Game already running in this room"]); return; }
-    const betAmount = parseInt(bet) || 0;
-    if (betAmount < 0 || (betAmount !== 0 && betAmount < 100)) { this._safeSend(ws, ["gameLowCardError", "Bet must be 0 or at least 100"]); return; }
-    const game = {
-      room, players: new Map(), botPlayers: new Map(), registrationOpen: true, round: 1,
-      numbers: new Map(), tanda: new Map(), eliminated: new Set(), winner: null, betAmount,
-      regTimeLeft: CONSTANTS.REGISTRATION_TIME, drawTimeLeft: CONSTANTS.DRAW_TIME,
-      drawTimeExpired: false, evaluationLocked: false, hostId: ws.idtarget,
-      hostName: ws.username || ws.idtarget, useBots: false, createdAt: Date.now(),
-      _active: true, _timeouts: [], _botTimers: [], _botDrawTimeouts: new Set(),
-      countdownTimers: [], _regInterval: null, _drawInterval: null
-    };
-    game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
-    this.activeGames.set(room, game);
-    this._safeBroadcast(room, ["gameLowCardStart", betAmount]);
-    this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, betAmount]);
-    this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.REGISTRATION_TIME}s`]);
-  }
-
-  _addFourMozBots(room) {
-    const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
-    if (game.useBots || game.botPlayers.size > 0) return;
-    game.useBots = true;
-    const mozNames = ["moz 1", "moz 2", "moz 3", "moz 4"];
-    for (let i = 0; i < 4; i++) {
-      const botId = `BOT_MOZ_${room}_${i}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-      const botName = mozNames[i];
-      game.players.set(botId, { id: botId, name: botName });
-      game.botPlayers.set(botId, botName);
-      this._safeBroadcast(room, ["gameLowCardJoin", botName, game.betAmount]);
-    }
-  }
-
-  _closeRegistration(room) {
-    const game = this._safeGetGame(room);
-    if (!game || !game.registrationOpen) return;
-    if (game.players.size === 1) this._addFourMozBots(room);
-    if (game.players.size < 2) { this._safeBroadcast(room, ["gameLowCardError", "Need at least 2 players", game.hostId]); this.endGame(room); return; }
-    game.registrationOpen = false;
-    const playersList = Array.from(game.players.values()).filter(p => p && p.name).map(p => p.name);
-    this._safeBroadcast(room, ["gameLowCardClosed", playersList]);
-    this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
-    this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
-    this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
-    this._startBotDraws(room);
-  }
-
-  _startBotDraws(room) {
-    const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
-    if (!game.useBots || !game.botPlayers) return;
-    if (game._botTimers) { for (const timer of game._botTimers) clearTimeout(timer); game._botTimers = []; }
-    if (game._botDrawTimeouts) { for (const timeout of game._botDrawTimeouts) clearTimeout(timeout); game._botDrawTimeouts.clear(); }
-    const activeBots = Array.from(game.botPlayers.keys()).filter(botId => !game.eliminated.has(botId) && !game.numbers.has(botId));
-    for (const botId of activeBots) {
-      const drawTime = this.getRandomDrawTime();
-      const botTimeout = setTimeout(() => {
-        if (this._destroyed) return;
-        const currentGame = this._safeGetGame(room);
-        if (currentGame && currentGame._active && !currentGame.drawTimeExpired && !currentGame.evaluationLocked) {
-          this._handleBotDraw(room, botId);
-        }
-      }, drawTime * 1000);
-      game._botTimers.push(botTimeout);
-      game._botDrawTimeouts.add(botTimeout);
-    }
-  }
-
-  _handleBotDraw(room, botId) {
-    const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
-    if (game.eliminated.has(botId) || game.numbers.has(botId)) return;
-    if (game.drawTimeExpired || game.evaluationLocked) return;
-    const botNumber = this.getBotNumberByRound(game.round);
-    const tanda = this.getRandomCardTanda();
-    game.numbers.set(botId, botNumber);
-    game.tanda.set(botId, tanda);
-    const botPlayer = game.players.get(botId);
-    const botName = botPlayer?.name || botId;
-    this._safeBroadcast(room, ["gameLowCardPlayerDraw", botName, botNumber, tanda]);
-    const activePlayers = Array.from(game.players.keys()).filter(id => !game.eliminated.has(id));
-    const allDrawn = game.numbers.size === activePlayers.length;
-    if (!game.evaluationLocked && allDrawn) {
-      game.evaluationLocked = true;
-      this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
-      const evalTimeout = setTimeout(() => { if (!this._destroyed) this._evaluateRound(room); }, 2000);
-      if (!game._timeouts) game._timeouts = [];
-      game._timeouts.push(evalTimeout);
-    }
-  }
-
-  joinGame(ws) {
-    if (!ws?.roomname || !ws?.idtarget) { this._safeSend(ws, ["gameLowCardError", "Invalid session"]); return; }
-    const game = this._safeGetGame(ws.roomname);
-    if (!game) { this._safeSend(ws, ["gameLowCardError", "No active game"]); return; }
-    if (game.evaluationLocked) { this._safeSend(ws, ["gameLowCardError", "Game in progress, please wait"]); return; }
-    if (!game.registrationOpen) { this._safeSend(ws, ["gameLowCardError", "Registration closed"]); return; }
-    if (game.players.has(ws.idtarget)) { this._safeSend(ws, ["gameLowCardError", "Already joined"]); return; }
-    game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
-    this._safeBroadcast(ws.roomname, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
-  }
-
-  submitNumber(ws, number, tanda = "") {
-    if (!ws?.roomname || !ws?.idtarget) { this._safeSend(ws, ["gameLowCardError", "Invalid session"]); return; }
-    const game = this._safeGetGame(ws.roomname);
-    if (!game) { this._safeSend(ws, ["gameLowCardError", "No active game"]); return; }
-    if (game.evaluationLocked) { this._safeSend(ws, ["gameLowCardError", "Please wait, results are being processed..."]); return; }
-    if (game.registrationOpen) { this._safeSend(ws, ["gameLowCardError", "Registration still open"]); return; }
-    if (!game.players.has(ws.idtarget) || game.eliminated.has(ws.idtarget)) { this._safeSend(ws, ["gameLowCardError", "Not in game or eliminated"]); return; }
-    if (game.numbers.has(ws.idtarget)) { this._safeSend(ws, ["gameLowCardError", "Already submitted number"]); return; }
-    if (game.drawTimeExpired) { this._safeSend(ws, ["gameLowCardError", "Draw time has expired!"]); return; }
-    const n = parseInt(number);
-    if (isNaN(n) || n < 1 || n > 12) { this._safeSend(ws, ["gameLowCardError", "Invalid number (1-12)"]); return; }
-    game.numbers.set(ws.idtarget, n);
-    game.tanda.set(ws.idtarget, tanda || this.getRandomCardTanda());
-    const player = game.players.get(ws.idtarget);
-    this._safeBroadcast(ws.roomname, ["gameLowCardPlayerDraw", player?.name || ws.idtarget, n, game.tanda.get(ws.idtarget)]);
-    const activePlayers = Array.from(game.players.keys()).filter(id => !game.eliminated.has(id));
-    const allDrawn = game.numbers.size === activePlayers.length;
-    if (!game.evaluationLocked && allDrawn) {
-      game.evaluationLocked = true;
-      this._safeBroadcast(ws.roomname, ["gameLowCardWait", "Please wait for results..."]);
-      const evalTimeout = setTimeout(() => { if (!this._destroyed) this._evaluateRound(ws.roomname); }, 2000);
-      if (!game._timeouts) game._timeouts = [];
-      game._timeouts.push(evalTimeout);
-    }
-  }
-
-  _evaluateRound(room) {
-    const game = this._safeGetGame(room);
-    if (!game || !game._active) return;
-    if (game.numbers.size === 0) { this.endGame(room); return; }
-    let lowest = 13;
-    for (const n of game.numbers.values()) if (n < lowest) lowest = n;
-    const losers = [];
-    for (const [id, n] of game.numbers) if (n === lowest) { game.eliminated.add(id); losers.push(id); }
-    const remaining = Array.from(game.players.keys()).filter(id => !game.eliminated.has(id));
-    if (remaining.length === 1) {
-      const winnerId = remaining[0];
-      const winner = game.players.get(winnerId);
-      const totalCoin = game.betAmount * game.players.size;
-      this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
-      this.endGame(room);
-      return;
-    }
-    if (remaining.length === 0) { this.endGame(room); return; }
-    const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
-      const player = game.players.get(id);
-      const playerTanda = game.tanda.get(id) || "";
-      return `${player?.name}:${n}(${playerTanda})`;
+      return value;
     });
-    const loserNames = losers.map(id => game.players.get(id)?.name || id);
-    const remainingNames = remaining.map(id => game.players.get(id)?.name || id);
-    this._safeBroadcast(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
-    game.round++;
-    game.numbers.clear();
-    game.tanda.clear();
-    game.drawTimeLeft = CONSTANTS.DRAW_TIME;
-    game.drawTimeExpired = false;
-    game.evaluationLocked = false;
-    this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
-    this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
-    if (game.useBots && game.botPlayers.size > 0) this._startBotDraws(room);
-  }
-
-  endGame(room) {
-    const game = this.activeGames.get(room);
-    if (!game) return;
-    game._active = false;
-    this._clearAllTimers(game);
-    const playersList = [];
-    if (game.players) { for (const player of game.players.values()) if (player && player.name) playersList.push(player.name); }
-    if (game.players) { game.players.clear(); game.players = null; }
-    if (game.botPlayers) { game.botPlayers.clear(); game.botPlayers = null; }
-    if (game.numbers) { game.numbers.clear(); game.numbers = null; }
-    if (game.tanda) { game.tanda.clear(); game.tanda = null; }
-    if (game.eliminated) { game.eliminated.clear(); game.eliminated = null; }
-    if (playersList.length > 0) this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
-    this.activeGames.delete(room);
-  }
-
-  destroy() {
-    this._destroyed = true;
-    for (const [room] of this.activeGames) this.endGame(room);
-    this.activeGames.clear();
-    this.chatServer = null;
-    this._errorLogs = [];
+  } catch (e) {
+    return JSON.stringify({ error: "Stringify failed" });
   }
 }
+
+function safeParseJSON(str) {
+  if (!str || str.length > 4000) return null;
+  try { return JSON.parse(str); } catch { return null; }
+}
+
+class SimpleChatBuffer {
+  constructor() {
+    this.queue = [];
+    this.callback = null;
+  }
+  setCallback(cb) { this.callback = cb; }
+  add(room, msg) {
+    if (!this.callback) return;
+    if (this.queue.length > CONSTANTS.MAX_CHAT_BUFFER_QUEUE) {
+      this.queue = [];
+      return;
+    }
+    this.queue.push({ room, msg, time: Date.now() });
+    if (this.queue.length >= CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES) this.flush();
+  }
+  flush() {
+    if (this.queue.length === 0) return;
+    const now = Date.now();
+    const toSend = this.queue.filter(item => now - item.time < CONSTANTS.MESSAGE_TTL_MS);
+    this.queue = [];
+    for (const item of toSend) {
+      try { this.callback(item.room, item.msg); } catch(e) {}
+    }
+  }
+  destroy() { this.flush(); this.callback = null; this.queue = null; }
+}
+
+class SeatData {
+  constructor() {
+    this.noimageUrl = "";
+    this.namauser = "";
+    this.color = "";
+    this.itembawah = 0;
+    this.itematas = 0;
+    this.vip = 0;
+    this.viptanda = 0;
+    this.lastPoint = null;
+  }
+  isEmpty() { return !this.namauser; }
+  clear() {
+    this.noimageUrl = "";
+    this.namauser = "";
+    this.color = "";
+    this.itembawah = 0;
+    this.itematas = 0;
+    this.vip = 0;
+    this.viptanda = 0;
+    this.lastPoint = null;
+  }
+  copyFrom(other) {
+    if (other) {
+      this.noimageUrl = other.noimageUrl || "";
+      this.namauser = other.namauser || "";
+      this.color = other.color || "";
+      this.itembawah = other.itembawah || 0;
+      this.itematas = other.itematas || 0;
+      this.vip = other.vip || 0;
+      this.viptanda = other.viptanda || 0;
+      this.lastPoint = other.lastPoint ? { ...other.lastPoint } : null;
+    }
+    return this;
+  }
+  toJSON() {
+    return {
+      noimageUrl: this.noimageUrl,
+      namauser: this.namauser,
+      color: this.color,
+      itembawah: this.itembawah,
+      itematas: this.itematas,
+      vip: this.vip,
+      viptanda: this.viptanda,
+      lastPoint: this.lastPoint
+    };
+  }
+}
+
+class RoomManager {
+  constructor() {
+    this.seats = new Map();
+    this.muteStatus = false;
+    this.currentNumber = 1;
+    this.pointsCache = null;
+    this.pointsCacheTime = 0;
+    for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) this.seats.set(i, new SeatData());
+  }
+  getOccupiedCount() {
+    let count = 0;
+    for (const seat of this.seats.values()) if (!seat.isEmpty()) count++;
+    return count;
+  }
+  getSeat(num) { const seat = this.seats.get(num); return seat ? seat.toJSON() : null; }
+  replaceSeat(num, data) {
+    const seat = this.seats.get(num);
+    if (seat) { seat.copyFrom(data); this.pointsCache = null; return true; }
+    return false;
+  }
+  replacePoint(num, point) {
+    const seat = this.seats.get(num);
+    if (seat && !seat.isEmpty()) {
+      seat.lastPoint = { x: point.x, y: point.y, fast: point.fast || false };
+      this.pointsCache = null;
+      return true;
+    }
+    return false;
+  }
+  removeSeat(num) {
+    const seat = this.seats.get(num);
+    if (seat) { seat.clear(); this.pointsCache = null; return true; }
+    return false;
+  }
+  getAllSeatsMeta() {
+    const meta = {};
+    for (const [num, seat] of this.seats) {
+      if (!seat.isEmpty()) {
+        meta[num] = {
+          noimageUrl: seat.noimageUrl,
+          namauser: seat.namauser,
+          color: seat.color,
+          itembawah: seat.itembawah,
+          itematas: seat.itematas,
+          vip: seat.vip,
+          viptanda: seat.viptanda
+        };
+      }
+    }
+    return meta;
+  }
+  getAllPoints() {
+    if (this.pointsCache && Date.now() - this.pointsCacheTime < CONSTANTS.POINTS_CACHE_MS) return this.pointsCache;
+    const points = [];
+    for (const [num, seat] of this.seats) {
+      if (seat.lastPoint && !seat.isEmpty()) {
+        points.push({ seat: num, x: seat.lastPoint.x, y: seat.lastPoint.y, fast: seat.lastPoint.fast ? 1 : 0 });
+      }
+    }
+    this.pointsCache = points;
+    this.pointsCacheTime = Date.now();
+    return points;
+  }
+  setMute(val) { this.muteStatus = !!val; return this.muteStatus; }
+  getMute() { return this.muteStatus; }
+  setCurrentNumber(n) { this.currentNumber = n; }
+  getCurrentNumber() { return this.currentNumber; }
+  destroy() {
+    for (const seat of this.seats.values()) seat.clear();
+    this.seats.clear();
+    this.pointsCache = null;
+  }
+}
+
+export class ChatServer2 {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this._startTime = Date.now();
+    this._isClosing = false;
+    this._lastCleanup = 0;
+    this._lastLog = 0;
+    
+    this.roomManagers = new Map();
+    this.userToSeat = new Map();
+    this.userCurrentRoom = new Map();
+    this.userConnections = new Map();
+    this.roomClients = new Map();
+    this.activeClients = new Set();
+    this._activeListeners = new Map();
+    
+    this.chatBuffer = new SimpleChatBuffer();
+    this.chatBuffer.setCallback((room, msg) => this._sendToRoom(room, msg));
+    
+    try { this.lowcard = new LowCardGameManager(this); } catch(e) { this.lowcard = null; }
+    
+    this.currentNumber = 1;
+    for (const room of roomList) {
+      this.roomManagers.set(room, new RoomManager());
+      this.roomClients.set(room, []);
+    }
+    
+    this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TIMER_INTERVAL);
+    this._tickCounter = 0;
+  }
+  
+  _masterTick() {
+    if (this._isClosing) return;
+    this._tickCounter++;
+    if (this._tickCounter % 900 === 0) this._doNumberTick();
+    if (this.lowcard && this.lowcard.masterTick) this.lowcard.masterTick();
+    if (this._tickCounter % 30 === 0) this._quickCleanup();
+    this.chatBuffer.flush();
+  }
+  
+  _doNumberTick() {
+    this.currentNumber = this.currentNumber < CONSTANTS.MAX_NUMBER ? this.currentNumber + 1 : 1;
+    for (const rm of this.roomManagers.values()) rm.setCurrentNumber(this.currentNumber);
+    const msg = safeStringify(["currentNumber", this.currentNumber]);
+    const notified = new Set();
+    for (const client of this.activeClients) {
+      if (client?.readyState === 1 && client.roomname && !notified.has(client.idtarget)) {
+        try { client.send(msg); notified.add(client.idtarget); } catch(e) {}
+      }
+    }
+  }
+  
+  _quickCleanup() {
+    const now = Date.now();
+    if (now - this._lastCleanup < 30000) return;
+    this._lastCleanup = now;
+    
+    if (this.userConnections.size > CONSTANTS.MAX_USER_CONNECTIONS) {
+      const entries = Array.from(this.userConnections.entries());
+      entries.sort((a, b) => (a[1]?.size || 0) - (b[1]?.size || 0));
+      const toDelete = entries.slice(0, this.userConnections.size - 400);
+      for (const [userId] of toDelete) {
+        this.userConnections.delete(userId);
+        this._removeUserFromSeat(userId);
+      }
+    }
+    
+    for (const [userId, seatInfo] of this.userToSeat) {
+      if (!this.userConnections.has(userId)) {
+        this.userToSeat.delete(userId);
+        this.userCurrentRoom.delete(userId);
+      }
+    }
+    
+    for (const [room, clients] of this.roomClients) {
+      const alive = clients.filter(c => c && c.readyState === 1 && c.roomname === room);
+      if (alive.length !== clients.length) {
+        this.roomClients.set(room, alive);
+      }
+    }
+    
+    if (this.chatBuffer.queue && this.chatBuffer.queue.length > CONSTANTS.MAX_CHAT_BUFFER_QUEUE) {
+      this.chatBuffer.queue = [];
+    }
+    
+    if (this.lowcard) this.lowcard.cleanupStaleGames();
+    
+    if (!this._lastLog || now - this._lastLog > 300000) {
+      console.log(`[STATS] Users: ${this.userConnections.size}, Connections: ${this.activeClients.size}, Games: ${this.lowcard?.activeGames?.size || 0}`);
+      this._lastLog = now;
+    }
+  }
+  
+  _cleanupWebSocket(ws) {
+    if (!ws) return;
+    
+    const listeners = this._activeListeners.get(ws);
+    if (listeners) {
+      for (const { event, handler } of listeners) {
+        try { ws.removeEventListener(event, handler); } catch(e) {}
+      }
+      this._activeListeners.delete(ws);
+    }
+    
+    const userId = ws.idtarget;
+    const room = ws.roomname;
+    
+    if (userId) {
+      const conns = this.userConnections.get(userId);
+      if (conns) {
+        conns.delete(ws);
+        if (conns.size === 0) {
+          this.userConnections.delete(userId);
+          this._removeUserFromSeat(userId, room);
+        }
+      }
+    }
+    
+    if (room) {
+      const clients = this.roomClients.get(room);
+      if (clients) {
+        const idx = clients.indexOf(ws);
+        if (idx !== -1) clients.splice(idx, 1);
+      }
+    }
+    
+    this.activeClients.delete(ws);
+    
+    try {
+      delete ws.idtarget;
+      delete ws.roomname;
+      delete ws._isClosing;
+      delete ws._connectionTime;
+    } catch(e) {}
+  }
+  
+  _removeUserFromSeat(userId, room) {
+    const seatInfo = this.userToSeat.get(userId);
+    if (seatInfo) {
+      const targetRoom = room || seatInfo.room;
+      const rm = this.roomManagers.get(targetRoom);
+      if (rm && seatInfo.seat) {
+        rm.removeSeat(seatInfo.seat);
+        this._sendToRoom(targetRoom, ["removeKursi", targetRoom, seatInfo.seat]);
+        this._sendToRoom(targetRoom, ["roomUserCount", targetRoom, rm.getOccupiedCount()]);
+      }
+    }
+    this.userToSeat.delete(userId);
+    this.userCurrentRoom.delete(userId);
+  }
+  
+  _sendToRoom(room, msg) {
+    const clients = this.roomClients.get(room);
+    if (!clients || clients.length === 0) return 0;
+    
+    const str = safeStringify(msg);
+    let sent = 0;
+    const batch = clients.slice(0, CONSTANTS.MAX_SEND_PER_TICK);
+    
+    for (let i = 0; i < batch.length; i++) {
+      const client = batch[i];
+      if (client && client.readyState === 1 && client.roomname === room) {
+        try { client.send(str); sent++; } catch(e) {}
+      }
+    }
+    
+    if (clients.length > CONSTANTS.MAX_SEND_PER_TICK) {
+      const remaining = clients.slice(CONSTANTS.MAX_SEND_PER_TICK);
+      setTimeout(() => {
+        for (const client of remaining) {
+          if (client && client.readyState === 1 && client.roomname === room) {
+            try { client.send(str); } catch(e) {}
+          }
+        }
+      }, 10);
+    }
+    
+    return sent;
+  }
+  
+  broadcastToRoom(room, msg) {
+    if (!roomList.includes(room)) return 0;
+    if (msg[0] === "chat") {
+      const rm = this.roomManagers.get(room);
+      if (rm && rm.getMute()) return 0;
+      this.chatBuffer.add(room, msg);
+      return this.roomManagers.get(room)?.getOccupiedCount() || 0;
+    }
+    return this._sendToRoom(room, msg);
+  }
+  
+  async safeSend(ws, msg) {
+    if (!ws || ws.readyState !== 1 || ws._isClosing) return false;
+    try {
+      const str = typeof msg === "string" ? msg : safeStringify(msg);
+      if (str.length > CONSTANTS.MAX_MESSAGE_SIZE) return false;
+      ws.send(str);
+      return true;
+    } catch(e) { this._cleanupWebSocket(ws); return false; }
+  }
+  
+  async handleJoinRoom(ws, room) {
+    if (!ws?.idtarget) return false;
+    if (!roomList.includes(room)) return false;
+    
+    try {
+      const existing = this.userToSeat.get(ws.idtarget);
+      if (existing && existing.room === room) {
+        const rm = this.roomManagers.get(room);
+        const seat = rm.getSeat(existing.seat);
+        if (seat && seat.namauser === ws.idtarget) {
+          ws.roomname = room;
+          this._addToRoom(ws, room);
+          await this._sendRoomState(ws, room);
+          await this.safeSend(ws, ["rooMasuk", existing.seat, room]);
+          await this.safeSend(ws, ["numberKursiSaya", existing.seat]);
+          return true;
+        }
+        this.userToSeat.delete(ws.idtarget);
+      }
+      
+      if (ws.roomname && ws.roomname !== room) await this._leaveRoom(ws, ws.roomname);
+      
+      const rm = this.roomManagers.get(room);
+      if (rm.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
+        await this.safeSend(ws, ["roomFull", room]);
+        return false;
+      }
+      
+      let assignedSeat = null;
+      for (let i = 1; i <= CONSTANTS.MAX_SEATS; i++) {
+        const seat = rm.getSeat(i);
+        if (!seat || !seat.namauser) {
+          assignedSeat = i;
+          break;
+        }
+      }
+      
+      if (!assignedSeat) {
+        await this.safeSend(ws, ["roomFull", room]);
+        return false;
+      }
+      
+      const emptySeat = new SeatData();
+      emptySeat.namauser = ws.idtarget;
+      rm.replaceSeat(assignedSeat, emptySeat.toJSON());
+      
+      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+      this.userCurrentRoom.set(ws.idtarget, room);
+      ws.roomname = room;
+      
+      this._addToRoom(ws, room);
+      this._addUserConnection(ws.idtarget, ws);
+      
+      await this._sendRoomState(ws, room);
+      await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+      await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+      await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
+      this._sendToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
+      
+      return true;
+    } catch(e) { return false; }
+  }
+  
+  async _sendRoomState(ws, room) {
+    const rm = this.roomManagers.get(room);
+    if (!rm) return;
+    
+    const seatInfo = this.userToSeat.get(ws.idtarget);
+    const selfSeat = seatInfo?.room === room ? seatInfo.seat : null;
+    
+    const allMeta = rm.getAllSeatsMeta();
+    const allPoints = rm.getAllPoints();
+    
+    if (selfSeat) {
+      delete allMeta[selfSeat];
+      const filteredPoints = allPoints.filter(p => p.seat !== selfSeat);
+      if (Object.keys(allMeta).length) await this.safeSend(ws, ["allUpdateKursiList", room, allMeta]);
+      if (filteredPoints.length) await this.safeSend(ws, ["allPointsList", room, filteredPoints]);
+    } else {
+      if (Object.keys(allMeta).length) await this.safeSend(ws, ["allUpdateKursiList", room, allMeta]);
+      if (allPoints.length) await this.safeSend(ws, ["allPointsList", room, allPoints]);
+    }
+  }
+  
+  async _leaveRoom(ws, room) {
+    if (!ws?.idtarget) return;
+    
+    const seatInfo = this.userToSeat.get(ws.idtarget);
+    if (seatInfo && seatInfo.room === room) {
+      const rm = this.roomManagers.get(room);
+      if (rm) {
+        rm.removeSeat(seatInfo.seat);
+        this._sendToRoom(room, ["removeKursi", room, seatInfo.seat]);
+        this._sendToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
+      }
+    }
+    
+    this.userToSeat.delete(ws.idtarget);
+    this.userCurrentRoom.delete(ws.idtarget);
+    
+    const clients = this.roomClients.get(room);
+    if (clients) {
+      const idx = clients.indexOf(ws);
+      if (idx !== -1) clients.splice(idx, 1);
+    }
+    
+    ws.roomname = undefined;
+  }
+  
+  _addToRoom(ws, room) {
+    let clients = this.roomClients.get(room);
+    if (!clients) { clients = []; this.roomClients.set(room, clients); }
+    if (!clients.includes(ws)) clients.push(ws);
+  }
+  
+  _addUserConnection(userId, ws) {
+    let conns = this.userConnections.get(userId);
+    if (!conns) { conns = new Set(); this.userConnections.set(userId, conns); }
+    conns.add(ws);
+    this.activeClients.add(ws);
+  }
+  
+  async safeWebSocketCleanup(ws) { if (ws) this._cleanupWebSocket(ws); }
+  
+  async handleSetIdTarget2(ws, id, isNew) {
+    if (!id || !ws) return;
+    
+    const oldConns = this.userConnections.get(id);
+    if (oldConns) {
+      for (const old of oldConns) {
+        if (old !== ws && old.readyState === 1) {
+          try { old.close(1000, "Replaced"); } catch(e) {}
+          this._cleanupWebSocket(old);
+        }
+      }
+    }
+    
+    ws.idtarget = id;
+    ws._isClosing = false;
+    ws._connectionTime = Date.now();
+    this.activeClients.add(ws);
+    this._addUserConnection(id, ws);
+    
+    const seatInfo = this.userToSeat.get(id);
+    if (seatInfo && !isNew) {
+      const { room, seat } = seatInfo;
+      const rm = this.roomManagers.get(room);
+      if (rm) {
+        const seatData = rm.getSeat(seat);
+        if (seatData && seatData.namauser === id) {
+          ws.roomname = room;
+          this._addToRoom(ws, room);
+          await this._sendRoomState(ws, room);
+          await this.safeSend(ws, ["numberKursiSaya", seat]);
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          return;
+        }
+      }
+      this.userToSeat.delete(id);
+      this.userCurrentRoom.delete(id);
+    }
+    
+    await this.safeSend(ws, isNew ? ["joinroomawal"] : ["needJoinRoom"]);
+  }
+  
+  async handleMessage(ws, raw) {
+    if (!ws || ws.readyState !== 1) return;
+    
+    let str = raw;
+    if (raw instanceof ArrayBuffer) {
+      try { str = new TextDecoder().decode(raw); } catch(e) { return; }
+    }
+    
+    if (str.length > CONSTANTS.MAX_MESSAGE_SIZE) return;
+    
+    const data = safeParseJSON(str);
+    if (!data || !Array.isArray(data)) return;
+    
+    const evt = data[0];
+    
+    try {
+      switch (evt) {
+        case "setIdTarget2":
+          await this.handleSetIdTarget2(ws, data[1], data[2]);
+          break;
+        case "joinRoom":
+          await this.handleJoinRoom(ws, data[1]);
+          break;
+        case "leaveRoom":
+          if (ws.roomname) {
+            await this._leaveRoom(ws, ws.roomname);
+            await this.safeSend(ws, ["roomLeft", ws.roomname]);
+          }
+          break;
+        case "chat": {
+          const [, room, noimg, user, msg, userColor, textColor] = data;
+          if (ws.roomname !== room || ws.idtarget !== user) return;
+          if (!roomList.includes(room)) return;
+          const rm = this.roomManagers.get(room);
+          if (rm && rm.getMute()) return;
+          this.broadcastToRoom(room, ["chat", room, noimg, user, msg, userColor, textColor]);
+          break;
+        }
+        case "updatePoint": {
+          const [, room, seat, x, y, fast] = data;
+          if (ws.roomname !== room) return;
+          const seatInfo = this.userToSeat.get(ws.idtarget);
+          if (!seatInfo || seatInfo.seat !== seat) return;
+          const rm = this.roomManagers.get(room);
+          if (rm && rm.replacePoint(seat, { x: parseFloat(x), y: parseFloat(y), fast: fast === 1 })) {
+            this._sendToRoom(room, ["pointUpdated", room, seat, x, y, fast]);
+          }
+          break;
+        }
+        case "updateKursi": {
+          const [, room, seat, noimg, user, color, bawah, atas, vip, vipTanda] = data;
+          if (ws.roomname !== room || ws.idtarget !== user) return;
+          const rm = this.roomManagers.get(room);
+          const existing = rm.getSeat(seat);
+          const updated = {
+            noimageUrl: noimg, namauser: user, color: color,
+            itembawah: bawah, itematas: atas, vip: vip, viptanda: vipTanda,
+            lastPoint: existing?.lastPoint || null
+          };
+          if (rm.replaceSeat(seat, updated)) {
+            this.userToSeat.set(user, { room, seat });
+            this.userCurrentRoom.set(user, room);
+            this._sendToRoom(room, ["kursiBatchUpdate", room, [[seat, {
+              noimageUrl: noimg, namauser: user, color: color,
+              itembawah: bawah, itematas: atas, vip: vip, viptanda: vipTanda
+            }]]]);
+          }
+          break;
+        }
+        case "removeKursiAndPoint": {
+          const [, room, seat] = data;
+          const seatInfo = this.userToSeat.get(ws.idtarget);
+          if (!seatInfo || seatInfo.seat !== seat || ws.roomname !== room) return;
+          const rm = this.roomManagers.get(room);
+          if (rm && rm.removeSeat(seat)) {
+            this.userToSeat.delete(ws.idtarget);
+            this.userCurrentRoom.delete(ws.idtarget);
+            this._sendToRoom(room, ["removeKursi", room, seat]);
+          }
+          break;
+        }
+        case "getRoomUserCount": {
+          const room = data[1];
+          if (roomList.includes(room)) {
+            const rm = this.roomManagers.get(room);
+            await this.safeSend(ws, ["roomUserCount", room, rm?.getOccupiedCount() || 0]);
+          }
+          break;
+        }
+        case "getAllRoomsUserCount": {
+          const counts = roomList.map(r => [r, this.roomManagers.get(r)?.getOccupiedCount() || 0]);
+          await this.safeSend(ws, ["allRoomsUserCount", counts]);
+          break;
+        }
+        case "getCurrentNumber":
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          break;
+        case "setMuteType": {
+          const muted = data[1], room = data[2];
+          if (roomList.includes(room)) {
+            const rm = this.roomManagers.get(room);
+            const success = rm.setMute(muted);
+            await this.safeSend(ws, ["muteTypeSet", !!muted, success, room]);
+            this._sendToRoom(room, ["muteStatusChanged", rm.getMute(), room]);
+          }
+          break;
+        }
+        case "getMuteType": {
+          const room = data[1];
+          if (roomList.includes(room)) {
+            const rm = this.roomManagers.get(room);
+            await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
+          }
+          break;
+        }
+        case "sendnotif": {
+          const [, target, img, name, desc] = data;
+          const conns = this.userConnections.get(target);
+          if (conns) {
+            const notif = ["notif", img, name, desc, Date.now()];
+            for (const c of conns) {
+              if (c.readyState === 1) {
+                await this.safeSend(c, notif);
+                break;
+              }
+            }
+          }
+          break;
+        }
+        case "private": {
+          const [, target, url, msg, sender] = data;
+          const out = ["private", target, url, msg, Date.now(), sender];
+          await this.safeSend(ws, out);
+          const conns = this.userConnections.get(target);
+          if (conns) {
+            for (const c of conns) {
+              if (c.readyState === 1) {
+                await this.safeSend(c, out);
+                break;
+              }
+            }
+          }
+          break;
+        }
+        case "isUserOnline": {
+          const user = data[1];
+          const conns = this.userConnections.get(user);
+          const online = conns && conns.size > 0;
+          await this.safeSend(ws, ["userOnlineStatus", user, online, data[2] || ""]);
+          break;
+        }
+        case "getOnlineUsers": {
+          const users = [];
+          const seen = new Set();
+          for (const c of this.activeClients) {
+            if (c?.idtarget && !seen.has(c.idtarget)) {
+              users.push(c.idtarget);
+              seen.add(c.idtarget);
+            }
+          }
+          await this.safeSend(ws, ["allOnlineUsers", users]);
+          break;
+        }
+        case "getRoomOnlineUsers": {
+          const room = data[1];
+          if (!roomList.includes(room)) return;
+          const users = [];
+          const seen = new Set();
+          const clients = this.roomClients.get(room) || [];
+          for (const c of clients) {
+            if (c?.idtarget && !seen.has(c.idtarget)) {
+              users.push(c.idtarget);
+              seen.add(c.idtarget);
+            }
+          }
+          await this.safeSend(ws, ["roomOnlineUsers", room, users]);
+          break;
+        }
+        case "gift": {
+          const [, room, sender, receiver, gift] = data;
+          if (ws.roomname !== room || ws.idtarget !== sender) return;
+          this.broadcastToRoom(room, ["gift", room, sender, receiver, gift, Date.now()]);
+          break;
+        }
+        case "rollangak": {
+          const room = data[1];
+          if (room && roomList.includes(room)) {
+            this.broadcastToRoom(room, ["rollangakBroadcast", room, data[2], data[3]]);
+          }
+          break;
+        }
+        case "gameLowCardStart":
+        case "gameLowCardJoin":
+        case "gameLowCardNumber":
+        case "gameLowCardEnd":
+          if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
+            await this.lowcard.handleEvent(ws, data);
+          }
+          break;
+        case "onDestroy":
+          await this.safeWebSocketCleanup(ws);
+          break;
+      }
+    } catch(e) {}
+  }
+  
+  async fetch(request) {
+    try {
+      const url = new URL(request.url);
+      const upgrade = request.headers.get("Upgrade") || "";
+      
+      if (upgrade.toLowerCase() !== "websocket") {
+        if (url.pathname === "/health") {
+          let activeReal = 0;
+          for (const c of this.activeClients) if (c?.readyState === 1) activeReal++;
+          return new Response(JSON.stringify({
+            status: "healthy",
+            connections: activeReal,
+            users: this.userConnections.size,
+            games: this.lowcard?.activeGames?.size || 0,
+            uptime: Date.now() - this._startTime,
+            buffer: this.chatBuffer.queue?.length || 0
+          }), { headers: { "content-type": "application/json" } });
+        }
+        
+        if (url.pathname === "/debug/memory") {
+          let totalRoomClients = 0;
+          for (const clients of this.roomClients.values()) totalRoomClients += clients.length;
+          return new Response(JSON.stringify({
+            userConnections: this.userConnections.size,
+            userToSeat: this.userToSeat.size,
+            userCurrentRoom: this.userCurrentRoom.size,
+            roomClients: totalRoomClients,
+            activeClients: this.activeClients.size,
+            chatBuffer: this.chatBuffer.queue?.length || 0,
+            activeGames: this.lowcard?.activeGames?.size || 0
+          }), { headers: { "content-type": "application/json" } });
+        }
+        
+        return new Response("ChatServer Running", { status: 200 });
+      }
+      
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      
+      await server.accept();
+      
+      server.idtarget = undefined;
+      server.roomname = undefined;
+      server._isClosing = false;
+      server._connectionTime = Date.now();
+      
+      const messageHandler = (ev) => this.handleMessage(server, ev.data);
+      const closeHandler = () => this.safeWebSocketCleanup(server);
+      const errorHandler = () => this.safeWebSocketCleanup(server);
+      
+      server.addEventListener("message", messageHandler);
+      server.addEventListener("close", closeHandler);
+      server.addEventListener("error", errorHandler);
+      
+      this._activeListeners.set(server, [
+        { event: "message", handler: messageHandler },
+        { event: "close", handler: closeHandler },
+        { event: "error", handler: errorHandler }
+      ]);
+      
+      this.activeClients.add(server);
+      
+      return new Response(null, { status: 101, webSocket: client });
+    } catch(e) {
+      console.error("Fetch error:", e);
+      return new Response("Error", { status: 500 });
+    }
+  }
+  
+  async shutdown() {
+    this._isClosing = true;
+    if (this._masterTimer) clearInterval(this._masterTimer);
+    if (this.lowcard) this.lowcard.destroy();
+    if (this.chatBuffer) this.chatBuffer.destroy();
+    
+    for (const ws of this.activeClients) {
+      try { ws.close(1000, "Shutdown"); } catch(e) {}
+    }
+    
+    for (const rm of this.roomManagers.values()) rm.destroy();
+    this.roomManagers.clear();
+    this.roomClients.clear();
+    this.userToSeat.clear();
+    this.userCurrentRoom.clear();
+    this.userConnections.clear();
+    this.activeClients.clear();
+    this._activeListeners.clear();
+  }
+}
+
+export default {
+  async fetch(req, env) {
+    try {
+      const id = env.CHAT_SERVER_2.idFromName("default");
+      const obj = env.CHAT_SERVER_2.get(id);
+      return obj.fetch(req);
+    } catch(e) {
+      console.error("Worker error:", e);
+      return new Response("Server Error", { status: 500 });
+    }
+  }
+};
