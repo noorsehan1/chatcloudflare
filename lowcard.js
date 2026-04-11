@@ -1,8 +1,8 @@
-// lowcard.js - LowCardGameManager (FULLY OPTIMIZED - NO MEMORY LEAKS - NO AUTO INTERVAL)
+// lowcard.js - LowCardGameManager 
+// 1 GAME PER ROOM - NO GLOBAL LIMIT - NO AUTO INTERVAL
 // ============================
 
 const CONSTANTS = Object.freeze({
-  MAX_LOWCARD_GAMES: 3,
   GAME_TIMEOUT_HOURS: 1,
   REGISTRATION_TIME: 25,
   DRAW_TIME: 30,
@@ -14,12 +14,8 @@ export class LowCardGameManager {
   constructor(chatServer) {
     this.chatServer = chatServer;
     this.activeGames = new Map();
-    this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
     this._errorLogs = [];
-    
-    // TIDAK ADA INTERVAL DI SINI!
-    // Cleanup dipanggil dari ChatServer2._quickCleanup()
     
     this._errorHandler = (error, context) => {
       const errorMsg = error?.message || String(error);
@@ -65,14 +61,13 @@ export class LowCardGameManager {
     }
   }
 
-  // ========== CLEANUP METHODS (DIPANGGIL DARI ChatServer2) ==========
+  // ========== CLEANUP METHODS ==========
   cleanupStaleGames() {
     try {
       if (this._destroyed) return;
       const now = Date.now();
       const staleGames = [];
       
-      // Clean up games by age or empty players
       for (const [room, game] of this.activeGames.entries()) {
         if (!game) {
           staleGames.push(room);
@@ -93,16 +88,6 @@ export class LowCardGameManager {
         }
       }
       
-      // Limit max games
-      if (this.activeGames.size > this._maxGames) {
-        const entries = Array.from(this.activeGames.entries());
-        entries.sort((a, b) => (a[1]._createdAt || 0) - (b[1]._createdAt || 0));
-        const toDelete = entries.slice(0, this.activeGames.size - this._maxGames);
-        for (const [room] of toDelete) {
-          if (!staleGames.includes(room)) staleGames.push(room);
-        }
-      }
-      
       for (const room of staleGames) {
         this.endGame(room);
       }
@@ -115,7 +100,7 @@ export class LowCardGameManager {
     }
   }
 
-  // ========== COMPLETELY CLEAR ALL TIMERS AND REFERENCES ==========
+  // ========== CLEAR ALL TIMERS ==========
   _clearAllTimers(game) {
     try {
       if (!game) return;
@@ -241,23 +226,10 @@ export class LowCardGameManager {
 
       const room = ws.roomname;
       
-      // Check existing game
+      // CEK: Apakah di room ini sudah ada game berjalan?
       const existingGame = this.activeGames.get(room);
       if (existingGame && existingGame._isActive) {
         this._safeSend(ws, ["gameLowCardError", "Game already running in this room"]);
-        return;
-      }
-      
-      // Check max games
-      let activeGameCount = 0;
-      for (const game of this.activeGames.values()) {
-        if (game && game._isActive && !game.winner) {
-          activeGameCount++;
-        }
-      }
-      
-      if (activeGameCount >= CONSTANTS.MAX_LOWCARD_GAMES) {
-        this._safeSend(ws, ["gameLowCardError", "Server busy, max 3 games"]);
         return;
       }
 
@@ -898,7 +870,6 @@ export class LowCardGameManager {
     }
   }
 
-  // ========== COMPLETELY CLEAR ALL GAME PROPERTIES ==========
   endGame(room) {
     try {
       const game = this.activeGames.get(room);
@@ -915,7 +886,6 @@ export class LowCardGameManager {
       
       this._clearAllTimers(game);
       
-      // Completely clear all game properties
       if (game.players) {
         game.players.clear();
         game.players = null;
@@ -937,7 +907,6 @@ export class LowCardGameManager {
         game.eliminated = null;
       }
       
-      // Clear all primitive properties
       game.round = null;
       game.winner = null;
       game.betAmount = null;
