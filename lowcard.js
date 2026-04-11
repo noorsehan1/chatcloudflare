@@ -2,8 +2,7 @@
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal (normal, tidak diseting menang terus)
-// FIXED: Memory leaks, timer cleanup, bot timer management
-// FIXED: User yang tidak draw akan dieliminasi dan tidak masuk ke round berikutnya
+// FIXED: User yang tidak draw akan dieliminasi dan MASUK ke daftar kalah (loser list)
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -526,9 +525,14 @@ export class LowCardGameManager {
       }
     }
     
+    // SEMUA YANG KALAH (termasuk yang tidak draw dan yang angka terendah)
+    const allLosers = [];
+    
+    // ELIMINASI YANG TIDAK DRAW (LANGSUNG KALAH)
     if (notSubmittedPlayers.length > 0) {
       for (const playerId of notSubmittedPlayers) {
         game.eliminated.add(playerId);
+        allLosers.push(playerId);
       }
       const notSubmittedNames = notSubmittedPlayers.map(id => game.players.get(id)?.name || id);
       this._safeBroadcast(room, ["gameLowCardRoundResultEliminated", notSubmittedNames]);
@@ -539,24 +543,27 @@ export class LowCardGameManager {
       return;
     }
     
+    // HITUNG LOWEST DARI YANG SUBMIT
     let lowest = 13;
     for (const id of submittedPlayers) {
       const n = game.numbers.get(id);
       if (n < lowest) lowest = n;
     }
     
-    const losers = [];
+    // ELIMINASI YANG SUBMIT ANGKA TERENDAH
     for (const id of submittedPlayers) {
       const n = game.numbers.get(id);
       if (n === lowest) {
         game.eliminated.add(id);
-        losers.push(id);
+        allLosers.push(id);
       }
     }
     
+    // HITUNG REMAINING PLAYER
     const remaining = Array.from(game.players.keys())
       .filter(id => !game.eliminated.has(id));
     
+    // CEK PEMENANG
     if (remaining.length === 1) {
       const winnerId = remaining[0];
       const winner = game.players.get(winnerId);
@@ -571,23 +578,25 @@ export class LowCardGameManager {
       return;
     }
     
+    // BROADCAST HASIL ROUND
     const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
       const player = game.players.get(id);
       const playerTanda = game.tanda.get(id) || "";
       return `${player?.name}:${n}(${playerTanda})`;
     });
     
-    const loserNames = losers.map(id => game.players.get(id)?.name || id);
+    const allLoserNames = allLosers.map(id => game.players.get(id)?.name || id);
     const remainingNames = remaining.map(id => game.players.get(id)?.name || id);
     
     this._safeBroadcast(room, [
       "gameLowCardRoundResult",
       game.round,
       numbersArr,
-      loserNames,
+      allLoserNames,
       remainingNames
     ]);
     
+    // RESET UNTUK ROUND BERIKUTNYA
     game.round++;
     game.numbers.clear();
     game.tanda.clear();
