@@ -1,4 +1,4 @@
-// index.js - ChatServer2 - LOGIKA AWAL + 1 TIMER
+// index.js - ChatServer2 - SESUAI DENGAN CLIENT JAVA
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
@@ -22,8 +22,6 @@ const CONSTANTS = Object.freeze({
   MAX_CHAT_BUFFER_QUEUE: 100,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_CONNECTIONS_PER_USER: 1,
-  CLEANUP_BATCH_SIZE: 10,
-  ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
 });
 
 const roomList = Object.freeze([
@@ -285,16 +283,9 @@ export class ChatServer2 {
     if (this._isClosing) return;
     this._tickCounter++;
     
-    // Number tick setiap 15 menit (900 detik)
     if (this._tickCounter % 900 === 0) this._doNumberTick();
-    
-    // Game tick
     if (this.lowcard && this.lowcard.masterTick) this.lowcard.masterTick();
-    
-    // Cleanup setiap 30 detik
     if (this._tickCounter % 30 === 0) this._quickCleanup();
-    
-    // Flush buffer
     this.chatBuffer.flush();
   }
   
@@ -315,7 +306,6 @@ export class ChatServer2 {
     if (now - this._lastCleanup < 30000) return;
     this._lastCleanup = now;
     
-    // Clean userConnections yang kelebihan
     if (this.userConnections.size > CONSTANTS.MAX_USER_CONNECTIONS) {
       const entries = Array.from(this.userConnections.entries());
       entries.sort((a, b) => (a[1]?.size || 0) - (b[1]?.size || 0));
@@ -326,7 +316,6 @@ export class ChatServer2 {
       }
     }
     
-    // Clean userToSeat orphan
     for (const [userId, seatInfo] of this.userToSeat) {
       if (!this.userConnections.has(userId)) {
         this.userToSeat.delete(userId);
@@ -334,7 +323,6 @@ export class ChatServer2 {
       }
     }
     
-    // Clean roomClients
     for (const [room, clients] of this.roomClients) {
       const alive = clients.filter(c => c && c.readyState === 1 && c.roomname === room);
       if (alive.length !== clients.length) {
@@ -342,18 +330,13 @@ export class ChatServer2 {
       }
     }
     
-    // Clean chat buffer
     if (this.chatBuffer.queue && this.chatBuffer.queue.length > CONSTANTS.MAX_CHAT_BUFFER_QUEUE) {
       this.chatBuffer.queue = [];
     }
     
-    // Clean rate limiter
     this.rateLimiter.cleanup();
-    
-    // Clean games
     if (this.lowcard) this.lowcard.cleanupStaleGames();
     
-    // Log stats
     if (!this._lastLog || now - this._lastLog > 300000) {
       console.log(`[STATS] Users: ${this.userConnections.size}, Connections: ${this.activeClients.size}, Games: ${this.lowcard?.activeGames?.size || 0}`);
       this._lastLog = now;
@@ -487,7 +470,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           
-          // ✅ BROADCAST ROOM COUNT KE SEMUA USER
+          // Broadcast room count ke semua user
           this.broadcastToRoom(room, ["roomUserCount", room, this.getRoomCount(room)]);
           
           return true;
@@ -534,7 +517,7 @@ export class ChatServer2 {
       await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       
-      // ✅ BROADCAST KE SEMUA USER (BUKAN HANYA USER YANG JOIN)
+      // Broadcast ke semua user
       this.broadcastToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
       this.broadcastToRoom(room, ["roomUserCount", room, this.getRoomCount(room)]);
       
@@ -668,15 +651,22 @@ export class ChatServer2 {
         case "setIdTarget2":
           await this.handleSetIdTarget2(ws, data[1], data[2]);
           break;
+          
         case "joinRoom":
           await this.handleJoinRoom(ws, data[1]);
           break;
+          
         case "leaveRoom":
           if (ws.roomname) {
             await this._leaveRoom(ws, ws.roomname);
             await this.safeSend(ws, ["roomLeft", ws.roomname]);
           }
           break;
+          
+        case "isInRoom":
+          await this.safeSend(ws, ["inRoomStatus", this.userCurrentRoom.has(ws.idtarget)]);
+          break;
+          
         case "chat": {
           const [, room, noimg, user, msg, userColor, textColor] = data;
           if (ws.roomname !== room || ws.idtarget !== user) return;
@@ -686,6 +676,7 @@ export class ChatServer2 {
           this.broadcastToRoom(room, ["chat", room, noimg, user, msg, userColor, textColor]);
           break;
         }
+        
         case "updatePoint": {
           const [, room, seat, x, y, fast] = data;
           if (ws.roomname !== room) return;
@@ -697,6 +688,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "updateKursi": {
           const [, room, seat, noimg, user, color, bawah, atas, vip, vipTanda] = data;
           if (ws.roomname !== room || ws.idtarget !== user) return;
@@ -717,6 +709,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "removeKursiAndPoint": {
           const [, room, seat] = data;
           const seatInfo = this.userToSeat.get(ws.idtarget);
@@ -726,9 +719,11 @@ export class ChatServer2 {
             this.userToSeat.delete(ws.idtarget);
             this.userCurrentRoom.delete(ws.idtarget);
             this._sendToRoom(room, ["removeKursi", room, seat]);
+            this.broadcastToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
           }
           break;
         }
+        
         case "getRoomUserCount": {
           const room = data[1];
           if (roomList.includes(room)) {
@@ -737,14 +732,17 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "getAllRoomsUserCount": {
           const counts = roomList.map(r => [r, this.roomManagers.get(r)?.getOccupiedCount() || 0]);
           await this.safeSend(ws, ["allRoomsUserCount", counts]);
           break;
         }
+        
         case "getCurrentNumber":
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           break;
+          
         case "setMuteType": {
           const muted = data[1], room = data[2];
           if (roomList.includes(room)) {
@@ -755,6 +753,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "getMuteType": {
           const room = data[1];
           if (roomList.includes(room)) {
@@ -763,6 +762,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "sendnotif": {
           const [, target, img, name, desc] = data;
           const conns = this.userConnections.get(target);
@@ -777,6 +777,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "private": {
           const [, target, url, msg, sender] = data;
           const out = ["private", target, url, msg, Date.now(), sender];
@@ -792,6 +793,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "isUserOnline": {
           const user = data[1];
           const conns = this.userConnections.get(user);
@@ -799,6 +801,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["userOnlineStatus", user, online, data[2] || ""]);
           break;
         }
+        
         case "getOnlineUsers": {
           const users = [];
           const seen = new Set();
@@ -811,6 +814,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
+        
         case "getRoomOnlineUsers": {
           const room = data[1];
           if (!roomList.includes(room)) return;
@@ -826,12 +830,14 @@ export class ChatServer2 {
           await this.safeSend(ws, ["roomOnlineUsers", room, users]);
           break;
         }
+        
         case "gift": {
           const [, room, sender, receiver, gift] = data;
           if (ws.roomname !== room || ws.idtarget !== sender) return;
           this.broadcastToRoom(room, ["gift", room, sender, receiver, gift, Date.now()]);
           break;
         }
+        
         case "rollangak": {
           const room = data[1];
           if (room && roomList.includes(room)) {
@@ -839,6 +845,7 @@ export class ChatServer2 {
           }
           break;
         }
+        
         case "gameLowCardStart":
         case "gameLowCardJoin":
         case "gameLowCardNumber":
@@ -847,8 +854,13 @@ export class ChatServer2 {
             await this.lowcard.handleEvent(ws, data);
           }
           break;
+          
         case "onDestroy":
           await this.safeWebSocketCleanup(ws);
+          break;
+          
+        case "ping":
+          await this.safeSend(ws, ["pong", Date.now()]);
           break;
       }
     } catch(e) {}
