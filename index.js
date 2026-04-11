@@ -1,5 +1,6 @@
 // index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
 // FIX: User online tidak akan dihapus meskipun diam
+// FIX: Keep-alive untuk mencegah DO idle
 import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS UNTUK CLOUDFLARE WORKERS ====================
@@ -63,6 +64,9 @@ const CONSTANTS = Object.freeze({
   MAX_USERS_BEFORE_CLEANUP: 100,
   MAX_SEATS_BEFORE_CLEANUP: 500,
   EMERGENCY_CLEANUP_INTERVAL_MS: 120000,
+  
+  // KEEP ALIVE
+  KEEP_ALIVE_INTERVAL_MS: 45000,
 });
 
 const roomList = Object.freeze([
@@ -757,6 +761,21 @@ export class ChatServer2 {
     this._emergencyCleanupInterval = setInterval(() => {
       this._emergencyCleanup();
     }, CONSTANTS.EMERGENCY_CLEANUP_INTERVAL_MS);
+    
+    // ========== KEEP ALIVE UNTUK MENCEGAH DO IDLE ==========
+    this._keepAliveInterval = setInterval(() => {
+      this._keepAlive().catch(() => {});
+    }, CONSTANTS.KEEP_ALIVE_INTERVAL_MS);
+  }
+  
+  async _keepAlive() {
+    try {
+      // Ping ke health endpoint sendiri
+      const url = `https://${this.env?.__host || 'chat-cloudflare.chatmozapp.workers.dev'}/health`;
+      await fetch(url, { method: 'GET' });
+    } catch (error) {
+      // Silent fail, keep-alive hanya preventif
+    }
   }
   
   _hasLiveConnection(userId) {
@@ -771,30 +790,34 @@ export class ChatServer2 {
   }
   
   _emergencyCleanup() {
-    console.log(`[EMERGENCY] Running cleanup`);
-    
-    this.chatBuffer.flushAll().catch(() => {});
-    
-    const toCleanup = [];
-    for (const [userId, connections] of this.userConnections) {
-      let hasLiveConnection = false;
-      for (const conn of connections) {
-        if (conn && conn.readyState === 1 && !conn._isClosing) {
-          hasLiveConnection = true;
-          break;
+    try {
+      console.log(`[EMERGENCY] Running cleanup`);
+      
+      this.chatBuffer.flushAll().catch(() => {});
+      
+      const toCleanup = [];
+      for (const [userId, connections] of this.userConnections) {
+        let hasLiveConnection = false;
+        for (const conn of connections) {
+          if (conn && conn.readyState === 1 && !conn._isClosing) {
+            hasLiveConnection = true;
+            break;
+          }
+        }
+        if (!hasLiveConnection) {
+          toCleanup.push(userId);
         }
       }
-      if (!hasLiveConnection) {
-        toCleanup.push(userId);
+      
+      for (let i = 0; i < Math.min(toCleanup.length, 20); i++) {
+        this.forceUserCleanup(toCleanup[i]).catch(() => {});
       }
+      
+      this._compressRoomClients();
+      this._checkMemoryAndCleanup();
+    } catch (error) {
+      console.error(`[EMERGENCY] Error:`, error);
     }
-    
-    for (let i = 0; i < Math.min(toCleanup.length, 20); i++) {
-      this.forceUserCleanup(toCleanup[i]).catch(() => {});
-    }
-    
-    this._compressRoomClients();
-    this._checkMemoryAndCleanup();
   }
   
   _checkMemoryAndCleanup() {
@@ -1766,12 +1789,16 @@ export class ChatServer2 {
           if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
             try {
               await this.lowcard.handleEvent(ws, data);
-            } catch (error) {}
+            } catch (error) {
+              console.error(`[GAME] Error in ${evt}:`, error);
+            }
           }
           break;
         }
       }
-    } catch (error) {}
+    } catch (error) {
+      console.error(`[PROCESS MESSAGE] Error in ${evt}:`, error);
+    }
   }
   
   async isUserStillConnected(userId) {
@@ -2006,6 +2033,11 @@ export class ChatServer2 {
     this._isClosing = true;
     console.log("[SHUTDOWN] Starting graceful shutdown...");
     
+    if (this._keepAliveInterval) {
+      clearInterval(this._keepAliveInterval);
+      this._keepAliveInterval = null;
+    }
+    
     await this.chatBuffer.flushAll();
     
     if (this.numberTickTimer) {
@@ -2199,8 +2231,8 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");  // ← UBAH!
-      const chatObj = env.CHAT_SERVER_2.get(chatId);             // ← UBAH!
+      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER_2.get(chatId);
       
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
         return chatObj.fetch(req);
