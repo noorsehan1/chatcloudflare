@@ -2,8 +2,8 @@
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal
-// HANYA menggunakan event yang ada di client Java (TIDAK menggunakan gameLowCardEnd)
-// gameLowCardTimeLeft: "TIME UP!" untuk time up, "Player lost" untuk user kalah lawan bot, "Player(s) X lost" untuk PvP
+// FIXED: Winner detection - jika hanya 1 user tersisa (meskipun masih ada bot), user tetap MENANG
+// gameLowCardWinner dikirim ke SEMUA user di room
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -618,16 +618,26 @@ export class LowCardGameManager {
     const remainingHumans = remaining.filter(id => this._isHumanPlayer(id));
     const isBotGame = this._isBotGame(game);
     
-    // Jika TIDAK ADA user manusia yang tersisa (semua user sudah kalah) - KHUSUS BOT
-    if (remainingHumans.length === 0 && loserNames.length > 0 && isBotGame) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "Player lost"]);
-      this.endGame(room, "Game ended");
+    // ========== WINNER DETECTION - DIPERBAIKI ==========
+    // Jika HANYA 1 user manusia yang tersisa (meskipun masih ada bot), user itu MENANG
+    if (remainingHumans.length === 1) {
+      const winnerId = remainingHumans[0];
+      const winner = game.players.get(winnerId);
+      const totalCoin = game.betAmount * game.players.size;
+      
+      // KIRIM KE SEMUA USER DI ROOM
+      this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
+      this.endGame(room, `${winner?.name} won the game`);
       return;
     }
     
-    // Jika TIDAK ADA user manusia yang tersisa (PVP)
-    if (remainingHumans.length === 0 && loserNames.length > 0 && !isBotGame) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", `Player(s) ${loserNames.join(", ")} lost`]);
+    // Jika TIDAK ADA user manusia yang tersisa (semua user sudah kalah)
+    if (remainingHumans.length === 0 && loserNames.length > 0) {
+      if (isBotGame) {
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", "Player lost"]);
+      } else {
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", `Player(s) ${loserNames.join(", ")} lost`]);
+      }
       this.endGame(room, "Game ended");
       return;
     }
@@ -638,21 +648,8 @@ export class LowCardGameManager {
       return;
     }
     
-    // Jika HANYA 1 user manusia yang tersisa dan tidak ada player lain
-    if (remainingHumans.length === 1 && remaining.length === 1) {
-      const winnerId = remainingHumans[0];
-      const winner = game.players.get(winnerId);
-      const totalCoin = game.betAmount * game.players.size;
-      
-      // HANYA 2 PARAMETER - COMPATIBLE DENGAN CLIENT JAVA
-      this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
-      
-      this.endGame(room, `${winner?.name} won the game`);
-      return;
-    }
-    
-    // JIKA MASIH ADA LEBIH DARI 1 PLAYER (termasuk bot)
-    if (remaining.length >= 2) {
+    // JIKA MASIH ADA LEBIH DARI 1 USER MANUSIA
+    if (remainingHumans.length >= 2) {
       const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
         const player = game.players.get(id);
         const playerTanda = game.tanda.get(id) || "";
