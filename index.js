@@ -1,4 +1,4 @@
-// index.js - ChatServer2 with LowCardGameManager - CLOUDFLARE WORKERS READY
+// index.js - ChatServer2 FIXED - 1 TIMER ONLY
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
@@ -270,6 +270,7 @@ export class ChatServer2 {
       this.roomClients.set(room, []);
     }
     
+    // HANYA 1 TIMER!
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TIMER_INTERVAL);
     this._tickCounter = 0;
   }
