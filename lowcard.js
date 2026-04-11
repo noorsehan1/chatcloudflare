@@ -1,10 +1,10 @@
-// lowcard.js - LowCardGameManager dengan TIME 15 DETIK
+// lowcard.js - LowCardGameManager dengan TIME 20 DETIK
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
-  REGISTRATION_TIME: 15,     // 15 detik join
-  DRAW_TIME: 15,             // 15 detik draw
-  BOT_DRAW_MIN_SECONDS: 2,   // bot draw tercepat 2 detik
-  BOT_DRAW_MAX_SECONDS: 10,  // bot draw terlambat 10 detik
+  REGISTRATION_TIME: 20,     // 20 detik join
+  DRAW_TIME: 20,             // 20 detik draw
+  BOT_DRAW_MIN_SECONDS: 2,
+  BOT_DRAW_MAX_SECONDS: 10,
 };
 
 export class LowCardGameManager {
@@ -94,9 +94,11 @@ export class LowCardGameManager {
     if (this._destroyed) return;
     for (const [room, game] of this.activeGames) {
       if (!game || !game._active) continue;
+      
+      // REGISTRATION COUNTDOWN (20 detik)
       if (game.registrationOpen && game.regTimeLeft > 0) {
         game.regTimeLeft--;
-        if (game.regTimeLeft === 10 || game.regTimeLeft === 5 || game.regTimeLeft === 3) {
+        if (game.regTimeLeft === 15 || game.regTimeLeft === 10 || game.regTimeLeft === 5) {
           this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.regTimeLeft}s`]);
         }
         if (game.regTimeLeft <= 0) {
@@ -104,9 +106,11 @@ export class LowCardGameManager {
           this._closeRegistration(room);
         }
       }
+      
+      // DRAW COUNTDOWN (20 detik)
       if (!game.registrationOpen && !game.drawTimeExpired && game.drawTimeLeft > 0) {
         game.drawTimeLeft--;
-        if (game.drawTimeLeft === 10 || game.drawTimeLeft === 5 || game.drawTimeLeft === 3) {
+        if (game.drawTimeLeft === 15 || game.drawTimeLeft === 10 || game.drawTimeLeft === 5) {
           this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
         }
         if (game.drawTimeLeft <= 0 && !game.drawTimeExpired) {
