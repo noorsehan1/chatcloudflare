@@ -1,4 +1,4 @@
-// index.js - ChatServer2 - LOGIKA SAMA PERSIS KODE AWAL + 1 TIMER
+// index.js - ChatServer2 - LOGIKA AWAL + 1 TIMER
 import { LowCardGameManager } from "./lowcard.js";
 
 const CONSTANTS = Object.freeze({
@@ -18,10 +18,12 @@ const CONSTANTS = Object.freeze({
   MASTER_TIMER_INTERVAL: 1000,
   MAX_USER_CONNECTIONS: 500,
   MAX_ROOM_CLIENTS: 300,
-  MAX_CHAT_BUFFER_QUEUE: 100,
   MAX_RATE_LIMITER_SIZE: 500,
+  MAX_CHAT_BUFFER_QUEUE: 100,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_CONNECTIONS_PER_USER: 1,
+  CLEANUP_BATCH_SIZE: 10,
+  ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
 });
 
 const roomList = Object.freeze([
@@ -274,7 +276,7 @@ export class ChatServer2 {
       this.roomClients.set(room, []);
     }
     
-    // SATU-SATUNYA TIMER
+    // ========== SATU-SATUNYA TIMER ==========
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TIMER_INTERVAL);
     this._tickCounter = 0;
   }
@@ -282,9 +284,17 @@ export class ChatServer2 {
   _masterTick() {
     if (this._isClosing) return;
     this._tickCounter++;
+    
+    // Number tick setiap 15 menit (900 detik)
     if (this._tickCounter % 900 === 0) this._doNumberTick();
+    
+    // Game tick
     if (this.lowcard && this.lowcard.masterTick) this.lowcard.masterTick();
+    
+    // Cleanup setiap 30 detik
     if (this._tickCounter % 30 === 0) this._quickCleanup();
+    
+    // Flush buffer
     this.chatBuffer.flush();
   }
   
@@ -305,6 +315,7 @@ export class ChatServer2 {
     if (now - this._lastCleanup < 30000) return;
     this._lastCleanup = now;
     
+    // Clean userConnections yang kelebihan
     if (this.userConnections.size > CONSTANTS.MAX_USER_CONNECTIONS) {
       const entries = Array.from(this.userConnections.entries());
       entries.sort((a, b) => (a[1]?.size || 0) - (b[1]?.size || 0));
@@ -315,6 +326,7 @@ export class ChatServer2 {
       }
     }
     
+    // Clean userToSeat orphan
     for (const [userId, seatInfo] of this.userToSeat) {
       if (!this.userConnections.has(userId)) {
         this.userToSeat.delete(userId);
@@ -322,6 +334,7 @@ export class ChatServer2 {
       }
     }
     
+    // Clean roomClients
     for (const [room, clients] of this.roomClients) {
       const alive = clients.filter(c => c && c.readyState === 1 && c.roomname === room);
       if (alive.length !== clients.length) {
@@ -329,13 +342,18 @@ export class ChatServer2 {
       }
     }
     
+    // Clean chat buffer
     if (this.chatBuffer.queue && this.chatBuffer.queue.length > CONSTANTS.MAX_CHAT_BUFFER_QUEUE) {
       this.chatBuffer.queue = [];
     }
     
+    // Clean rate limiter
     this.rateLimiter.cleanup();
+    
+    // Clean games
     if (this.lowcard) this.lowcard.cleanupStaleGames();
     
+    // Log stats
     if (!this._lastLog || now - this._lastLog > 300000) {
       console.log(`[STATS] Users: ${this.userConnections.size}, Connections: ${this.activeClients.size}, Games: ${this.lowcard?.activeGames?.size || 0}`);
       this._lastLog = now;
@@ -466,6 +484,12 @@ export class ChatServer2 {
           await this._sendRoomState(ws, room);
           await this.safeSend(ws, ["rooMasuk", existing.seat, room]);
           await this.safeSend(ws, ["numberKursiSaya", existing.seat]);
+          await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          
+          // ✅ BROADCAST ROOM COUNT KE SEMUA USER
+          this.broadcastToRoom(room, ["roomUserCount", room, this.getRoomCount(room)]);
+          
           return true;
         }
         this.userToSeat.delete(ws.idtarget);
@@ -507,8 +531,12 @@ export class ChatServer2 {
       await this._sendRoomState(ws, room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
-      await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
-      this._sendToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
+      await this.safeSend(ws, ["muteTypeResponse", rm.getMute(), room]);
+      await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      
+      // ✅ BROADCAST KE SEMUA USER (BUKAN HANYA USER YANG JOIN)
+      this.broadcastToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
+      this.broadcastToRoom(room, ["roomUserCount", room, this.getRoomCount(room)]);
       
       return true;
     } catch(e) { return false; }
@@ -857,15 +885,6 @@ export class ChatServer2 {
             rateLimiter: this.rateLimiter.map?.size || 0,
             chatBuffer: this.chatBuffer.queue?.length || 0,
             activeGames: this.lowcard?.activeGames?.size || 0
-          }), { headers: { "content-type": "application/json" } });
-        }
-        
-        if (url.pathname === "/debug/roomcounts") {
-          const counts = {};
-          for (const room of roomList) counts[room] = this.getRoomCount(room);
-          return new Response(JSON.stringify({
-            counts: counts,
-            total: Object.values(counts).reduce((a,b) => a + b, 0)
           }), { headers: { "content-type": "application/json" } });
         }
         
