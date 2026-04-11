@@ -1,8 +1,9 @@
-// lowcard.js - LowCardGameManager FINAL - NO LOGS
+// lowcard.js - LowCardGameManager FINAL - FULL CLASS
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
 // Logika bot PERSIS seperti kode awal (normal, tidak diseting menang terus)
 // FIXED: User yang tidak draw akan dieliminasi dan MASUK ke daftar kalah (loser list)
+// FIXED: Jika angka sama, lanjut next round sampai ada yang terendah dan sisa 1 pemenang
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -525,10 +526,9 @@ export class LowCardGameManager {
       }
     }
     
-    // SEMUA YANG KALAH (termasuk yang tidak draw dan yang angka terendah)
     const allLosers = [];
     
-    // ELIMINASI YANG TIDAK DRAW (LANGSUNG KALAH)
+    // YANG TIDAK DRAW LANGSUNG KALAH
     if (notSubmittedPlayers.length > 0) {
       for (const playerId of notSubmittedPlayers) {
         game.eliminated.add(playerId);
@@ -538,28 +538,59 @@ export class LowCardGameManager {
       this._safeBroadcast(room, ["gameLowCardRoundResultEliminated", notSubmittedNames]);
     }
     
+    // JIKA TIDAK ADA YANG DRAW (SEMUA TIDAK DRAW)
     if (submittedPlayers.length === 0) {
+      this._safeBroadcast(room, ["gameLowCardNoWinner", "No one drew cards! No winner."]);
       this.endGame(room);
       return;
     }
     
-    // HITUNG LOWEST DARI YANG SUBMIT
+    // HITUNG LOWEST DARI YANG DRAW
     let lowest = 13;
     for (const id of submittedPlayers) {
       const n = game.numbers.get(id);
       if (n < lowest) lowest = n;
     }
     
-    // ELIMINASI YANG SUBMIT ANGKA TERENDAH
+    // HITUNG ADA BERAPA YANG DRAW ANGKA TERENDAH
+    const lowestPlayers = [];
     for (const id of submittedPlayers) {
       const n = game.numbers.get(id);
       if (n === lowest) {
-        game.eliminated.add(id);
-        allLosers.push(id);
+        lowestPlayers.push(id);
       }
     }
     
-    // HITUNG REMAINING PLAYER
+    // ========== LOGIKA ANGKA SAMA ==========
+    // Jika semua player yang draw memiliki angka yang SAMA semua
+    if (lowestPlayers.length === submittedPlayers.length && submittedPlayers.length > 1) {
+      // SEMUA DRAW ANGKA SAMA - TIDAK ADA YANG ELIMINASI, LANJUT NEXT ROUND
+      this._safeBroadcast(room, ["gameLowCardSameNumber", "All players drew the same number! Continue to next round."]);
+      
+      // Reset untuk round berikutnya (tanpa eliminasi)
+      game.round++;
+      game.numbers.clear();
+      game.tanda.clear();
+      game.drawTimeLeft = CONSTANTS.DRAW_TIME;
+      game.drawTimeExpired = false;
+      game.evaluationLocked = false;
+      
+      this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
+      
+      if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
+        this._startBotDraws(room);
+      }
+      return;
+    }
+    
+    // ELIMINASI YANG DRAW ANGKA TERENDAH (HANYA JIKA TIDAK SEMUA SAMA)
+    for (const id of lowestPlayers) {
+      game.eliminated.add(id);
+      allLosers.push(id);
+    }
+    
+    // HITUNG REMAINING
     const remaining = Array.from(game.players.keys())
       .filter(id => !game.eliminated.has(id));
     
@@ -573,42 +604,46 @@ export class LowCardGameManager {
       return;
     }
     
-    if (remaining.length === 0) {
-      this.endGame(room);
+    // JIKA MASIH ADA LEBIH DARI 1 PLAYER
+    if (remaining.length >= 2) {
+      const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
+        const player = game.players.get(id);
+        const playerTanda = game.tanda.get(id) || "";
+        return `${player?.name}:${n}(${playerTanda})`;
+      });
+      
+      const allLoserNames = allLosers.map(id => game.players.get(id)?.name || id);
+      const remainingNames = remaining.map(id => game.players.get(id)?.name || id);
+      
+      this._safeBroadcast(room, [
+        "gameLowCardRoundResult",
+        game.round,
+        numbersArr,
+        allLoserNames,
+        remainingNames
+      ]);
+      
+      game.round++;
+      game.numbers.clear();
+      game.tanda.clear();
+      game.drawTimeLeft = CONSTANTS.DRAW_TIME;
+      game.drawTimeExpired = false;
+      game.evaluationLocked = false;
+      
+      this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
+      
+      if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
+        this._startBotDraws(room);
+      }
       return;
     }
     
-    // BROADCAST HASIL ROUND
-    const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
-      const player = game.players.get(id);
-      const playerTanda = game.tanda.get(id) || "";
-      return `${player?.name}:${n}(${playerTanda})`;
-    });
-    
-    const allLoserNames = allLosers.map(id => game.players.get(id)?.name || id);
-    const remainingNames = remaining.map(id => game.players.get(id)?.name || id);
-    
-    this._safeBroadcast(room, [
-      "gameLowCardRoundResult",
-      game.round,
-      numbersArr,
-      allLoserNames,
-      remainingNames
-    ]);
-    
-    // RESET UNTUK ROUND BERIKUTNYA
-    game.round++;
-    game.numbers.clear();
-    game.tanda.clear();
-    game.drawTimeLeft = CONSTANTS.DRAW_TIME;
-    game.drawTimeExpired = false;
-    game.evaluationLocked = false;
-    
-    this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
-    this._safeBroadcast(room, ["gameLowCardTimeLeft", `${CONSTANTS.DRAW_TIME}s`]);
-    
-    if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
-      this._startBotDraws(room);
+    // JIKA TIDAK ADA YANG TERSISA
+    if (remaining.length === 0) {
+      this._safeBroadcast(room, ["gameLowCardNoWinner", "All players eliminated! No winner."]);
+      this.endGame(room);
+      return;
     }
   }
 
