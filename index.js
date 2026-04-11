@@ -476,6 +476,7 @@ export class ChatServer2 {
       if (seatInfo && seatInfo.room === room) {
         await this._sendRoomState(ws, room);
         await this.safeSend(ws, ["rooMasuk", seatInfo.seat, room]);
+        await this.safeSend(ws, ["currentRoom", room]);
         return true;
       }
     }
@@ -491,6 +492,7 @@ export class ChatServer2 {
           await this._sendRoomState(ws, room);
           await this.safeSend(ws, ["rooMasuk", existing.seat, room]);
           await this.safeSend(ws, ["numberKursiSaya", existing.seat]);
+          await this.safeSend(ws, ["currentRoom", room]);
           return true;
         }
         this.userToSeat.delete(ws.idtarget);
@@ -532,9 +534,9 @@ export class ChatServer2 {
       await this._sendRoomState(ws, room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
+      await this.safeSend(ws, ["currentRoom", room]);
       await this.safeSend(ws, ["roomUserCount", room, rm.getOccupiedCount()]);
       
-      // ✅ BROADCAST ke semua user di room
       this._sendToRoom(room, ["roomUserCount", room, rm.getOccupiedCount()]);
       this._sendToRoom(room, ["userOccupiedSeat", room, assignedSeat, ws.idtarget]);
       
@@ -644,6 +646,7 @@ export class ChatServer2 {
           await this._sendRoomState(ws, room);
           await this.safeSend(ws, ["numberKursiSaya", seat]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          await this.safeSend(ws, ["currentRoom", room]);
           return;
         }
       }
