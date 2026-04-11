@@ -1,4 +1,4 @@
-// lowcard.js - LowCardGameManager with BOTS WORKING - NO MEMORY LEAK
+// lowcard.js - LowCardGameManager FINAL - NO MEMORY LEAK
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
   REGISTRATION_TIME: 25,
@@ -63,9 +63,18 @@ export class LowCardGameManager {
     if (!game) return;
     if (game._regInterval) { clearInterval(game._regInterval); game._regInterval = null; }
     if (game._drawInterval) { clearInterval(game._drawInterval); game._drawInterval = null; }
-    if (game.countdownTimers) { for (const timer of game.countdownTimers) { if (timer) { if (timer.interval) clearInterval(timer.interval); if (timer.timeout) clearTimeout(timer.timeout); } } game.countdownTimers = null; }
+    if (game.countdownTimers) {
+      for (const timer of game.countdownTimers) {
+        if (timer) { if (timer.interval) clearInterval(timer.interval); if (timer.timeout) clearTimeout(timer.timeout); }
+      }
+      game.countdownTimers = null;
+    }
     if (game._botTimers) { for (const timer of game._botTimers) if (timer) clearTimeout(timer); game._botTimers = null; }
-    if (game._botDrawTimeouts) { for (const timeout of game._botDrawTimeouts) try { clearTimeout(timeout); } catch(e) {} game._botDrawTimeouts.clear(); game._botDrawTimeouts = null; }
+    if (game._botDrawTimeouts) {
+      for (const timeout of game._botDrawTimeouts) try { clearTimeout(timeout); } catch(e) {}
+      game._botDrawTimeouts.clear();
+      game._botDrawTimeouts = null;
+    }
     if (game._timeouts) { for (const tid of game._timeouts) clearTimeout(tid); game._timeouts = null; }
   }
 
@@ -87,12 +96,19 @@ export class LowCardGameManager {
       if (!game || !game._active) continue;
       if (game.registrationOpen && game.regTimeLeft > 0) {
         game.regTimeLeft--;
-        if (game.regTimeLeft === 20 || game.regTimeLeft === 10 || game.regTimeLeft === 5) this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.regTimeLeft}s`]);
-        if (game.regTimeLeft <= 0) { this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]); this._closeRegistration(room); }
+        if (game.regTimeLeft === 20 || game.regTimeLeft === 10 || game.regTimeLeft === 5) {
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.regTimeLeft}s`]);
+        }
+        if (game.regTimeLeft <= 0) {
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+          this._closeRegistration(room);
+        }
       }
       if (!game.registrationOpen && !game.drawTimeExpired && game.drawTimeLeft > 0) {
         game.drawTimeLeft--;
-        if (game.drawTimeLeft === 20 || game.drawTimeLeft === 10 || game.drawTimeLeft === 5) this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
+        if (game.drawTimeLeft === 20 || game.drawTimeLeft === 10 || game.drawTimeLeft === 5) {
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
+        }
         if (game.drawTimeLeft <= 0 && !game.drawTimeExpired) {
           game.drawTimeExpired = true;
           this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
@@ -182,7 +198,9 @@ export class LowCardGameManager {
       const botTimeout = setTimeout(() => {
         if (this._destroyed) return;
         const currentGame = this._safeGetGame(room);
-        if (currentGame && currentGame._active && !currentGame.drawTimeExpired && !currentGame.evaluationLocked) this._handleBotDraw(room, botId);
+        if (currentGame && currentGame._active && !currentGame.drawTimeExpired && !currentGame.evaluationLocked) {
+          this._handleBotDraw(room, botId);
+        }
       }, drawTime * 1000);
       game._botTimers.push(botTimeout);
       game._botDrawTimeouts.add(botTimeout);
@@ -267,7 +285,11 @@ export class LowCardGameManager {
       return;
     }
     if (remaining.length === 0) { this.endGame(room); return; }
-    const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => { const player = game.players.get(id); const playerTanda = game.tanda.get(id) || ""; return `${player?.name}:${n}(${playerTanda})`; });
+    const numbersArr = Array.from(game.numbers.entries()).map(([id, n]) => {
+      const player = game.players.get(id);
+      const playerTanda = game.tanda.get(id) || "";
+      return `${player?.name}:${n}(${playerTanda})`;
+    });
     const loserNames = losers.map(id => game.players.get(id)?.name || id);
     const remainingNames = remaining.map(id => game.players.get(id)?.name || id);
     this._safeBroadcast(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
