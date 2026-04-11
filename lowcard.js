@@ -1,9 +1,8 @@
-// lowcard.js - LowCardGameManager FINAL - FULL CLASS
+// lowcard.js - LowCardGameManager FINAL - NO EXTRA EVENTS
 // Timer: 20s registration, 20s draw
 // Notifikasi: 20s, 10s, 5s
-// Logika bot PERSIS seperti kode awal (normal, tidak diseting menang terus)
-// FIXED: User yang tidak draw akan dieliminasi dan MASUK ke daftar kalah (loser list)
-// FIXED: Jika angka sama, lanjut next round sampai ada yang terendah dan sisa 1 pemenang
+// Logika bot PERSIS seperti kode awal
+// TANPA event tambahan (hanya gameLowCardEnd dan gameLowCardWinner)
 
 const CONSTANTS = {
   GAME_TIMEOUT_HOURS: 1,
@@ -59,6 +58,18 @@ export class LowCardGameManager {
     } catch (error) { 
       return null; 
     }
+  }
+
+  _isHumanPlayer(playerId) {
+    return !playerId.includes('BOT_MOZ_');
+  }
+
+  _hasHumanPlayer(game) {
+    if (!game || !game.players) return false;
+    for (const playerId of game.players.keys()) {
+      if (this._isHumanPlayer(playerId)) return true;
+    }
+    return false;
   }
 
   cleanupStaleGames() {
@@ -534,13 +545,10 @@ export class LowCardGameManager {
         game.eliminated.add(playerId);
         allLosers.push(playerId);
       }
-      const notSubmittedNames = notSubmittedPlayers.map(id => game.players.get(id)?.name || id);
-      this._safeBroadcast(room, ["gameLowCardRoundResultEliminated", notSubmittedNames]);
     }
     
     // JIKA TIDAK ADA YANG DRAW (SEMUA TIDAK DRAW)
     if (submittedPlayers.length === 0) {
-      this._safeBroadcast(room, ["gameLowCardNoWinner", "No one drew cards! No winner."]);
       this.endGame(room);
       return;
     }
@@ -561,13 +569,8 @@ export class LowCardGameManager {
       }
     }
     
-    // ========== LOGIKA ANGKA SAMA ==========
-    // Jika semua player yang draw memiliki angka yang SAMA semua
+    // JIKA SEMUA PLAYER DRAW ANGKA SAMA
     if (lowestPlayers.length === submittedPlayers.length && submittedPlayers.length > 1) {
-      // SEMUA DRAW ANGKA SAMA - TIDAK ADA YANG ELIMINASI, LANJUT NEXT ROUND
-      this._safeBroadcast(room, ["gameLowCardSameNumber", "All players drew the same number! Continue to next round."]);
-      
-      // Reset untuk round berikutnya (tanpa eliminasi)
       game.round++;
       game.numbers.clear();
       game.tanda.clear();
@@ -584,7 +587,7 @@ export class LowCardGameManager {
       return;
     }
     
-    // ELIMINASI YANG DRAW ANGKA TERENDAH (HANYA JIKA TIDAK SEMUA SAMA)
+    // ELIMINASI YANG DRAW ANGKA TERENDAH
     for (const id of lowestPlayers) {
       game.eliminated.add(id);
       allLosers.push(id);
@@ -594,14 +597,36 @@ export class LowCardGameManager {
     const remaining = Array.from(game.players.keys())
       .filter(id => !game.eliminated.has(id));
     
+    // CEK APAKAH MASIH ADA USER MANUSIA
+    const hasHuman = this._hasHumanPlayer(game);
+    const remainingHasHuman = remaining.some(id => this._isHumanPlayer(id));
+    
+    // Jika tidak ada user manusia yang tersisa (hanya bot)
+    if (!remainingHasHuman && hasHuman) {
+      this.endGame(room);
+      return;
+    }
+    
+    // Jika tidak ada user manusia dari awal
+    if (!hasHuman) {
+      this.endGame(room);
+      return;
+    }
+    
     // CEK PEMENANG
     if (remaining.length === 1) {
       const winnerId = remaining[0];
-      const winner = game.players.get(winnerId);
-      const totalCoin = game.betAmount * game.players.size;
-      this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
-      this.endGame(room);
-      return;
+      
+      if (this._isHumanPlayer(winnerId)) {
+        const winner = game.players.get(winnerId);
+        const totalCoin = game.betAmount * game.players.size;
+        this._safeBroadcast(room, ["gameLowCardWinner", winner?.name || winnerId, totalCoin]);
+        this.endGame(room);
+        return;
+      } else {
+        this.endGame(room);
+        return;
+      }
     }
     
     // JIKA MASIH ADA LEBIH DARI 1 PLAYER
@@ -641,7 +666,6 @@ export class LowCardGameManager {
     
     // JIKA TIDAK ADA YANG TERSISA
     if (remaining.length === 0) {
-      this._safeBroadcast(room, ["gameLowCardNoWinner", "All players eliminated! No winner."]);
       this.endGame(room);
       return;
     }
