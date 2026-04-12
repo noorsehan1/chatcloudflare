@@ -3,8 +3,7 @@
 // NO RATE LIMIT - No connection limits
 // FIXED: Satu kursi tidak bisa dipakai beberapa user bersamaan (dengan lock)
 // FIXED: User keluar → hapus kursi, User masuk → tidak buat data baru
-// FIXED: WebSocket tidak aktif otomatis dihapus
-// FIXED: Room count berdasarkan kursi yang terisi (bukan jumlah WebSocket)
+// FIXED: HANYA WebSocket yang CLOSED yang dihapus (tidak ada auto cleanup berdasarkan waktu)
 
 import { LowCardGameManager } from "./lowcard.js";
 
@@ -44,7 +43,7 @@ const CONSTANTS = Object.freeze({
   MAX_USERNAME_LENGTH: 25,
   MAX_GIFT_NAME: 40,
   
-  // CLEANUP - LEBIH SERING
+  // CLEANUP
   CLEANUP_INTERVAL: 5000,
   MAX_USER_IDLE: 2 * 60 * 1000,
   ROOM_MANAGER_IDLE_TIMEOUT: 3 * 60 * 1000,
@@ -52,10 +51,8 @@ const CONSTANTS = Object.freeze({
   CLEANUP_DELAY_MS: 5,
   MAX_CLEANUP_DURATION_MS: 30,
   
-  // WEBSOCKET CLEANUP
-  WS_INACTIVE_TIMEOUT_MS: 2 * 60 * 1000,   // 2 menit tidak ada aktivitas
-  SEAT_INACTIVE_TIMEOUT_MS: 3 * 60 * 1000, // 3 menit user offline
-  WS_CLEANUP_INTERVAL_MS: 30000,           // 30 detik sekali cleanup
+  // WEBSOCKET CLEANUP - HANYA UNTUK YANG CLOSED
+  WS_CLEANUP_INTERVAL_MS: 30000, // 30 detik sekali cek
   
   // TIMER
   NUMBER_TICK_INTERVAL: 15 * 60 * 1000,
@@ -827,11 +824,9 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== WEBSOCKET INACTIVE CLEANUP ====================
+  // ==================== WEBSOCKET CLEANUP - HANYA YANG CLOSED ====================
   
-  _cleanupInactiveWebSockets() {
-    const now = Date.now();
-    let cleaned = 0;
+  _cleanupClosedWebSockets() {
     const zombies = [];
     
     for (const ws of this._activeClients) {
@@ -840,83 +835,19 @@ export class ChatServer2 {
         continue;
       }
       
-      // Cek WebSocket sudah closed
+      // HANYA hapus jika WebSocket sudah closed
+      // readyState: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
       if (ws.readyState !== 1) {
         zombies.push(ws);
         continue;
       }
-      
-      // Cek WebSocket yang sudah lama tidak ada aktivitas
-      if (ws._lastActivity && (now - ws._lastActivity) > CONSTANTS.WS_INACTIVE_TIMEOUT_MS) {
-        zombies.push(ws);
-        continue;
-      }
-      
-      // Cek user yang tidak memiliki kursi dan tidak dalam room
-      const userId = ws.idtarget;
-      if (userId) {
-        const hasSeat = this.userToSeat.has(userId);
-        const currentRoom = this.userCurrentRoom.get(userId);
-        
-        // Jika user tidak punya kursi dan tidak dalam room, dan sudah lama
-        if (!hasSeat && !currentRoom && ws._connectionTime && (now - ws._connectionTime) > 30000) {
-          zombies.push(ws);
-        }
-      }
     }
     
-    // Hapus semua zombie connections
     for (const ws of zombies) {
       this.safeWebSocketCleanup(ws).catch(() => {});
-      cleaned++;
     }
     
-    return cleaned;
-  }
-  
-  _cleanupEmptySeatsFromInactiveUsers() {
-    const now = Date.now();
-    let cleanedCount = 0;
-    
-    // Kumpulkan semua user yang sedang online (memiliki WebSocket aktif)
-    const onlineUsers = new Set();
-    for (const ws of this._activeClients) {
-      if (ws && ws.readyState === 1 && ws.idtarget) {
-        onlineUsers.add(ws.idtarget);
-      }
-    }
-    
-    // Cek setiap kursi di setiap room
-    for (const [roomName, roomManager] of this.roomManagers) {
-      for (let seatNum = 1; seatNum <= CONSTANTS.MAX_SEATS; seatNum++) {
-        const seat = roomManager.getSeat(seatNum);
-        if (seat && seat.namauser && seat.namauser !== "") {
-          const userName = seat.namauser;
-          
-          // Jika user tidak online (tidak ada WebSocket aktif)
-          if (!onlineUsers.has(userName)) {
-            // Cek kapan terakhir update
-            const lastUpdated = seat.lastUpdated || 0;
-            const timeSinceLastUpdate = now - lastUpdated;
-            
-            // Jika sudah lebih dari threshold, hapus kursi
-            if (timeSinceLastUpdate > CONSTANTS.SEAT_INACTIVE_TIMEOUT_MS) {
-              // Hapus kursi
-              this.removeSeatDirect(roomName, seatNum);
-              this.broadcastToRoom(roomName, ["removeKursi", roomName, seatNum]);
-              
-              // Hapus dari tracking
-              this.userToSeat.delete(userName);
-              this.userCurrentRoom.delete(userName);
-              
-              cleanedCount++;
-            }
-          }
-        }
-      }
-    }
-    
-    return cleanedCount;
+    return zombies.length;
   }
   
   _startWebSocketCleanup() {
@@ -926,10 +857,9 @@ export class ChatServer2 {
     
     this._webSocketCleanupInterval = setInterval(() => {
       try {
-        const cleanedWS = this._cleanupInactiveWebSockets();
-        const cleanedSeats = this._cleanupEmptySeatsFromInactiveUsers();
+        const cleanedWS = this._cleanupClosedWebSockets();
         
-        if (cleanedWS > 0 || cleanedSeats > 0) {
+        if (cleanedWS > 0) {
           // Update room counts setelah cleanup
           for (const room of roomList) {
             this.updateRoomCount(room);
@@ -1281,7 +1211,6 @@ export class ChatServer2 {
   }
   
   getRoomCount(room) {
-    // ⭐ ROOM COUNT BERDASARKAN KURSI YANG TERISI (bukan jumlah WebSocket)
     if (!room || !roomList.includes(room)) return 0;
     const roomManager = this.roomManagers.get(room);
     return roomManager.getOccupiedCount();
@@ -1451,7 +1380,7 @@ export class ChatServer2 {
     }
     
     const propsToDelete = [
-      'roomname', 'idtarget', '_isClosing', '_connectionTime', '_lastActivity',
+      'roomname', 'idtarget', '_isClosing', '_connectionTime',
       '_isCleaningUp', 'username', 'sessionId', '_reconnectAttempts',
       '_messageQueue', '_lastMessageTime', '_bytesReceived', '_bytesSent', '_abortController'
     ];
@@ -1477,9 +1406,6 @@ export class ChatServer2 {
     if (state !== 1) return false;
     
     try {
-      // Update last activity timestamp
-      ws._lastActivity = Date.now();
-      
       const message = typeof msg === "string" ? msg : safeStringify(msg);
       if (message.length > CONSTANTS.MAX_MESSAGE_SIZE) return false;
       
@@ -1679,7 +1605,6 @@ export class ChatServer2 {
       this._removeUserConnection(ws.idtarget, ws);
       ws.roomname = undefined;
       
-      // Update room count setelah cleanup
       this.updateRoomCount(room);
     } catch (error) {}
   }
@@ -1779,7 +1704,6 @@ export class ChatServer2 {
         ws.roomname = undefined;
         ws._isClosing = false;
         ws._connectionTime = Date.now();
-        ws._lastActivity = Date.now();
         this._addUserConnection(id, ws);
         this._addToActiveClients(ws);
         await this.safeSend(ws, ["joinroomawal"]);
@@ -1789,7 +1713,6 @@ export class ChatServer2 {
       ws.idtarget = id;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
-      ws._lastActivity = Date.now();
       this._addToActiveClients(ws);
       
       const seatInfo = this.userToSeat.get(id);
@@ -1843,9 +1766,6 @@ export class ChatServer2 {
   
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
-    
-    // Track aktivitas
-    ws._lastActivity = Date.now();
     
     let messageStr = raw;
     if (raw instanceof ArrayBuffer) {
@@ -2450,8 +2370,7 @@ export class ChatServer2 {
         
         if (url.pathname === "/debug/gc") {
           this._forceMemoryCleanup();
-          this._cleanupInactiveWebSockets();
-          this._cleanupEmptySeatsFromInactiveUsers();
+          this._cleanupClosedWebSockets();
           return new Response("Force cleanup executed", { status: 200 });
         }
         
@@ -2491,7 +2410,6 @@ export class ChatServer2 {
       ws.idtarget = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
-      ws._lastActivity = Date.now();
       ws._abortController = abortController;
       
       this.clients.add(ws);
