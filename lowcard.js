@@ -762,7 +762,7 @@ export class LowCardGameManager {
       
       // If NO ONE submitted any number - game ends
       if (entries.length === 0) {
-        this._safeBroadcast(room, ["gameLowCardError", "No one submitted any number! Game ended."]);
+        this._safeBroadcast(room, ["gameLowCardError", "No one submitted Game ended."]);
         this.activeGames.delete(room);
         this._gamesToTick.delete(room);
         return;
