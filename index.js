@@ -1450,6 +1450,7 @@ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
     const existingSeatInfo = this.userToSeat.get(ws.idtarget);
     const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
     
+    // Check if user already in this room (reconnecting)
     if (existingSeatInfo && existingSeatInfo.room === room) {
       const seatNum = existingSeatInfo.seat;
       const roomManager = this.roomManagers.get(room);
@@ -1465,9 +1466,10 @@ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
         await this.safeSend(ws, ["numberKursiSaya", seatNum]);
         await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
         await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-        await this.sendAllStateTo(ws, room);
-
         
+        // Delay 1 detik sebelum sendAllStateTo
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this.sendAllStateTo(ws, room);
         
         return true;
       } else {
@@ -1475,6 +1477,7 @@ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
       }
     }
     
+    // Leave old room if exists
     if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
       const oldSeatInfo = this.userToSeat.get(ws.idtarget);
       if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
@@ -1486,17 +1489,20 @@ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
       this.userCurrentRoom.delete(ws.idtarget);
     }
     
+    // Check if room is full
     if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
       await this.safeSend(ws, ["roomFull", room]);
       return false;
     }
     
+    // Assign new seat
     const assignedSeat = this.assignNewSeat(room, ws.idtarget);
     if (!assignedSeat) { 
       await this.safeSend(ws, ["roomFull", room]); 
       return false; 
     }
     
+    // Update user mappings
     this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
     this.userCurrentRoom.set(ws.idtarget, room);
     ws.roomname = room;
@@ -1505,17 +1511,19 @@ async sendAllStateTo(ws, room, excludeSelfSeat = true) {
     
     const roomManager = this.roomManagers.get(room);
     
-  
+    // Send initial data to client
     await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
     await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
     await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-    await this.sendAllStateTo(ws, room);
-
     
+    // Delay 1 detik sebelum sendAllStateTo
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await this.sendAllStateTo(ws, room);
     
     return true;
   } catch (error) {
+    console.error('Error in _handleJoinRoomInternal:', error);
     await this.safeSend(ws, ["error", "Failed to join room"]);
     return false;
   }
