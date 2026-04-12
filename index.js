@@ -422,7 +422,9 @@ export class ChatServer2 {
     const now = Date.now();
     
     try {
-      if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) this._handleNumberTick();
+      if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) {
+        this._handleNumberTick();
+      }
       if (this.chatBuffer) this.chatBuffer.tick(now);
       if (this._masterTickCounter % CONSTANTS.WS_CLEANUP_TICKS === 0) this._cleanupDeadWebSockets();
       if (this._masterTickCounter % CONSTANTS.CLEANUP_TICKS === 0) this._mediumCleanup();
@@ -432,22 +434,30 @@ export class ChatServer2 {
     } catch (error) {}
   }
   
-  _handleNumberTick() {
+  async _handleNumberTick() {
     try {
       this.currentNumber = this.currentNumber < this.maxNumber ? this.currentNumber + 1 : 1;
-      for (const roomManager of this.roomManagers.values()) roomManager.setCurrentNumber(this.currentNumber);
+      for (const roomManager of this.roomManagers.values()) {
+        roomManager.setCurrentNumber(this.currentNumber);
+      }
       
       const message = safeStringify(["currentNumber", this.currentNumber]);
       const clientsToNotify = [];
       for (const client of this._activeClients) {
-        if (client && client.readyState === 1 && client.roomname && !client._isClosing) clientsToNotify.push(client);
+        if (client && client.readyState === 1 && client.roomname && !client._isClosing) {
+          clientsToNotify.push(client);
+        }
       }
       
       const batchSize = 50;
       for (let i = 0; i < clientsToNotify.length; i += batchSize) {
         const batch = clientsToNotify.slice(i, i + batchSize);
-        for (const client of batch) try { client.send(message); } catch (e) {}
-        if (i + batchSize < clientsToNotify.length) await new Promise(resolve => setTimeout(resolve, 1));
+        for (const client of batch) {
+          try { client.send(message); } catch (e) {}
+        }
+        if (i + batchSize < clientsToNotify.length) {
+          await new Promise(resolve => setTimeout(resolve, 1));
+        }
       }
     } catch (error) {}
   }
