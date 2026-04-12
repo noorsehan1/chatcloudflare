@@ -1,16 +1,16 @@
 // ============================
-// LowCardGameManager (SINGLE MASTER TICK - ZERO MEMORY LEAKS)
+// LowCardGameManager (SINGLE MASTER TICK - 20 SECOND TIMER)
 // ============================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 1,
   CLEANUP_INTERVAL_MS: 300000,
-  REGISTRATION_TIME: 25,
-  DRAW_TIME: 30,
-  BOT_DRAW_MIN_SECONDS: 3,
-  BOT_DRAW_MAX_SECONDS: 25,
-  MASTER_TICK_INTERVAL_MS: 1000, // Master tick every 1 second
+  REGISTRATION_TIME: 20,  // Changed from 25 to 20
+  DRAW_TIME: 20,          // Changed from 30 to 20
+  BOT_DRAW_MIN_SECONDS: 2,  // Changed from 3 to 2
+  BOT_DRAW_MAX_SECONDS: 15, // Changed from 25 to 15
+  MASTER_TICK_INTERVAL_MS: 1000,
 });
 
 export class LowCardGameManager {
@@ -22,9 +22,8 @@ export class LowCardGameManager {
     this._cleanupInterval = null;
     this._destroyed = false;
     this._errorLogs = [];
-    this._tickCallbacks = new Set();
+    this._gamesToTick = new Map(); // room -> game reference for ticking
     
-    // Error handler untuk prevent crash
     this._errorHandler = (error, context) => {
       const errorMsg = error?.message || String(error);
       this._errorLogs.push({ time: Date.now(), context, error: errorMsg });
@@ -32,64 +31,32 @@ export class LowCardGameManager {
       console.error(`[LowCardGame] ${context}:`, errorMsg);
     };
     
-    // Start master tick system
     this._startMasterTick();
     
-    // Auto cleanup setiap 5 menit
     this._cleanupInterval = setInterval(() => {
       if (!this._destroyed) this.cleanupStaleGames();
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
   }
 
-  // ========== MASTER TICK SYSTEM ==========
   _startMasterTick() {
     if (this._masterTickInterval) return;
     
     this._masterTickInterval = setInterval(() => {
       if (this._destroyed) return;
       
-      const now = Date.now();
-      const toRemove = [];
-      
-      for (const callback of this._tickCallbacks) {
+      for (const [room, game] of this._gamesToTick) {
         try {
-          if (callback && callback.game && callback.game._isActive) {
-            callback.callback(now);
+          if (game && game._isActive) {
+            this._onMasterTick(room, game);
           } else {
-            toRemove.push(callback);
+            this._gamesToTick.delete(room);
           }
         } catch (error) {
-          this._errorHandler(error, 'masterTick callback');
-          toRemove.push(callback);
+          this._errorHandler(error, `masterTick ${room}`);
+          this._gamesToTick.delete(room);
         }
-      }
-      
-      for (const callback of toRemove) {
-        this._tickCallbacks.delete(callback);
       }
     }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
-  }
-  
-  _registerTickCallback(game, callback) {
-    if (!game || !game._tickId) {
-      game._tickId = Symbol();
-    }
-    const tickHandler = { game, callback, id: game._tickId };
-    this._tickCallbacks.add(tickHandler);
-    return tickHandler;
-  }
-  
-  _unregisterTickCallback(game, handler) {
-    if (handler) {
-      this._tickCallbacks.delete(handler);
-    } else if (game && game._tickId) {
-      for (const cb of this._tickCallbacks) {
-        if (cb.id === game._tickId) {
-          this._tickCallbacks.delete(cb);
-          break;
-        }
-      }
-    }
   }
 
   // ========== SAFE HELPER METHODS ==========
@@ -128,7 +95,6 @@ export class LowCardGameManager {
     }
   }
 
-  // ========== IMPROVED CLEANUP METHODS ==========
   cleanupStaleGames() {
     try {
       if (this._destroyed) return;
@@ -167,24 +133,9 @@ export class LowCardGameManager {
     }
   }
 
-  // ========== CLEAR ALL REFERENCES ==========
-  _clearAllGameReferences(game) {
-    try {
-      if (!game) return;
-      
-      // Unregister from master tick
-      if (game._tickHandler) {
-        this._unregisterTickCallback(game, game._tickHandler);
-        game._tickHandler = null;
-      }
-      
-      // Clear bot draw timeouts array
-      if (game._botDrawTimeouts && Array.isArray(game._botDrawTimeouts)) {
-        game._botDrawTimeouts = null;
-      }
-      
-    } catch (error) {
-      this._errorHandler(error, 'clearAllGameReferences');
+  _clearGameFromTick(game) {
+    if (game && game.room) {
+      this._gamesToTick.delete(game.room);
     }
   }
 
@@ -202,7 +153,7 @@ export class LowCardGameManager {
     try {
       return Math.floor(Math.random() * (CONSTANTS.BOT_DRAW_MAX_SECONDS - CONSTANTS.BOT_DRAW_MIN_SECONDS + 1)) + CONSTANTS.BOT_DRAW_MIN_SECONDS;
     } catch {
-      return 10;
+      return 5;
     }
   }
 
@@ -308,9 +259,8 @@ export class LowCardGameManager {
         _createdAt: Date.now(),
         _isActive: true,
         _phase: 'registration', // registration, draw, evaluating
-        _pendingBotDraws: new Map(), // botId -> drawTimeRemaining
-        _tickHandler: null,
-        _tickId: null
+        _pendingBotDraws: new Map(),
+        _lastTickTime: Date.now()
       };
 
       game.players.set(ws.idtarget, { 
@@ -319,11 +269,7 @@ export class LowCardGameManager {
       });
 
       this.activeGames.set(room, game);
-      
-      // Register game with master tick
-      game._tickHandler = this._registerTickCallback(game, (now) => {
-        this._onMasterTick(room, now);
-      });
+      this._gamesToTick.set(room, game);
 
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
@@ -334,18 +280,19 @@ export class LowCardGameManager {
     }
   }
 
-  _onMasterTick(room, now) {
+  _onMasterTick(room, game) {
     try {
-      const game = this._safeGetGame(room);
       if (!game || !game._isActive || this._destroyed) return;
+      
+      const now = Date.now();
+      game._lastTickTime = now;
       
       if (game._phase === 'registration') {
         this._handleRegistrationTick(game, room);
       } else if (game._phase === 'draw') {
         this._handleDrawTick(game, room);
-      } else if (game._phase === 'evaluating') {
-        // Do nothing during evaluation
       }
+      // evaluating phase does nothing during tick
     } catch (error) {
       this._errorHandler(error, 'onMasterTick');
     }
@@ -354,6 +301,7 @@ export class LowCardGameManager {
   _handleRegistrationTick(game, room) {
     const timesToNotify = [20, 10, 5, 0];
     
+    // Broadcast time left at specific intervals
     if (timesToNotify.includes(game.registrationTimeLeft)) {
       if (game.registrationTimeLeft === 0) {
         this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
@@ -363,6 +311,7 @@ export class LowCardGameManager {
         }
         
         this._closeRegistration(room);
+        return;
       } else {
         this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.registrationTimeLeft}s`]);
       }
@@ -370,14 +319,16 @@ export class LowCardGameManager {
     
     game.registrationTimeLeft--;
     
-    if (game.registrationTimeLeft < 0) {
-      game._phase = 'evaluating';
+    // Auto close if time runs out
+    if (game.registrationTimeLeft < 0 && game.registrationOpen) {
+      this._closeRegistration(room);
     }
   }
 
   _handleDrawTick(game, room) {
     const timesToNotify = [20, 10, 5, 0];
     
+    // Broadcast time left at specific intervals
     if (timesToNotify.includes(game.drawTimeLeft)) {
       if (game.drawTimeLeft === 0) {
         this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
@@ -395,7 +346,6 @@ export class LowCardGameManager {
         game.evaluationLocked = true;
         this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
         
-        // Schedule evaluation
         setTimeout(() => {
           try {
             const currentGame = this._safeGetGame(room);
@@ -406,6 +356,7 @@ export class LowCardGameManager {
             this._errorHandler(evalError, 'evaluateRound timeout');
           }
         }, 2000);
+        return;
       } else {
         this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
       }
@@ -413,12 +364,8 @@ export class LowCardGameManager {
     
     game.drawTimeLeft--;
     
-    if (game.drawTimeLeft < 0) {
-      game._phase = 'evaluating';
-    }
-    
     // Process pending bot draws
-    if (game.useBots && game._pendingBotDraws) {
+    if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
       const toDraw = [];
       for (const [botId, timeRemaining] of game._pendingBotDraws.entries()) {
         if (timeRemaining <= 0) {
@@ -434,6 +381,25 @@ export class LowCardGameManager {
           this._handleBotDraw(room, botId);
         }
       }
+    }
+    
+    // Auto evaluate if time runs out
+    if (game.drawTimeLeft < 0 && game._phase === 'draw') {
+      game.drawTimeExpired = true;
+      game._phase = 'evaluating';
+      game.evaluationLocked = true;
+      this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
+      
+      setTimeout(() => {
+        try {
+          const currentGame = this._safeGetGame(room);
+          if (currentGame && currentGame._isActive && !this._destroyed) {
+            this._evaluateRound(room);
+          }
+        } catch (evalError) {
+          this._errorHandler(evalError, 'evaluateRound timeout');
+        }
+      }, 2000);
     }
   }
 
@@ -474,6 +440,7 @@ export class LowCardGameManager {
 
       if (!game.players) {
         this.activeGames.delete(room);
+        this._gamesToTick.delete(room);
         return;
       }
       
@@ -491,7 +458,7 @@ export class LowCardGameManager {
 
         this._safeBroadcast(room, ["gameLowCardError", "Need at least 2 players", game.hostId]);
         
-        this._clearAllGameReferences(game);
+        this._clearGameFromTick(game);
         this.activeGames.delete(room);
         return;
       }
@@ -499,6 +466,7 @@ export class LowCardGameManager {
       game.registrationOpen = false;
       game._phase = 'draw';
       game.drawTimeLeft = CONSTANTS.DRAW_TIME;
+      game.drawTimeExpired = false;
 
       const playersList = Array.from(game.players.values())
         .filter(p => p && p.name)
@@ -510,6 +478,7 @@ export class LowCardGameManager {
 
       // Schedule bot draws
       if (game.useBots && game.botPlayers) {
+        game._pendingBotDraws = new Map();
         const activeBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated.has(botId));
         
@@ -518,6 +487,9 @@ export class LowCardGameManager {
           game._pendingBotDraws.set(botId, drawTime);
         }
       }
+      
+      // Ensure the draw timer starts immediately
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
       
     } catch (error) {
       this._errorHandler(error, 'closeRegistration');
@@ -711,7 +683,7 @@ export class LowCardGameManager {
       if (!game || !game._isActive || this._destroyed) return;
       
       if (!game.players || game.players.size === 0) {
-        this._clearAllGameReferences(game);
+        this._clearGameFromTick(game);
         this.activeGames.delete(room);
         return;
       }
@@ -725,12 +697,10 @@ export class LowCardGameManager {
       
       if (!numbers || typeof numbers.entries !== 'function') {
         this._errorHandler(new Error('Invalid numbers map'), 'evaluateRound');
-        this._clearAllGameReferences(game);
+        this._clearGameFromTick(game);
         this.activeGames.delete(room);
         return;
       }
-      
-      this._clearAllGameReferences(game);
       
       let entries = [];
       try {
@@ -745,6 +715,7 @@ export class LowCardGameManager {
         const remainingPlayers = Array.from(players.keys()).filter(id => !eliminated.has(id));
         if (remainingPlayers.length === 0) {
           this.activeGames.delete(room);
+          this._gamesToTick.delete(room);
           return;
         }
         
@@ -756,7 +727,6 @@ export class LowCardGameManager {
         game.numbers.clear();
         game.tanda.clear();
         
-        // Reschedule bot draws
         if (game.useBots && game.botPlayers) {
           game._pendingBotDraws = new Map();
           const activeBots = Array.from(game.botPlayers.keys())
@@ -769,6 +739,7 @@ export class LowCardGameManager {
         }
         
         this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
         return;
       }
       
@@ -780,6 +751,7 @@ export class LowCardGameManager {
       if (entries.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "No numbers drawn this round"]);
         this.activeGames.delete(room);
+        this._gamesToTick.delete(room);
         return;
       }
 
@@ -794,6 +766,7 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this.activeGames.delete(room);
+        this._gamesToTick.delete(room);
         return;
       }
 
@@ -818,6 +791,7 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this.activeGames.delete(room);
+        this._gamesToTick.delete(room);
         return;
       }
 
@@ -854,7 +828,6 @@ export class LowCardGameManager {
       game._phase = 'draw';
       game.drawTimeLeft = CONSTANTS.DRAW_TIME;
       
-      // Reschedule bot draws
       if (game.useBots && game.botPlayers) {
         game._pendingBotDraws = new Map();
         const activeBots = Array.from(game.botPlayers.keys())
@@ -867,11 +840,13 @@ export class LowCardGameManager {
       }
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
       
     } catch (error) {
       this._errorHandler(error, 'evaluateRound');
       try {
         this.activeGames.delete(room);
+        this._gamesToTick.delete(room);
       } catch (e) {}
     }
   }
@@ -890,7 +865,7 @@ export class LowCardGameManager {
       
       game._isActive = false;
       
-      this._clearAllGameReferences(game);
+      this._clearGameFromTick(game);
       
       if (game.players) {
         game.players.clear();
@@ -938,10 +913,12 @@ export class LowCardGameManager {
       }
       
       this.activeGames.delete(room);
+      this._gamesToTick.delete(room);
       
     } catch (error) {
       this._errorHandler(error, 'endGame');
       this.activeGames.delete(room);
+      this._gamesToTick.delete(room);
     }
   }
   
@@ -968,13 +945,13 @@ export class LowCardGameManager {
       this.endGame(room);
     }
     this.activeGames.clear();
+    this._gamesToTick.clear();
     
     if (this._cleanupInterval) {
       clearInterval(this._cleanupInterval);
       this._cleanupInterval = null;
     }
     
-    this._tickCallbacks.clear();
     this.chatServer = null;
     this._errorLogs = [];
   }
