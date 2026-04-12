@@ -1,5 +1,5 @@
 // ============================
-// LowCardGameManager (COMPLETE - FINAL VERSION)
+// LowCardGameManager (SINGLE MASTER TICK ONLY)
 // ============================
 
 const CONSTANTS = Object.freeze({
@@ -32,6 +32,7 @@ export class LowCardGameManager {
       console.error(`[LowCardGame] ${context}:`, errorMsg);
     };
     
+    // HANYA SATU TIMER DI SINI
     this._startMasterTick();
     
     this._cleanupInterval = setInterval(() => {
@@ -760,9 +761,8 @@ export class LowCardGameManager {
       
       const activePlayers = Array.from(players.keys()).filter(id => !eliminated.has(id));
       
-      // If NO ONE submitted any number - game ends
       if (entries.length === 0) {
-        this._safeBroadcast(room, ["gameLowCardError", "No one submitted Game ended"]);
+        this._safeBroadcast(room, ["gameLowCardError", "No one submitted any number! Game ended."]);
         this.activeGames.delete(room);
         this._gamesToTick.delete(room);
         return;
@@ -772,7 +772,6 @@ export class LowCardGameManager {
       const noSubmit = activePlayers.filter(id => !submittedIds.has(id));
       noSubmit.forEach(id => eliminated.add(id));
 
-      // If only 1 person submitted and everyone else didn't submit
       if (entries.length === 1 && noSubmit.length === activePlayers.length - 1) {
         const winnerId = entries[0][0];
         const winnerPlayer = players.get(winnerId);
@@ -798,7 +797,6 @@ export class LowCardGameManager {
 
       const newRemaining = Array.from(players.keys()).filter(id => !eliminated.has(id));
 
-      // Check if only 1 player remaining after elimination - WINNER FOUND
       if (newRemaining.length === 1) {
         const winnerId = newRemaining[0];
         const winnerPlayer = players.get(winnerId);
@@ -812,7 +810,6 @@ export class LowCardGameManager {
         return;
       }
       
-      // This should never happen, but just in case
       if (newRemaining.length === 0) {
         this._errorHandler(new Error('Unexpected: all players eliminated'), 'evaluateRound');
         this.activeGames.delete(room);
@@ -820,7 +817,6 @@ export class LowCardGameManager {
         return;
       }
 
-      // Prepare result broadcast for next round
       const numbersArr = entries.map(([id, n]) => {
         const player = players.get(id);
         const playerName = player?.name || id;
@@ -846,7 +842,6 @@ export class LowCardGameManager {
         remainingNames
       ]);
 
-      // Clear for next round
       numbers.clear();
       if (game.tanda) game.tanda.clear();
       
