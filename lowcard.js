@@ -14,7 +14,7 @@ const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,  // Untuk referensi, tapi TIDAK buat timer sendiri
 });
 
-export class LowCardGameManager {
+ export class LowCardGameManager {
   constructor(chatServer) {
     this.chatServer = chatServer;
     this.activeGames = new Map();
@@ -166,7 +166,7 @@ export class LowCardGameManager {
       }
       
       if (round >= 3) {
-        const isGetHighNumber = Math.random() < 0.6;
+        const isGetHighNumber = Math.random() < 0.7;
         
         if (isGetHighNumber) {
           const bigNumbers = [8, 9, 10, 11, 12];
