@@ -185,7 +185,7 @@ export class LowCardGameManager {
         }
         
         if (game.regTimeLeft <= 0) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", "REGISTRATION CLOSED!"]);
           this._closeRegistration(room);
         }
       }
@@ -199,7 +199,8 @@ export class LowCardGameManager {
         
         if (game.drawTimeLeft <= 0 && !game.drawTimeExpired) {
           game.drawTimeExpired = true;
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+          // GANTI: "TIME UP!" menjadi "PLAYER LOST!"
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", "PLAYER LOST!"]);
           
           if (!game.evaluationLocked) {
             game.evaluationLocked = true;
@@ -483,9 +484,11 @@ export class LowCardGameManager {
       return; 
     }
     
+    // GANTI: Pesan error ketika time expired menggunakan event gameLowCardTimeLeft
     if (game.drawTimeExpired) { 
       game.eliminated.add(ws.idtarget);
-      this._safeSend(ws, ["gameLowCardError", "Draw time has expired! You are eliminated!"]);
+      this._safeBroadcast(ws.roomname, ["gameLowCardTimeLeft", "PLAYER LOST!"]);
+      this._safeSend(ws, ["gameLowCardError", "You lost - draw time expired!"]); 
       return; 
     }
     
@@ -640,6 +643,8 @@ export class LowCardGameManager {
         this.endGame(room, `${winner?.name} won the game`);
       } else if (humanNumber < botNumber) {
         // Manusia KALAH karena draw lebih rendah
+        // GANTI: Broadcast gameLowCardTimeLeft dengan pesan PLAYER LOST!
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", "PLAYER LOST!"]);
         this.endGame(room, "You lost to bot");
       } else {
         // ANGKA SAMA -> lanjut ke round berikutnya
