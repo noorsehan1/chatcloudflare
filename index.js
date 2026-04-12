@@ -1386,12 +1386,15 @@ export class ChatServer2 {
     return this._sendDirectToRoom(room, msg);
   }
   
-  async sendAllStateTo(ws, room, excludeSelfSeat = true) {
+async sendAllStateTo(ws, room, excludeSelfSeat = true) {
   try {
     if (!ws || ws.readyState !== 1 || !room || ws.roomname !== room) return;
     
     const roomManager = this.roomManagers.get(room);
     if (!roomManager) return;
+    
+    // ✅ KIRIM JUMLAH KURSI (ROOM COUNT) - MOVED TO CORRECT POSITION
+    await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
     const allKursiMeta = roomManager.getAllSeatsMeta();
     const lastPointsData = roomManager.getAllPoints();  // ✅ AMBIL SEMUA POIN DARI MAP
@@ -1464,8 +1467,6 @@ export class ChatServer2 {
         await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
         await this.safeSend(ws, ["currentNumber", this.currentNumber]);
         
-        // ✅ TAMBAHKAN KIRIM JUMLAH KURSI (ROOM COUNT)
-        await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
         
         return true;
       } else {
@@ -1509,8 +1510,6 @@ export class ChatServer2 {
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
     await this.safeSend(ws, ["currentNumber", this.currentNumber]);
     
-    // ✅ TAMBAHKAN KIRIM JUMLAH KURSI (ROOM COUNT)
-    await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
     return true;
   } catch (error) {
