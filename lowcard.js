@@ -1,7 +1,4 @@
-// ============================
-// LowCardGameManager (OPTIMIZED FOR SINGLE MASTER TIMER)
-// TIDAK PUNYA TIMER SENDIRI - DIPANGGIL MANUAL DARI CHATSERVER
-// ============================
+// ==================== LOWCARDGAMEMANAGER.js - FIXED TIMEOUT CLEANUP ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -11,19 +8,16 @@ const CONSTANTS = Object.freeze({
   DRAW_TIME: 20,
   BOT_DRAW_MIN_SECONDS: 2,
   BOT_DRAW_MAX_SECONDS: 15,
-  MASTER_TICK_INTERVAL_MS: 1000,  // Untuk referensi, tapi TIDAK buat timer sendiri
+  MASTER_TICK_INTERVAL_MS: 1000,
 });
 
- export class LowCardGameManager {
+export class LowCardGameManager {
   constructor(chatServer) {
     this.chatServer = chatServer;
     this.activeGames = new Map();
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
     this._errorLogs = [];
-    
-    // TIDAK MEMBUAT TIMER SENDIRI
-    // Timer akan dipanggil manual dari ChatServer.masterTick()
     
     this._errorHandler = (error, context) => {
       const errorMsg = error?.message || String(error);
@@ -33,20 +27,18 @@ const CONSTANTS = Object.freeze({
     };
   }
 
-  // ==================== MASTER TICK - DIPANGGIL DARI CHATSERVER ====================
+  // ==================== MASTER TICK ====================
   masterTick() {
     if (this._destroyed) return;
     
     const now = Date.now();
     
     try {
-      // Process all active games
       for (const [room, game] of this.activeGames) {
         if (!game || !game._isActive) {
           this.activeGames.delete(room);
           continue;
         }
-        
         this._processGameTick(room, game, now);
       }
     } catch (error) {
@@ -166,7 +158,7 @@ const CONSTANTS = Object.freeze({
       }
       
       if (round >= 3) {
-        const isGetHighNumber = Math.random() < 0.7;
+        const isGetHighNumber = Math.random() < 0.6;
         
         if (isGetHighNumber) {
           const bigNumbers = [8, 9, 10, 11, 12];
@@ -261,7 +253,7 @@ const CONSTANTS = Object.freeze({
         drawTimeExpired: false,
         _createdAt: Date.now(),
         _isActive: true,
-        _phase: 'registration', // registration, draw, evaluating
+        _phase: 'registration',
         _pendingBotDraws: new Map(),
         _hasBroadcastInitial: false,
         _evalTimeout: null
@@ -336,8 +328,10 @@ const CONSTANTS = Object.freeze({
           game.evaluationLocked = true;
           this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
           
+          // ✅ HAPUS TIMEOUT LAMA SEBELUM BUAT BARU
           if (game._evalTimeout) {
             clearTimeout(game._evalTimeout);
+            game._evalTimeout = null;
           }
           
           game._evalTimeout = setTimeout(() => {
@@ -348,8 +342,9 @@ const CONSTANTS = Object.freeze({
               }
             } catch (evalError) {
               this._errorHandler(evalError, 'evaluateRound timeout');
+            } finally {
+              game._evalTimeout = null;
             }
-            game._evalTimeout = null;
           }, 2000);
           return;
         } else if (game.drawTimeLeft > 0) {
@@ -388,8 +383,10 @@ const CONSTANTS = Object.freeze({
         game.evaluationLocked = true;
         this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
         
+        // ✅ HAPUS TIMEOUT LAMA SEBELUM BUAT BARU
         if (game._evalTimeout) {
           clearTimeout(game._evalTimeout);
+          game._evalTimeout = null;
         }
         
         game._evalTimeout = setTimeout(() => {
@@ -400,8 +397,9 @@ const CONSTANTS = Object.freeze({
             }
           } catch (evalError) {
             this._errorHandler(evalError, 'evaluateRound timeout');
+          } finally {
+            game._evalTimeout = null;
           }
-          game._evalTimeout = null;
         }, 2000);
       }
     } catch (error) {
@@ -533,8 +531,10 @@ const CONSTANTS = Object.freeze({
         game.evaluationLocked = true;
         this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
         
+        // ✅ HAPUS TIMEOUT LAMA SEBELUM BUAT BARU
         if (game._evalTimeout) {
           clearTimeout(game._evalTimeout);
+          game._evalTimeout = null;
         }
         
         game._evalTimeout = setTimeout(() => {
@@ -545,8 +545,9 @@ const CONSTANTS = Object.freeze({
             }
           } catch (evalError) {
             this._errorHandler(evalError, 'evaluateRound after bot draw');
+          } finally {
+            game._evalTimeout = null;
           }
-          game._evalTimeout = null;
         }, 2000);
       }
     } catch (error) {
@@ -671,8 +672,10 @@ const CONSTANTS = Object.freeze({
         game.evaluationLocked = true;
         this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
         
+        // ✅ HAPUS TIMEOUT LAMA SEBELUM BUAT BARU
         if (game._evalTimeout) {
           clearTimeout(game._evalTimeout);
+          game._evalTimeout = null;
         }
         
         game._evalTimeout = setTimeout(() => {
@@ -683,8 +686,9 @@ const CONSTANTS = Object.freeze({
             }
           } catch (evalError) {
             this._errorHandler(evalError, 'evaluateRound after submit');
+          } finally {
+            game._evalTimeout = null;
           }
-          game._evalTimeout = null;
         }, 2000);
       }
       
@@ -699,6 +703,7 @@ const CONSTANTS = Object.freeze({
       const game = this._safeGetGame(room);
       if (!game || !game._isActive || this._destroyed) return;
       
+      // ✅ HAPUS TIMEOUT SETELAH EKSEKUSI
       if (game._evalTimeout) {
         clearTimeout(game._evalTimeout);
         game._evalTimeout = null;
@@ -857,6 +862,7 @@ const CONSTANTS = Object.freeze({
       
       game._isActive = false;
       
+      // ✅ HAPUS TIMEOUT SEBELUM HAPUS GAME
       if (game._evalTimeout) {
         clearTimeout(game._evalTimeout);
         game._evalTimeout = null;
@@ -929,6 +935,14 @@ const CONSTANTS = Object.freeze({
   
   destroy() {
     this._destroyed = true;
+    
+    // ✅ HAPUS SEMUA TIMEOUT DARI SEMUA GAME
+    for (const [room, game] of this.activeGames) {
+      if (game && game._evalTimeout) {
+        clearTimeout(game._evalTimeout);
+        game._evalTimeout = null;
+      }
+    }
     
     const rooms = Array.from(this.activeGames.keys());
     for (const room of rooms) {
