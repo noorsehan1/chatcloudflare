@@ -9,7 +9,7 @@ const CONSTANTS = Object.freeze({
   BOT_DRAW_MIN_SECONDS: 2,
   BOT_DRAW_MAX_SECONDS: 8, // Kurangi untuk free plan
   MASTER_TICK_INTERVAL_MS: 1000,
-  MAX_PLAYERS_PER_GAME: 10, // Batasi untuk free plan
+  MAX_PLAYERS_PER_GAME: 35, // Batasi untuk free plan
 });
 
 export class LowCardGameManager {
