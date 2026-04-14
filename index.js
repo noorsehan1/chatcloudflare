@@ -34,7 +34,7 @@ const GAME_ROOMS = [
 ];
 
 // ==================== DURABLE OBJECT CLASS ====================
-export class ChatServer3 {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -46,7 +46,6 @@ export class ChatServer3 {
     this.roomSeats = new Map();       // room_seat -> {userId, seatData}
     this.roomPoints = new Map();      // room_seat -> {x, y, fast}
     this.roomMute = new Map();        // room -> isMuted
-    this.userRoom = new Map();        // userId -> {room, seat}
     this.userToSeat = new Map();      // userId -> {room, seat}
     this.userCurrentRoom = new Map(); // userId -> room
     this.currentNumber = 1;
@@ -185,7 +184,6 @@ export class ChatServer3 {
     try {
       switch (type) {
         case "pong":
-          // Heartbeat response
           break;
           
         case "isInRoom":
@@ -656,8 +654,8 @@ export default {
       const url = new URL(request.url);
       
       if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        const id = env.CHAT_SERVER_3.idFromName("chat-room");
-        const chatObj = env.CHAT_SERVER_3.get(id);
+        const id = env.CHAT_SERVER_2.idFromName("chat-room");
+        const chatObj = env.CHAT_SERVER_2.get(id);
         return chatObj.fetch(request);
       }
       
