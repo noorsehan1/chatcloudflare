@@ -1,7 +1,7 @@
 // ==================== CHAT SERVER - STATELESS FREE TIER (COMPLETE) ====================
 // index.js - Tanpa Durable Objects, Tanpa Ping/Pong
 
-import { LowCardGameManager } from "./lowcard.js";
+ import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
 const CONSTANTS = {
