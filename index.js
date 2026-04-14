@@ -140,7 +140,7 @@ class RoomManager {
   destroy() { this.seats.clear(); this.points.clear(); }
 }
 
-// ==================== CHAT SERVER ====================
+// ==================== CHAT SERVER DENGAN SQLITE ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -168,6 +168,47 @@ export class ChatServer2 {
     
     this._masterTickCounter = 0;
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
+    
+    // Load data dari SQLite storage (optional)
+    this._loadFromStorage();
+  }
+  
+  // ==================== SQLITE STORAGE METHODS ====================
+  async _loadFromStorage() {
+    try {
+      // Contoh: load room data dari storage
+      const savedRooms = await this.state.storage.get("roomManagers");
+      if (savedRooms && typeof savedRooms === 'object') {
+        for (const [roomName, roomData] of Object.entries(savedRooms)) {
+          if (this.roomManagers.has(roomName)) {
+            const rm = this.roomManagers.get(roomName);
+            if (roomData.seats) rm.seats = new Map(roomData.seats);
+            if (roomData.points) rm.points = new Map(roomData.points);
+            rm.muteStatus = roomData.muteStatus || false;
+            rm.currentNumber = roomData.currentNumber || 1;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Load from storage error:", error);
+    }
+  }
+  
+  async _saveToStorage() {
+    try {
+      const roomsToSave = {};
+      for (const [roomName, rm] of this.roomManagers) {
+        roomsToSave[roomName] = {
+          seats: Array.from(rm.seats.entries()),
+          points: Array.from(rm.points.entries()),
+          muteStatus: rm.muteStatus,
+          currentNumber: rm.currentNumber
+        };
+      }
+      await this.state.storage.put("roomManagers", roomsToSave);
+    } catch (error) {
+      console.error("Save to storage error:", error);
+    }
   }
   
   // ==================== MASTER TICK ====================
@@ -185,6 +226,11 @@ export class ChatServer2 {
     
     if (this._masterTickCounter % CONSTANTS.ZOMBIE_CLEANUP_INTERVAL_TICKS === 0) {
       this._cleanupZombieWebSockets();
+    }
+    
+    // Simpan ke storage setiap 1 jam (3600 tick)
+    if (this._masterTickCounter % 3600 === 0) {
+      this._saveToStorage().catch(e => console.error("Auto-save error:", e));
     }
   }
   
@@ -630,6 +676,10 @@ export class ChatServer2 {
           uptime: Date.now() - this._startTime
         }), { headers: { "content-type": "application/json" } });
       }
+      if (url.pathname === "/save") {
+        await this._saveToStorage();
+        return new Response("Saved to storage", { status: 200 });
+      }
       return new Response("ChatServer2 Running", { status: 200 });
     }
     
@@ -647,7 +697,6 @@ export class ChatServer2 {
     
     this._activeClients.add(server);
     
-    // LANGSUNG assign handler, tanpa addEventListener
     server.onclose = () => {
       this._cleanupZombieWebSockets();
     };
@@ -667,6 +716,7 @@ export class ChatServer2 {
   async shutdown() {
     this._isClosing = true;
     if (this._masterTimer) clearInterval(this._masterTimer);
+    await this._saveToStorage();
     if (this.lowcard?.destroy) await this.lowcard.destroy();
     for (const ws of this._activeClients) {
       if (ws.readyState === 1) try { ws.close(); } catch(e) {}
@@ -676,7 +726,6 @@ export class ChatServer2 {
 }
 
 // ==================== EXPORT UNTUK ES MODULES ====================
-// Ini yang penting: Worker handler untuk menerima request
 export default {
   async fetch(request, env) {
     try {
@@ -690,5 +739,4 @@ export default {
   }
 };
 
-// Export class untuk Durable Object binding
 export { ChatServer2 };
