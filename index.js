@@ -1,7 +1,7 @@
 // ==================== CHAT SERVER WITH DURABLE OBJECTS - FREE TIER OPTIMIZED ====================
 // index.js - LENGKAP, tanpa ping/pong, tanpa roomLeft, tanpa resetRoom
 
-import { LowCardGameManager } from "./lowcard.js";
+import { LowCardGameManager } from "./lowcard.js"; 
 
 // ==================== CONSTANTS ====================
 const CONSTANTS = {
