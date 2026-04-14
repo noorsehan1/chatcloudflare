@@ -1,6 +1,6 @@
 // ==================== LOWCARDGAMEMANAGER.js - FIXED TIMEOUT CLEANUP (FINAL) ====================
 
-const CONSTANTS = Object.freeze({
+ const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 1,
   CLEANUP_INTERVAL_MS: 300000,
