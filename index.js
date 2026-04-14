@@ -1,21 +1,18 @@
-// ==================== CHAT SERVER - GAME LANGSUNG PROSES (TANPA BUFFER) ====================
+// ==================== CHAT SERVER - FINAL FIXED VERSION ====================
 // index.js - Untuk Cloudflare Free Tier (128MB)
 
-// LowCardGameManager
 let LowCardGameManager;
 try {
   LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
 } catch (e) {
-  console.warn("LowCardGameManager not found, using stub");
   LowCardGameManager = class StubLowCardGameManager {
-    constructor() { console.log("Stub LowCardGameManager initialized"); }
+    constructor() {}
     masterTick() {}
-    async handleEvent() { console.log("Game event ignored - stub"); }
+    async handleEvent() {}
     async destroy() {}
   };
 }
 
-// ==================== CONSTANTS ====================
 const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL_TICKS: 900,
@@ -61,7 +58,6 @@ const GAME_ROOMS = Object.freeze([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers"
 ]);
 
-// ==================== ASYNC LOCK ====================
 class AsyncLock {
   constructor(timeoutMs = 2000) {
     this.locks = new Map();
@@ -84,7 +80,7 @@ class AsyncLock {
         const index = this.waitingQueues.get(key)?.findIndex(item => item.resolve === resolve);
         if (index !== undefined && index > -1) {
           this.waitingQueues.get(key).splice(index, 1);
-          reject(new Error(`Lock acquisition timeout for key: ${key}`));
+          reject(new Error(`Lock timeout: ${key}`));
         }
       }, this.timeoutMs);
       
@@ -116,7 +112,6 @@ class AsyncLock {
   }
 }
 
-// ==================== PM BUFFER ====================
 class PMBuffer {
   constructor() {
     this._queue = [];
@@ -126,9 +121,7 @@ class PMBuffer {
     this.BATCH_DELAY_MS = CONSTANTS.PM_BATCH_DELAY_MS;
   }
   
-  setFlushCallback(callback) {
-    this._flushCallback = callback;
-  }
+  setFlushCallback(callback) { this._flushCallback = callback; }
   
   add(targetId, message) {
     this._queue.push({ targetId, message, timestamp: Date.now() });
@@ -144,7 +137,7 @@ class PMBuffer {
       for (const item of batch) {
         try {
           if (this._flushCallback) await this._flushCallback(item.targetId, item.message);
-        } catch (e) { console.error("PMBuffer flush error:", e); }
+        } catch (e) {}
       }
       if (this._queue.length > 0) await new Promise(resolve => setTimeout(resolve, this.BATCH_DELAY_MS));
     }
@@ -170,7 +163,6 @@ class PMBuffer {
   }
 }
 
-// ==================== CHAT BUFFER ====================
 class GlobalChatBuffer {
   constructor() {
     this._messageQueue = [];
@@ -326,7 +318,6 @@ class GlobalChatBuffer {
   }
 }
 
-// ==================== ROOM MANAGER ====================
 class RoomManager {
   constructor(roomName) {
     this.roomName = roomName;
@@ -441,7 +432,6 @@ class RoomManager {
   }
 }
 
-// ==================== MAIN CHATSERVER CLASS ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -471,8 +461,6 @@ export class ChatServer2 {
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg, msgId) => this._sendDirectToRoom(room, msg, msgId));
     
-    // GAME BUFFER TIDAK DIPAKAI LAGI - LANGSUNG PROSES
-    
     this.pmBuffer = new PMBuffer();
     this.pmBuffer.setFlushCallback(async (targetId, message) => {
       const targetConnections = this.userConnections.get(targetId);
@@ -489,9 +477,7 @@ export class ChatServer2 {
     this.lowcard = null;
     try {
       this.lowcard = new LowCardGameManager(this);
-      console.log("[ChatServer2] LowCardGameManager initialized successfully");
     } catch (error) { 
-      console.error("Failed to initialize LowCardGameManager:", error);
       this.lowcard = null; 
     }
     
@@ -533,27 +519,21 @@ export class ChatServer2 {
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
         this.lowcard.masterTick();
       }
-    } catch (error) {
-      console.error("Master tick error:", error);
-    }
+    } catch (error) {}
   }
   
   async _checkMemoryAndEmergencyCleanup() {
-    const memUsage = process.memoryUsage?.() || { heapUsed: 0, heapTotal: 0 };
+    const memUsage = process.memoryUsage?.() || { heapUsed: 0 };
     const heapUsedMB = (memUsage.heapUsed / 1024 / 1024) || 0;
     
     if (heapUsedMB > CONSTANTS.MEMORY_CRITICAL_THRESHOLD) {
-      console.log(`[MEMORY] CRITICAL: ${heapUsedMB}MB, forcing emergency cleanup`);
       await this._emergencyFullCleanup();
     } else if (heapUsedMB > CONSTANTS.MEMORY_WARNING_THRESHOLD) {
-      console.log(`[MEMORY] WARNING: ${heapUsedMB}MB, cleaning buffers`);
       this.chatBuffer._flush();
     }
   }
   
   async _emergencyFullCleanup() {
-    console.log("[EMERGENCY] Starting emergency cleanup");
-    
     await this.chatBuffer.flushAll();
     await this.pmBuffer.flushAll();
     
@@ -571,8 +551,6 @@ export class ChatServer2 {
         this.roomManagers.set(room, new RoomManager(room));
       }
     }
-    
-    console.log(`[EMERGENCY] Completed. Active clients: ${this._activeClients.size}`);
   }
   
   async _handleNumberTick() {
@@ -602,9 +580,7 @@ export class ChatServer2 {
           await new Promise(resolve => setTimeout(resolve, 1));
         }
       }
-    } catch (error) {
-      console.error("Number tick error:", error);
-    }
+    } catch (error) {}
   }
   
   async _cleanupZombieWebSocketsAndData() {
@@ -656,9 +632,7 @@ export class ChatServer2 {
         if (filtered.length !== clients.length) this.roomClients.set(room, filtered);
       }
       
-    } catch (error) {
-      console.error("[CLEANUP] Error:", error);
-    } finally {
+    } catch (error) {} finally {
       this._isCleaningUp = false;
     }
   }
@@ -671,8 +645,6 @@ export class ChatServer2 {
     const room = ws.roomname;
     
     try {
-      console.log(`[CLEANUP] Force cleaning WebSocket for user: ${userId || 'unknown'}, room: ${room || 'none'}`);
-      
       ws._isClosing = true;
       
       if (userId && room) {
@@ -696,17 +668,10 @@ export class ChatServer2 {
       this._clientWebSockets.delete(ws);
       
       if (ws.readyState === 1) {
-        try { 
-          ws.close(1000, "Cleanup completed"); 
-          console.log(`[CLEANUP] WebSocket closed for ${userId || 'unknown'}`);
-        } catch(e) {}
+        try { ws.close(1000, "Cleanup completed"); } catch(e) {}
       }
       
-      console.log(`[CLEANUP] Successfully cleaned up user: ${userId || 'unknown'}`);
-      
-    } catch (error) {
-      console.error("[FORCE CLEANUP] Error:", error);
-    } finally { 
+    } catch (error) {} finally { 
       this._cleaningUp.delete(ws); 
     }
   }
@@ -726,12 +691,9 @@ export class ChatServer2 {
         this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
         this.broadcastToRoom(room, ["pointRemoved", room, seatNumber]);
         this.updateRoomCount(room);
-        
-        console.log(`[CLEANUP] Removed seat ${seatNumber} and point for user ${userId} in room ${room}`);
         return true;
       }
     }
-    
     return false;
   }
   
@@ -759,11 +721,14 @@ export class ChatServer2 {
   }
   
   async _withSeatLock(room, seatNumber, operation) {
-    const release = await this.seatLocker.acquire(`seat_${room}_${seatNumber}`);
+    let release = null;
     try {
+      release = await this.seatLocker.acquire(`seat_${room}_${seatNumber}`);
       return await operation();
     } finally {
-      release();
+      if (release) {
+        try { release(); } catch(e) {}
+      }
     }
   }
   
@@ -1001,9 +966,7 @@ export class ChatServer2 {
       }
       if (Object.keys(filteredMeta).length > 0) await this.safeSend(ws, ["allUpdateKursiList", room, filteredMeta]);
       if (lastPointsData.length > 0) await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
-    } catch (error) {
-      console.error("Send all state error:", error);
-    }
+    } catch (error) {}
   }
   
   async handleJoinRoom(ws, room) {
@@ -1073,7 +1036,6 @@ export class ChatServer2 {
       await this.sendAllStateTo(ws, room);
       return true;
     } catch (error) {
-      console.error("Join room error:", error);
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     }
@@ -1092,9 +1054,7 @@ export class ChatServer2 {
       await this._removeUserConnection(ws.idtarget, ws);
       ws.roomname = undefined;
       this.updateRoomCount(room);
-    } catch (error) {
-      console.error("Cleanup from room error:", error);
-    }
+    } catch (error) {}
   }
   
   async handleSetIdTarget2(ws, id, baru) {
@@ -1153,7 +1113,6 @@ export class ChatServer2 {
       await this._addUserConnection(id, ws);
       await this.safeSend(ws, ["needJoinRoom"]);
     } catch (error) {
-      console.error("SetIdTarget2 error:", error);
       await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
   }
@@ -1166,9 +1125,7 @@ export class ChatServer2 {
     let data;
     try { data = JSON.parse(messageStr); } catch (e) { return; }
     if (!data || !Array.isArray(data) || data.length === 0) return;
-    try { await this._processMessage(ws, data, data[0]); } catch (error) {
-      console.error("Process message error:", error);
-    }
+    try { await this._processMessage(ws, data, data[0]); } catch (error) {}
   }
   
   async _processMessage(ws, data, evt) {
@@ -1328,23 +1285,16 @@ export class ChatServer2 {
           this.pmBuffer.add(idtarget, ["private", idtarget, noimageUrl, message, Date.now(), sender]);
           break;
         }
-        // ==========================================
-        // GAME EVENTS - LANGSUNG PROSES, TIDAK DI-BUFFER!
-        // ==========================================
         case "gameLowCardStart":
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
           if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
             try { 
-              console.log(`[GAME] ✅ Processing ${evt} for ${ws.idtarget} in ${ws.roomname}`);
               await this.lowcard.handleEvent(ws, data); 
             } catch (error) {
-              console.error(`[GAME] Error processing ${evt}:`, error);
               await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
             }
-          } else {
-            console.log(`[GAME] ❌ Rejected ${evt} - room: ${ws.roomname}, lowcard exists: ${!!this.lowcard}, inGameRoom: ${GAME_ROOMS.includes(ws.roomname)}`);
           }
           break;
         case "onDestroy":
@@ -1353,9 +1303,7 @@ export class ChatServer2 {
         default: 
           break;
       }
-    } catch (error) {
-      console.error(`Unhandled error in _processMessage for event ${evt}:`, error);
-    }
+    } catch (error) {}
   }
   
   setRoomMute(roomName, isMuted) {
@@ -1402,7 +1350,7 @@ export class ChatServer2 {
     await this.chatBuffer.flushAll();
     await this.chatBuffer.destroy();
     await this.pmBuffer.destroy();
-    if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch(e) { console.error("Lowcard destroy error:", e); }
+    if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch(e) {}
     this.lowcard = null;
     const clientsToClose = Array.from(this._activeClients);
     for (const ws of clientsToClose) {
@@ -1467,7 +1415,6 @@ export class ChatServer2 {
       try {
         await Promise.race([acceptPromise, timeoutPromise]);
       } catch (acceptError) {
-        console.error("WebSocket accept failed or timed out:", acceptError);
         abortController.abort();
         return new Response("WebSocket accept timeout", { status: 500 });
       }
@@ -1483,19 +1430,9 @@ export class ChatServer2 {
       this._activeClients.add(ws);
       this._clientWebSockets.add(client);
       
-      const messageHandler = (ev) => { 
-        this.handleMessage(ws, ev.data).catch(e => console.error("Message handler error:", e)); 
-      };
-      
-      const errorHandler = () => { 
-        console.log(`[WS ERROR] WebSocket error for ${ws.idtarget || 'unknown'}, LANGSUNG HAPUS...`);
-        this._forceFullCleanupWebSocket(ws).catch(e => console.error("Error handler cleanup error:", e)); 
-      };
-      
-      const closeHandler = () => { 
-        console.log(`[WS CLOSE] WebSocket closed for ${ws.idtarget || 'unknown'}, LANGSUNG HAPUS KURSI & POINT...`);
-        this._forceFullCleanupWebSocket(ws).catch(e => console.error("Close handler cleanup error:", e)); 
-      };
+      const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
+      const errorHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
+      const closeHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
       
       ws.addEventListener("message", messageHandler, { signal: abortController.signal });
       ws.addEventListener("error", errorHandler, { signal: abortController.signal });
@@ -1511,13 +1448,11 @@ export class ChatServer2 {
       
       return new Response(null, { status: 101, webSocket: client });
     } catch (error) {
-      console.error("Fetch error:", error);
       return new Response("Internal server error", { status: 500 });
     }
   }
 }
 
-// ==================== EXPORT ====================
 export default {
   async fetch(req, env) {
     try {
@@ -1528,7 +1463,6 @@ export default {
       if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
       return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
     } catch (error) {
-      console.error("Export fetch error:", error);
       return new Response("Server error", { status: 500 });
     }
   }
