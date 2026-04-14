@@ -2,4 +2,13 @@ name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-14"
 
-# Tanpa Durable Objects sama sekali
+[[durable_objects.bindings]]
+name = "CHAT_SERVER_2"
+class_name = "ChatServer2"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatServer2"]
+
+[limits]
+cpu_ms = 30
