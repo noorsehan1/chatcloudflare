@@ -2,21 +2,15 @@ name = "chatcloudflare"
 main = "index.js"
 compatibility_date = "2026-04-03"
 
-# ==================== FREE TIER OPTIMIZATION ====================
-# Tidak menggunakan Durable Objects untuk menghindari timeout
-# WebSocket langsung dihandle oleh Worker stateless
+[[durable_objects.bindings]]
+name = "CHAT_SERVER_2"
+class_name = "ChatServer2"
 
-# ==================== VARIABLES LINGKUNGAN (Opsional) ====================
-# [vars]
-# ENVIRONMENT = "production"
-# MAX_CONNECTIONS = "80"
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatServer2"]
 
-# ==================== OBSERVABILITY (Opsional) ====================
-# [observability]
-# enabled = true
-# head_sampling_rate = 0.1
-
-# ==================== CATATAN PENTING ====================
-# 1. HAPUS semua konfigurasi durable_objects jika sebelumnya ada
-# 2. Jika sebelumnya sudah deploy dengan Durable Objects, 
-#    buat worker baru dengan nama berbeda atau hapus migration lama
+# TAMBAHKAN INI untuk menghapus class
+[[migrations]]
+tag = "v2"
+deleted_classes = ["ChatServer2"]
