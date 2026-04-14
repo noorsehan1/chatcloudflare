@@ -34,7 +34,7 @@ const GAME_ROOMS = [
 ];
 
 // ==================== DURABLE OBJECT CLASS ====================
-export class ChatServer2 {
+export class ChatServer3 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -656,8 +656,8 @@ export default {
       const url = new URL(request.url);
       
       if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-        const id = env.CHAT_SERVER_2.idFromName("chat-room");
-        const chatObj = env.CHAT_SERVER_2.get(id);
+        const id = env.CHAT_SERVER_3.idFromName("chat-room");
+        const chatObj = env.CHAT_SERVER_3.get(id);
         return chatObj.fetch(request);
       }
       
