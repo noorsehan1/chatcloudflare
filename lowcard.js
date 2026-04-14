@@ -1,5 +1,5 @@
 // ==================== LOWCARD GAME MANAGER - FREE TIER OPTIMIZED ====================
-// lowcard.js
+// lowcard.js - Fully compatible with index.js
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
