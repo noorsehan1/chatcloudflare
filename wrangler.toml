@@ -1,5 +1,5 @@
-name = "chatcloudflare"
+name = "chatcloudnew"
 main = "index.js"
-compatibility_date = "2026-04-03"
+compatibility_date = "2026-04-14"
 
 # Tanpa Durable Objects sama sekali
