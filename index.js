@@ -1,5 +1,5 @@
-// ==================== CHAT SERVER - 128MB MEMORY OPTIMIZED ====================
-// index.js - For Cloudflare Free Tier (128MB limit)
+// ==================== CHAT SERVER - LANGSUNG HAPUS SAAT CLOSE/ERROR ====================
+// index.js - Optimized for Cloudflare Free Tier (128MB)
 
 // LowCardGameManager stub
 let LowCardGameManager;
@@ -21,37 +21,35 @@ const CONSTANTS = Object.freeze({
   NUMBER_TICK_INTERVAL_TICKS: 900,
   ZOMBIE_CLEANUP_TICKS: 1800,
   
-  MAX_GLOBAL_CONNECTIONS: 250,              // TURUNKAN: 500 → 250
-  MAX_ACTIVE_CLIENTS_LIMIT: 250,            // TURUNKAN: 500 → 250
-  MAX_SEATS: 35,                            // TURUNKAN: 35 → 25
+  MAX_GLOBAL_CONNECTIONS: 250,
+  MAX_ACTIVE_CLIENTS_LIMIT: 250,
+  MAX_SEATS: 25,
   MAX_NUMBER: 6,
   
-  // KECILKAN LIMITS UNTUK 128MB
-  MAX_MESSAGE_SIZE: 5000,                  // TURUNKAN: 100KB → 50KB
-  MAX_MESSAGE_LENGTH: 5000,                 // TURUNKAN: 5000 → 2000 chars
-  MAX_USERNAME_LENGTH: 50,                  // TURUNKAN: 50 → 30
-  MAX_GIFT_NAME: 50,                        // TURUNKAN: 100 → 50
+  MAX_MESSAGE_SIZE: 51200,
+  MAX_MESSAGE_LENGTH: 2000,
+  MAX_USERNAME_LENGTH: 30,
+  MAX_GIFT_NAME: 50,
   
-  MAX_TOTAL_BUFFER_MESSAGES: 50,            // TURUNKAN: 100 → 50
-  MESSAGE_TTL_MS: 8000,                     // TURUNKAN: 10000 → 8000
+  MAX_TOTAL_BUFFER_MESSAGES: 50,
+  MESSAGE_TTL_MS: 8000,
   
   MAX_CONNECTIONS_PER_USER: 1,
   
-  ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000, // TURUNKAN: 30 → 15 menit
+  ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
   
-  PM_BATCH_SIZE: 5,                         // TURUNKAN: 10 → 5
-  PM_BATCH_DELAY_MS: 30,                    // TURUNKAN: 50 → 30ms
+  PM_BATCH_SIZE: 5,
+  PM_BATCH_DELAY_MS: 30,
   
-  GAME_BUFFER_SIZE: 30,                     // TURUNKAN: 50 → 30
-  GAME_BUFFER_TTL_MS: 3000,                 // TURUNKAN: 5000 → 3000ms
+  GAME_BUFFER_SIZE: 30,
+  GAME_BUFFER_TTL_MS: 3000,
   
   WS_ACCEPT_TIMEOUT_MS: 5000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
   
-  // NEW: Emergency thresholds for 128MB
-  MEMORY_CRITICAL_THRESHOLD: 100,           // 100MB = critical
-  MEMORY_WARNING_THRESHOLD: 80,             // 80MB = warning
-  FORCE_CLEANUP_MEMORY_TICKS: 30,           // Cek memory setiap 30 detik
+  MEMORY_CRITICAL_THRESHOLD: 100,
+  MEMORY_WARNING_THRESHOLD: 80,
+  FORCE_CLEANUP_MEMORY_TICKS: 30,
 });
 
 const roomList = Object.freeze([
@@ -274,7 +272,7 @@ class GlobalChatBuffer {
     this._pendingMessages = new Map();
     this._nextMsgId = 0;
     this._roomQueueSizes = new Map();
-    this.MAX_PER_ROOM = 25;  // TURUNKAN: 50 → 25
+    this.MAX_PER_ROOM = 25;
   }
   
   setFlushCallback(callback) { this._flushCallback = callback; }
@@ -334,7 +332,7 @@ class GlobalChatBuffer {
   _processRetryQueue(now) {
     const toRetry = this._retryQueue.filter(item => now >= item.nextRetry);
     for (const item of toRetry) {
-      if (item.retries >= 2) continue;  // TURUNKAN: 3 → 2 retries
+      if (item.retries >= 2) continue;
       const sent = this._sendWithCallback(item.room, item.message, item.msgId);
       if (!sent) {
         item.retries++;
@@ -621,7 +619,6 @@ export class ChatServer2 {
         this._cleanupZombieWebSocketsAndData();
       }
       
-      // Memory check lebih sering untuk 128MB
       if (this._masterTickCounter % CONSTANTS.FORCE_CLEANUP_MEMORY_TICKS === 0) {
         this._checkMemoryAndEmergencyCleanup();
       }
@@ -651,12 +648,10 @@ export class ChatServer2 {
   async _emergencyFullCleanup() {
     console.log("[EMERGENCY] Starting emergency cleanup");
     
-    // Force flush all buffers
     await this.chatBuffer.flushAll();
     this.gameBuffer.flushAll();
     await this.pmBuffer.flushAll();
     
-    // Force cleanup all zombie connections
     const allWS = Array.from(this._activeClients);
     for (const ws of allWS) {
       if (ws && ws.readyState !== 1) {
@@ -664,7 +659,6 @@ export class ChatServer2 {
       }
     }
     
-    // Clear old room data
     for (const room of roomList) {
       const roomManager = this.roomManagers.get(room);
       if (roomManager && roomManager.getOccupiedCount() === 0) {
@@ -691,7 +685,7 @@ export class ChatServer2 {
         }
       }
       
-      const batchSize = 30; // TURUNKAN: 50 → 30
+      const batchSize = 30;
       for (let i = 0; i < clientsToNotify.length; i += batchSize) {
         const batch = clientsToNotify.slice(i, i + batchSize);
         for (const client of batch) {
@@ -716,7 +710,7 @@ export class ChatServer2 {
       const zombies = [];
       for (const ws of this._activeClients) {
         const isZombie = !ws || ws.readyState !== 1 || ws._isClosing === true ||
-                         (ws._connectionTime && Date.now() - ws._connectionTime > 1800000); // 30 menit max
+                         (ws._connectionTime && Date.now() - ws._connectionTime > 1800000);
         if (isZombie) zombies.push(ws);
       }
       
@@ -764,6 +758,9 @@ export class ChatServer2 {
     }
   }
   
+  // ==========================================
+  // LANGSUNG HAPUS SAAT CLOSE ATAU ERROR
+  // ==========================================
   async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._cleaningUp.has(ws)) return;
     this._cleaningUp.add(ws);
@@ -772,27 +769,46 @@ export class ChatServer2 {
     const room = ws.roomname;
     
     try {
+      console.log(`[CLEANUP] Force cleaning WebSocket for user: ${userId || 'unknown'}, room: ${room || 'none'}`);
+      
+      // SET closing flag
       ws._isClosing = true;
       
+      // LANGSUNG HAPUS KURSI DAN POINT
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
       
+      // LANGSUNG HAPUS dari semua Map
       if (userId) {
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         await this._removeUserConnection(userId, ws);
       }
       
-      if (room) this._removeFromRoomClients(ws, room);
+      // LANGSUNG HAPUS dari room clients
+      if (room) {
+        this._removeFromRoomClients(ws, room);
+      }
+      
+      // LANGSUNG HAPUS event listeners
       this._cleanupWebSocketListeners(ws);
+      
+      // LANGSUNG HAPUS dari semua collection
       this.clients.delete(ws);
       this._activeClients.delete(ws);
       this._clientWebSockets.delete(ws);
       
+      // TUTUP koneksi jika masih open
       if (ws.readyState === 1) {
-        try { ws.close(1000, "Cleanup completed"); } catch(e) {}
+        try { 
+          ws.close(1000, "Cleanup completed"); 
+          console.log(`[CLEANUP] WebSocket closed for ${userId || 'unknown'}`);
+        } catch(e) {}
       }
+      
+      console.log(`[CLEANUP] Successfully cleaned up user: ${userId || 'unknown'}`);
+      
     } catch (error) {
       console.error("[FORCE CLEANUP] Error:", error);
     } finally { 
@@ -800,6 +816,7 @@ export class ChatServer2 {
     }
   }
   
+  // LANGSUNG HAPUS KURSI DAN POINT DARI ROOM
   async _removeUserSeatAndPointFromRoom(userId, room) {
     const seatInfo = this.userToSeat.get(userId);
     if (!seatInfo || seatInfo.room !== room) return false;
@@ -810,14 +827,20 @@ export class ChatServer2 {
     if (roomManager) {
       const seatData = roomManager.getSeat(seatNumber);
       if (seatData && seatData.namauser === userId) {
+        // LANGSUNG HAPUS KURSI
         roomManager.removeSeat(seatNumber);
+        // LANGSUNG HAPUS POINT
         roomManager.removePoint(seatNumber);
+        // LANGSUNG BROADCAST ke semua user di room
         this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
         this.broadcastToRoom(room, ["pointRemoved", room, seatNumber]);
         this.updateRoomCount(room);
+        
+        console.log(`[CLEANUP] Removed seat ${seatNumber} and point for user ${userId} in room ${room}`);
         return true;
       }
     }
+    
     return false;
   }
   
@@ -1561,11 +1584,20 @@ export class ChatServer2 {
       this._activeClients.add(ws);
       this._clientWebSockets.add(client);
       
-      const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(e => console.error("Message handler error:", e)); };
+      // ==========================================
+      // EVENT HANDLER - LANGSUNG HAPUS SAAT ERROR ATAU CLOSE
+      // ==========================================
+      const messageHandler = (ev) => { 
+        this.handleMessage(ws, ev.data).catch(e => console.error("Message handler error:", e)); 
+      };
+      
       const errorHandler = () => { 
+        console.log(`[WS ERROR] WebSocket error for ${ws.idtarget || 'unknown'}, LANGSUNG HAPUS...`);
         this._forceFullCleanupWebSocket(ws).catch(e => console.error("Error handler cleanup error:", e)); 
       };
+      
       const closeHandler = () => { 
+        console.log(`[WS CLOSE] WebSocket closed for ${ws.idtarget || 'unknown'}, LANGSUNG HAPUS KURSI & POINT...`);
         this._forceFullCleanupWebSocket(ws).catch(e => console.error("Close handler cleanup error:", e)); 
       };
       
