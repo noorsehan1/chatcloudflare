@@ -1,15 +1,19 @@
-// ==================== LOWCARDGAMEMANAGER.js - FIXED TIMEOUT CLEANUP (FINAL) ====================
+// ==================== LOWCARDGAMEMANAGER.js - FIXED TIMEOUT (FINAL) ====================
 
- const CONSTANTS = Object.freeze({
+const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
-  GAME_TIMEOUT_HOURS: 1,
-  CLEANUP_INTERVAL_MS: 300000,
-  REGISTRATION_TIME: 20,
-  DRAW_TIME: 20,
-  BOT_DRAW_MIN_SECONDS: 2,
-  BOT_DRAW_MAX_SECONDS: 15,
+  GAME_TIMEOUT_HOURS: 6,                    // INCREASE: 1 → 6 jam
+  CLEANUP_INTERVAL_MS: 600000,              // INCREASE: 5 menit → 10 menit
+  REGISTRATION_TIME: 60,                    // INCREASE: 20 → 60 detik
+  DRAW_TIME: 45,                            // INCREASE: 20 → 45 detik
+  BOT_DRAW_MIN_SECONDS: 3,                  // INCREASE: 2 → 3 detik
+  BOT_DRAW_MAX_SECONDS: 20,                 // INCREASE: 15 → 20 detik
   MASTER_TICK_INTERVAL_MS: 1000,
-  EVALUATION_DELAY_MS: 2000,  // NEW: Configurable evaluation delay
+  EVALUATION_DELAY_MS: 5000,                // INCREASE: 2000 → 5000ms (5 detik)
+  
+  // NEW: Safety timeouts
+  MAX_EVALUATION_TIME_MS: 15000,            // 15 detik max evaluasi
+  MAX_DRAW_WAIT_MS: 60000,                  // 60 detik max draw
 });
 
 export class LowCardGameManager {
@@ -19,7 +23,7 @@ export class LowCardGameManager {
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
     this._errorLogs = [];
-    this._cleanupInterval = null;  // NEW: Track cleanup interval
+    this._cleanupInterval = null;
     
     this._errorHandler = (error, context) => {
       const errorMsg = error?.message || String(error);
@@ -28,7 +32,6 @@ export class LowCardGameManager {
       console.error(`[LowCardGame] ${context}:`, errorMsg);
     };
     
-    // Start cleanup interval
     this._startCleanupInterval();
   }
   
@@ -62,9 +65,23 @@ export class LowCardGameManager {
   
   _processGameTick(room, game, now) {
     try {
-      // Skip if game is already in evaluation phase (timeout pending)
-      if (game._phase === 'evaluating') {
-        return;
+      // Safety: Force cleanup if evaluation stuck too long
+      if (game._phase === 'evaluating' && game._evalStartTime) {
+        if (now - game._evalStartTime > CONSTANTS.MAX_EVALUATION_TIME_MS) {
+          console.warn(`[LowCardGame] Evaluation stuck in ${room}, forcing next round`);
+          this._forceNextRound(room);
+          return;
+        }
+        return; // Skip other ticks during evaluation
+      }
+      
+      // Safety: Force cleanup if draw stuck too long
+      if (game._phase === 'draw' && game.drawStartTime) {
+        if (now - game.drawStartTime > CONSTANTS.MAX_DRAW_WAIT_MS) {
+          console.warn(`[LowCardGame] Draw stuck in ${room}, forcing evaluation`);
+          this._forceEvaluateRound(room);
+          return;
+        }
       }
       
       if (game._phase === 'registration') {
@@ -74,6 +91,46 @@ export class LowCardGameManager {
       }
     } catch (error) {
       this._errorHandler(error, `processGameTick ${room}`);
+    }
+  }
+  
+  _forceNextRound(room) {
+    try {
+      const game = this._safeGetGame(room);
+      if (!game) return;
+      
+      this._safeBroadcast(room, ["gameLowCardInfo", "Processing next round..."]);
+      this._evaluateRound(room);
+    } catch (error) {
+      this._errorHandler(error, 'forceNextRound');
+      this.endGame(room);
+    }
+  }
+  
+  _forceEvaluateRound(room) {
+    try {
+      const game = this._safeGetGame(room);
+      if (!game) return;
+      
+      game.drawTimeExpired = true;
+      game._phase = 'evaluating';
+      game.evaluationLocked = true;
+      game._evalStartTime = Date.now();
+      
+      this._safeBroadcast(room, ["gameLowCardWait", "Processing results..."]);
+      
+      setTimeout(() => {
+        try {
+          const currentGame = this._safeGetGame(room);
+          if (currentGame && currentGame._isActive && !this._destroyed) {
+            this._evaluateRound(room);
+          }
+        } catch (evalError) {
+          this._errorHandler(evalError, 'forceEvaluateRound');
+        }
+      }, CONSTANTS.EVALUATION_DELAY_MS);
+    } catch (error) {
+      this._errorHandler(error, 'forceEvaluateRound');
     }
   }
 
@@ -135,6 +192,7 @@ export class LowCardGameManager {
           continue;
         }
         
+        // Only cleanup if game is REALLY old (6+ hours)
         if (game._createdAt && (now - game._createdAt) > CONSTANTS.GAME_TIMEOUT_HOURS * 3600000) {
           staleGames.push(room);
         }
@@ -143,9 +201,9 @@ export class LowCardGameManager {
           staleGames.push(room);
         }
         
-        // Check if evaluation timeout is stuck (safety)
-        if (game._phase === 'evaluating' && game._evalStartTime && (now - game._evalStartTime) > 10000) {
-          console.warn(`[LowCardGame] Stuck evaluation detected for room ${room}, forcing cleanup`);
+        // Safety: Check if evaluation stuck for too long
+        if (game._phase === 'evaluating' && game._evalStartTime && (now - game._evalStartTime) > 30000) {
+          console.warn(`[LowCardGame] Stuck evaluation for room ${room}, forcing cleanup`);
           staleGames.push(room);
         }
       }
@@ -207,6 +265,8 @@ export class LowCardGameManager {
 
       const evt = data[0];
       if (typeof evt !== 'string') return;
+
+      console.log(`[LowCardGame] handleEvent: ${evt} from ${ws.idtarget || 'unknown'} in ${ws.roomname || 'unknown'}`);
 
       switch (evt) {
         case "gameLowCardStart":
@@ -282,7 +342,8 @@ export class LowCardGameManager {
         _pendingBotDraws: new Map(),
         _hasBroadcastInitial: false,
         _evalTimeout: null,
-        _evalStartTime: null  // NEW: Track when evaluation started
+        _evalStartTime: null,
+        drawStartTime: null  // NEW: Track draw start time
       };
 
       game.players.set(ws.idtarget, { 
@@ -294,6 +355,8 @@ export class LowCardGameManager {
 
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
+      
+      console.log(`[LowCardGame] Game started in ${room} by ${ws.idtarget} with bet ${betAmount}`);
       
     } catch (error) {
       this._errorHandler(error, 'startGame');
@@ -314,7 +377,7 @@ export class LowCardGameManager {
 
   _handleRegistrationTick(game, room) {
     try {
-      const timesToNotify = [20, 10, 5, 0];
+      const timesToNotify = [60, 30, 15, 10, 5, 0];
       
       if (timesToNotify.includes(game.registrationTimeLeft)) {
         if (game.registrationTimeLeft === 0) {
@@ -343,7 +406,12 @@ export class LowCardGameManager {
 
   _handleDrawTick(game, room) {
     try {
-      const timesToNotify = [20, 10, 5, 0];
+      const timesToNotify = [45, 30, 15, 10, 5, 0];
+      
+      // Set draw start time on first tick
+      if (game.drawStartTime === null && game._phase === 'draw') {
+        game.drawStartTime = Date.now();
+      }
       
       if (timesToNotify.includes(game.drawTimeLeft)) {
         if (game.drawTimeLeft === 0) {
@@ -360,10 +428,9 @@ export class LowCardGameManager {
           
           game._phase = 'evaluating';
           game.evaluationLocked = true;
-          game._evalStartTime = Date.now();  // NEW: Track evaluation start time
+          game._evalStartTime = Date.now();
           this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
           
-          // Clear any existing timeout before setting a new one
           this._clearGameTimeouts(game);
           
           game._evalTimeout = setTimeout(() => {
@@ -455,11 +522,11 @@ export class LowCardGameManager {
       }
       game._pendingBotDraws = new Map();
       
-      const mozNames = ["moz 1", "moz 2", "moz 3", "moz 4"];
+      const mozNames = ["🤖 Bot 1", "🤖 Bot 2", "🤖 Bot 3", "🤖 Bot 4"];
       
       for (let i = 0; i < 4; i++) {
         const randomSuffix = Math.random().toString(36).substring(7);
-        const botId = `BOT_MOZ_${room}_${i}_${Date.now()}_${randomSuffix}`;
+        const botId = `BOT_${room}_${i}_${Date.now()}_${randomSuffix}`;
         const botName = mozNames[i];
         
         if (!game.players) game.players = new Map();
@@ -470,6 +537,8 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardJoin", botName, game.betAmount]);
       }
+      
+      console.log(`[LowCardGame] Added 4 bots to room ${room}`);
     } catch (error) {
       this._errorHandler(error, 'addFourMozBots');
     }
@@ -508,6 +577,7 @@ export class LowCardGameManager {
       game.drawTimeLeft = CONSTANTS.DRAW_TIME;
       game.drawTimeExpired = false;
       game._hasBroadcastInitial = false;
+      game.drawStartTime = null;  // Will be set on first draw tick
 
       const playersList = Array.from(game.players.values())
         .filter(p => p && p.name)
@@ -530,6 +600,8 @@ export class LowCardGameManager {
           game._pendingBotDraws.set(botId, drawTime);
         }
       }
+      
+      console.log(`[LowCardGame] Registration closed in ${room}, ${playerCount} players, round 1 starting`);
       
     } catch (error) {
       this._errorHandler(error, 'closeRegistration');
@@ -627,6 +699,8 @@ export class LowCardGameManager {
       });
 
       this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
+      
+      console.log(`[LowCardGame] Player ${ws.idtarget} joined game in ${room}`);
       
     } catch (error) {
       this._errorHandler(error, 'joinGame');
@@ -727,6 +801,8 @@ export class LowCardGameManager {
         }, CONSTANTS.EVALUATION_DELAY_MS);
       }
       
+      console.log(`[LowCardGame] Player ${ws.idtarget} submitted number ${n} in ${room}`);
+      
     } catch (error) {
       this._errorHandler(error, 'submitNumber');
       this._safeSend(ws, ["gameLowCardError", "Failed to submit number"]);
@@ -765,7 +841,7 @@ export class LowCardGameManager {
       
       // If NO ONE submitted any number - game ends
       if (entries.length === 0) {
-        this._safeBroadcast(room, ["gameLowCardError", "Game ended"]);
+        this._safeBroadcast(room, ["gameLowCardError", "Game ended - no submissions"]);
         this.activeGames.delete(room);
         return;
       }
@@ -784,6 +860,7 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this.activeGames.delete(room);
+        console.log(`[LowCardGame] Game ended in ${room}, winner: ${winnerName}`);
         return;
       }
 
@@ -809,6 +886,7 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this.activeGames.delete(room);
+        console.log(`[LowCardGame] Game ended in ${room}, winner: ${winnerName}`);
         return;
       }
       
@@ -855,6 +933,7 @@ export class LowCardGameManager {
       game._phase = 'draw';
       game.drawTimeLeft = CONSTANTS.DRAW_TIME;
       game._hasBroadcastInitial = false;
+      game.drawStartTime = null;  // Reset draw start time
       
       if (game.useBots && game.botPlayers) {
         if (game._pendingBotDraws) {
@@ -871,6 +950,7 @@ export class LowCardGameManager {
       }
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      console.log(`[LowCardGame] Round ${game.round} starting in ${room}, ${newRemaining.length} players remaining`);
       
     } catch (error) {
       this._errorHandler(error, 'evaluateRound');
@@ -939,12 +1019,14 @@ export class LowCardGameManager {
       game._phase = null;
       game._hasBroadcastInitial = null;
       game._evalStartTime = null;
+      game.drawStartTime = null;
       
       if (playersList.length > 0) {
         this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
       }
       
       this.activeGames.delete(room);
+      console.log(`[LowCardGame] Game ended in ${room}`);
       
     } catch (error) {
       this._errorHandler(error, 'endGame');
@@ -963,6 +1045,7 @@ export class LowCardGameManager {
   }
   
   destroy() {
+    console.log("[LowCardGame] Destroying LowCardGameManager...");
     this._destroyed = true;
     
     // Clear cleanup interval
@@ -986,5 +1069,6 @@ export class LowCardGameManager {
     
     this.chatServer = null;
     this._errorLogs = [];
+    console.log("[LowCardGame] LowCardGameManager destroyed");
   }
 }
