@@ -1,17 +1,18 @@
-// ==================== LOWCARDGAMEMANAGER.js - FINAL CLEAN VERSION ====================
+// ==================== LOWCARDGAMEMANAGER.js - 20 DETIK VERSION ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 6,
   CLEANUP_INTERVAL_MS: 600000,
-  REGISTRATION_TIME: 60,
-  DRAW_TIME: 45,
-  BOT_DRAW_MIN_SECONDS: 3,
-  BOT_DRAW_MAX_SECONDS: 20,
+  REGISTRATION_TIME: 20,                    // 60 → 20 detik
+  DRAW_TIME: 20,                            // 45 → 20 detik
+  BOT_DRAW_MIN_SECONDS: 2,                  // 3 → 2 detik
+  BOT_DRAW_MAX_SECONDS: 10,                 // 20 → 10 detik
   MASTER_TICK_INTERVAL_MS: 1000,
-  EVALUATION_DELAY_MS: 5000,
-  MAX_EVALUATION_TIME_MS: 15000,
-  MAX_DRAW_WAIT_MS: 60000,
+  EVALUATION_DELAY_MS: 3000,                // 5000 → 3000ms
+  
+  MAX_EVALUATION_TIME_MS: 10000,            // 15000 → 10000ms
+  MAX_DRAW_WAIT_MS: 30000,                  // 60000 → 30000ms
 });
 
 export class LowCardGameManager {
@@ -186,7 +187,7 @@ export class LowCardGameManager {
           staleGames.push(room);
         }
         
-        if (game._phase === 'evaluating' && game._evalStartTime && (now - game._evalStartTime) > 30000) {
+        if (game._phase === 'evaluating' && game._evalStartTime && (now - game._evalStartTime) > 20000) {
           staleGames.push(room);
         }
       }
@@ -212,7 +213,7 @@ export class LowCardGameManager {
     try {
       return Math.floor(Math.random() * (CONSTANTS.BOT_DRAW_MAX_SECONDS - CONSTANTS.BOT_DRAW_MIN_SECONDS + 1)) + CONSTANTS.BOT_DRAW_MIN_SECONDS;
     } catch {
-      return 5;
+      return 3;
     }
   }
 
@@ -342,7 +343,7 @@ export class LowCardGameManager {
 
   _handleRegistrationTick(game, room) {
     try {
-      const timesToNotify = [60, 30, 15, 10, 5, 0];
+      const timesToNotify = [20, 15, 10, 5, 0];
       
       if (timesToNotify.includes(game.registrationTimeLeft)) {
         if (game.registrationTimeLeft === 0) {
@@ -368,7 +369,7 @@ export class LowCardGameManager {
 
   _handleDrawTick(game, room) {
     try {
-      const timesToNotify = [45, 30, 15, 10, 5, 0];
+      const timesToNotify = [20, 15, 10, 5, 0];
       
       if (game.drawStartTime === null && game._phase === 'draw') {
         game.drawStartTime = Date.now();
