@@ -965,43 +965,41 @@ export class ChatServer2 {
     }
   }
   
-  async handleSetIdTarget2(ws, id, baru) {
-    if (!id || !ws) return;
-    
-    try {
-      const existingConnections = this.userConnections.get(id);
-      if (existingConnections && existingConnections.size > 0) {
-        for (const oldWs of existingConnections) {
-          if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
-            try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch(e) {}
-            await this._forceFullCleanupWebSocket(oldWs);
-          }
+ async handleSetIdTarget2(ws, id, baru) {
+  if (!id || !ws) return;
+  
+  try {
+    // Bersihkan koneksi lama user ini
+    const oldConns = this.userConnections.get(id);
+    if (oldConns) {
+      for (const oldWs of oldConns) {
+        if (oldWs !== ws && oldWs.readyState === 1) {
+          try { oldWs.close(1000, "New connection"); } catch(e) {}
         }
       }
-      
-      await this._removeUserSeatAndPointCompletely(id, ws.roomname);
-      this.userToSeat.delete(id);
-      this.userCurrentRoom.delete(id);
-      
-      ws.idtarget = id;
-      ws.roomname = undefined;
-      ws._isClosing = false;
-      ws._connectionTime = Date.now();
-      
-      await this._addUserConnection(id, ws);
-      this._activeClients.add(ws);
-      
-      if (baru === true) {
-        await this.safeSend(ws, ["joinroomawal"]);
-      } else {
-        await this.safeSend(ws, ["needJoinRoom"]);
-      }
-      
-    } catch (error) {
-      console.error("SetIdTarget2 error:", error);
-      await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
+    
+    // Set ID baru
+    ws.idtarget = id;
+    ws.roomname = undefined;
+    ws._isClosing = false;
+    
+    // Simpan koneksi
+    await this._addUserConnection(id, ws);
+    this._activeClients.add(ws);
+    
+    // Response sesuai tipe
+    if (baru === true) {
+      await this.safeSend(ws, ["joinroomawal"]);
+    } else {
+      await this.safeSend(ws, ["needJoinRoom"]);
+    }
+    
+  } catch (error) {
+    console.error("SetIdTarget2 error:", error);
+    await this.safeSend(ws, ["error", "Failed to set ID"]);
   }
+}
   
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) { await this.safeSend(ws, ["error", "User ID not set"]); return false; }
