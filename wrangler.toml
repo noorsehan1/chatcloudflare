@@ -9,6 +9,3 @@ class_name = "ChatServer2"
 [[migrations]]
 tag = "v1"
 new_classes = ["ChatServer2"]
-
-[limits]
-cpu_ms = 30
