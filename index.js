@@ -1,7 +1,7 @@
 // ==================== CHAT SERVER - STATELESS FREE TIER (COMPLETE) ====================
-// index.js - Tanpa Durable Objects, Tanpa Ping/Pong
+// index.js - Fully compatible with Java Client
 
- import { LowCardGameManager } from "./lowcard.js";
+import { LowCardGameManager } from "./lowcard.js";
 
 // ==================== CONSTANTS ====================
 const CONSTANTS = {
@@ -703,14 +703,67 @@ async function processMessage(ws, data, evt) {
       case "isInRoom":
         await safeSend(ws, ["inRoomStatus", globalState.userCurrentRoom.get(ws.userId) !== undefined]);
         break;
+      
+      // ============ KOMPATIBILITAS JAVA CLIENT ============
+      // Java client menggunakan "setIdTarget" (tanpa 2)
+      case "setIdTarget": {
+        const [id] = data.slice(1);
+        if (!id) break;
         
+        ws.userId = id;
+        
+        const existingConn = globalState.userConnection.get(id);
+        if (existingConn && existingConn !== ws && existingConn.readyState === 1) {
+          try {
+            await safeSend(existingConn, ["connectionReplaced", "New connection detected"]);
+            existingConn.close(1000, "Replaced");
+          } catch(e) {}
+          cleanupWebSocket(existingConn);
+        }
+        
+        globalState.userConnection.set(id, ws);
+        
+        const seatInfo = globalState.userToSeat.get(id);
+        if (seatInfo) {
+          const { room, seat } = seatInfo;
+          const roomManager = globalState.roomManagers.get(room);
+          const seatData = roomManager?.getSeat(seat);
+          
+          if (roomManager && seatData && seatData.namauser === id) {
+            ws.roomname = room;
+            ws.seatNumber = seat;
+            
+            let clientArray = globalState.roomClients.get(room);
+            if (!clientArray) {
+              clientArray = [];
+              globalState.roomClients.set(room, clientArray);
+            }
+            if (!clientArray.includes(ws)) clientArray.push(ws);
+            
+            await safeSend(ws, ["rooMasuk", seat, room]);
+            await safeSend(ws, ["numberKursiSaya", seat]);
+            await safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+            await safeSend(ws, ["currentNumber", globalState.currentNumber]);
+            await sendAllStateTo(ws, room);
+            
+            const point = roomManager.getPoint(seat);
+            if (point) {
+              await safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
+            }
+            break;
+          }
+        }
+        
+        await safeSend(ws, ["needJoinRoom"]);
+        break;
+      }
+      
       case "setIdTarget2": {
         const [id, isNew] = data.slice(1);
         if (!id) break;
         
         ws.userId = id;
         
-        // Replace existing connection (1 ID = 1 connection)
         const existingConn = globalState.userConnection.get(id);
         if (existingConn && existingConn !== ws && existingConn.readyState === 1) {
           try {
@@ -770,7 +823,6 @@ async function processMessage(ws, data, evt) {
           break;
         }
         
-        // Leave old room
         if (ws.roomname && ws.roomname !== room && ws.seatNumber && ws.userId) {
           await safeRemoveSeat(ws.roomname, ws.seatNumber, ws.userId);
           const oldClients = globalState.roomClients.get(ws.roomname);
@@ -782,7 +834,6 @@ async function processMessage(ws, data, evt) {
           ws.seatNumber = null;
         }
         
-        // Check existing seat
         const existingSeatInfo = globalState.userToSeat.get(ws.userId);
         if (existingSeatInfo && existingSeatInfo.room === room) {
           const seatNum = existingSeatInfo.seat;
@@ -809,7 +860,6 @@ async function processMessage(ws, data, evt) {
           }
         }
         
-        // Assign new seat
         const newSeat = await assignNewSeat(room, ws.userId);
         if (!newSeat) {
           await safeSend(ws, ["roomFull", room]);
@@ -988,6 +1038,47 @@ async function processMessage(ws, data, evt) {
         break;
       }
       
+      // ============ JAVA CLIENT COMPATIBILITY - RESET ROOM ============
+      case "resetRoom": {
+        const [roomName] = data.slice(1);
+        if (roomName && roomList.includes(roomName)) {
+          const roomManager = globalState.roomManagers.get(roomName);
+          if (roomManager) {
+            roomManager.destroy();
+            globalState.roomManagers.set(roomName, new RoomManager(roomName));
+            
+            for (const [userId, seatInfo] of globalState.userToSeat) {
+              if (seatInfo.room === roomName) {
+                globalState.userToSeat.delete(userId);
+                globalState.userCurrentRoom.delete(userId);
+              }
+            }
+            
+            const clientArray = globalState.roomClients.get(roomName);
+            if (clientArray) {
+              for (const client of clientArray) {
+                if (client && client.roomname === roomName) {
+                  client.roomname = null;
+                  client.seatNumber = null;
+                }
+              }
+              globalState.roomClients.set(roomName, []);
+            }
+            
+            broadcastToRoom(roomName, ["resetRoom", roomName]);
+            await safeSend(ws, ["resetRoom", roomName]);
+          }
+        }
+        break;
+      }
+      
+      // ============ JAVA CLIENT COMPATIBILITY - PRIVATE FAILED ============
+      case "privateFailed": {
+        const [username, reason] = data.slice(1);
+        await safeSend(ws, ["privateFailed", username || "", reason || ""]);
+        break;
+      }
+      
       case "gameLowCardStart":
       case "gameLowCardJoin":
       case "gameLowCardNumber":
@@ -1004,6 +1095,9 @@ async function processMessage(ws, data, evt) {
       case "onDestroy":
         await cleanupWebSocket(ws);
         break;
+      
+      default:
+        break;
     }
   } catch (error) {
     console.error(`Process message error for ${evt}:`, error);
@@ -1012,7 +1106,6 @@ async function processMessage(ws, data, evt) {
 
 // ==================== MASTER TICK ====================
 function startMasterTick() {
-  // Number tick (update current number setiap 30 detik)
   globalState._numberInterval = setInterval(() => {
     globalState.currentNumber = globalState.currentNumber < globalState.maxNumber ?
       globalState.currentNumber + 1 : 1;
@@ -1029,14 +1122,12 @@ function startMasterTick() {
     }
   }, CONSTANTS.NUMBER_TICK_INTERVAL_MS);
   
-  // Chat buffer tick
   setInterval(() => {
     if (globalState.chatBuffer) {
       globalState.chatBuffer.tick(Date.now());
     }
   }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
   
-  // Game tick untuk LowCard
   globalState._gameTickInterval = setInterval(() => {
     if (globalState.lowcard && typeof globalState.lowcard.masterTick === 'function') {
       try {
@@ -1047,11 +1138,9 @@ function startMasterTick() {
     }
   }, CONSTANTS.GAME_TICK_INTERVAL_MS);
   
-  // Cleanup intervals
   globalState._cleanupInterval = setInterval(() => {
     const now = Date.now();
     
-    // Cleanup empty rooms
     for (const room of roomList) {
       const roomManager = globalState.roomManagers.get(room);
       if (roomManager && roomManager.getOccupiedCount() === 0 && 
@@ -1061,7 +1150,6 @@ function startMasterTick() {
       }
     }
     
-    // Cleanup room clients
     for (const [room, clients] of globalState.roomClients) {
       const filtered = clients.filter(ws => ws && ws.readyState === 1 && ws.roomname === room);
       if (filtered.length !== clients.length) {
@@ -1069,14 +1157,12 @@ function startMasterTick() {
       }
     }
     
-    // Cleanup user connections
     for (const [userId, ws] of globalState.userConnection) {
       if (!ws || ws.readyState !== 1 || ws._isClosing) {
         globalState.userConnection.delete(userId);
       }
     }
     
-    // Cleanup stale games
     if (globalState.lowcard && typeof globalState.lowcard.cleanupStaleGames === 'function') {
       try {
         globalState.lowcard.cleanupStaleGames();
@@ -1091,7 +1177,6 @@ export default {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade") || "";
     
-    // HTTP endpoints
     if (upgrade.toLowerCase() !== "websocket") {
       if (url.pathname === "/health") {
         return new Response(JSON.stringify({
@@ -1134,12 +1219,10 @@ export default {
       });
     }
     
-    // WebSocket connection
     if (globalState.activeClients.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
       return new Response("Server busy", { status: 503 });
     }
     
-    // Start timers if not running
     if (!globalState._numberInterval) {
       startMasterTick();
       
