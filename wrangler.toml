@@ -1,4 +1,4 @@
-name = "chatcloudnew"
+name = "chatcloudnew2"
 main = "index.js"
 compatibility_date = "2026-04-14"
 
@@ -6,10 +6,6 @@ compatibility_date = "2026-04-14"
 name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
 
-# Bagian ini yang Diubah
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ChatServer2"] # <-- Perubahan ada di baris ini
-
-[limits]
-cpu_ms = 30
+new_sqlite_classes = ["ChatServer2"]
