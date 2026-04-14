@@ -1,4 +1,4 @@
-// ==================== LOWCARD GAME MANAGER - COMPLETE FOR STATELESS ====================
+// ==================== LOWCARD GAME MANAGER - FREE TIER OPTIMIZED ====================
 // lowcard.js
 
 const CONSTANTS = {
@@ -64,6 +64,35 @@ export class LowCardGameManager {
       }
     } catch (error) {
       this._errorHandler(error, 'masterTick');
+    }
+  }
+  
+  cleanupStaleGames() {
+    try {
+      if (this._destroyed) return;
+      const now = Date.now();
+      const staleGames = [];
+      
+      for (const [room, game] of this.activeGames.entries()) {
+        if (!game || !game._isActive) {
+          staleGames.push(room);
+          continue;
+        }
+        
+        if (game._createdAt && (now - game._createdAt) > CONSTANTS.GAME_TIMEOUT_MINUTES * 60 * 1000) {
+          staleGames.push(room);
+        }
+        
+        if (game.players && game.players.size === 0) {
+          staleGames.push(room);
+        }
+      }
+      
+      for (const room of staleGames) {
+        this.endGame(room);
+      }
+    } catch (error) {
+      this._errorHandler(error, 'cleanupStaleGames');
     }
   }
   
@@ -190,7 +219,6 @@ export class LowCardGameManager {
     let game = null;
     try {
       if (this._destroyed) return;
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (!ws || !ws.roomname || !ws.userId) {
         this._safeSend(ws, ["gameLowCardError", "Invalid session"]);
         return;
@@ -229,7 +257,6 @@ export class LowCardGameManager {
         betAmount: betAmount,
         registrationTimeLeft: CONSTANTS.REGISTRATION_TIME,
         drawTimeLeft: CONSTANTS.DRAW_TIME,
-        // PERUBAHAN: ws.userId (bukan ws.idtarget)
         hostId: ws.userId,
         hostName: ws.username || ws.userId,
         useBots: false,
@@ -243,7 +270,6 @@ export class LowCardGameManager {
         _evalTimeout: null
       };
 
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       game.players.set(ws.userId, { 
         id: ws.userId, 
         name: ws.username || ws.userId 
@@ -545,7 +571,6 @@ export class LowCardGameManager {
   joinGame(ws) {
     try {
       if (this._destroyed) return;
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (!ws || !ws.roomname || !ws.userId) {
         this._safeSend(ws, ["gameLowCardError", "Invalid session"]);
         return;
@@ -569,13 +594,11 @@ export class LowCardGameManager {
         return;
       }
       
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (game.players.has(ws.userId)) {
         this._safeSend(ws, ["gameLowCardError", "Already joined"]);
         return;
       }
 
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       game.players.set(ws.userId, { 
         id: ws.userId, 
         name: ws.username || ws.userId 
@@ -592,7 +615,6 @@ export class LowCardGameManager {
   submitNumber(ws, number, tanda = "") {
     try {
       if (this._destroyed) return;
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (!ws || !ws.roomname || !ws.userId) {
         this._safeSend(ws, ["gameLowCardError", "Invalid session"]);
         return;
@@ -616,13 +638,11 @@ export class LowCardGameManager {
         return;
       }
       
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (!game.players.has(ws.userId) || game.eliminated.has(ws.userId)) {
         this._safeSend(ws, ["gameLowCardError", "Not in game or eliminated"]);
         return;
       }
       
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       if (game.numbers.has(ws.userId)) {
         this._safeSend(ws, ["gameLowCardError", "Already submitted number"]);
         return;
@@ -648,7 +668,6 @@ export class LowCardGameManager {
         return;
       }
 
-      // PERUBAHAN: ws.userId (bukan ws.idtarget)
       game.numbers.set(ws.userId, n);
       game.tanda.set(ws.userId, tanda);
       
