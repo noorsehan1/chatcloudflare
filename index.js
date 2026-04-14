@@ -1,7 +1,7 @@
-// ==================== CHAT SERVER - LANGSUNG HAPUS SAAT CLOSE/ERROR ====================
-// index.js - Optimized for Cloudflare Free Tier (128MB)
+// ==================== CHAT SERVER - GAME LANGSUNG PROSES (TANPA BUFFER) ====================
+// index.js - Untuk Cloudflare Free Tier (128MB)
 
-// LowCardGameManager stub
+// LowCardGameManager
 let LowCardGameManager;
 try {
   LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
@@ -15,7 +15,7 @@ try {
   };
 }
 
-// ==================== CONSTANTS - 128MB OPTIMIZED ====================
+// ==================== CONSTANTS ====================
 const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL_TICKS: 900,
@@ -40,9 +40,6 @@ const CONSTANTS = Object.freeze({
   
   PM_BATCH_SIZE: 5,
   PM_BATCH_DELAY_MS: 30,
-  
-  GAME_BUFFER_SIZE: 30,
-  GAME_BUFFER_TTL_MS: 3000,
   
   WS_ACCEPT_TIMEOUT_MS: 5000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
@@ -169,91 +166,6 @@ class PMBuffer {
     await this.flushAll();
     this._queue = [];
     this._isProcessing = false;
-    this._flushCallback = null;
-  }
-}
-
-// ==================== GAME BUFFER ====================
-class GameEventBuffer {
-  constructor() {
-    this._gameEvents = new Map();
-    this._flushCallback = null;
-    this.maxBufferSize = CONSTANTS.GAME_BUFFER_SIZE;
-    this.eventTTL = CONSTANTS.GAME_BUFFER_TTL_MS;
-  }
-  
-  setFlushCallback(callback) {
-    this._flushCallback = callback;
-  }
-  
-  add(room, event, ws, data) {
-    if (!this._gameEvents.has(room)) {
-      this._gameEvents.set(room, []);
-    }
-    
-    const roomEvents = this._gameEvents.get(room);
-    
-    const now = Date.now();
-    while (roomEvents.length > 0 && now - roomEvents[0].timestamp > this.eventTTL) {
-      roomEvents.shift();
-    }
-    
-    roomEvents.push({
-      event,
-      ws,
-      data,
-      timestamp: now
-    });
-    
-    if (roomEvents.length >= this.maxBufferSize) {
-      this.flushRoom(room);
-    }
-  }
-  
-  flushRoom(room) {
-    const roomEvents = this._gameEvents.get(room);
-    if (!roomEvents || roomEvents.length === 0) return;
-    
-    const events = [...roomEvents];
-    this._gameEvents.set(room, []);
-    
-    if (this._flushCallback) {
-      for (const ev of events) {
-        try {
-          this._flushCallback(room, ev.event, ev.ws, ev.data);
-        } catch (e) {
-          console.error("Game event flush error:", e);
-        }
-      }
-    }
-  }
-  
-  flushAll() {
-    for (const room of this._gameEvents.keys()) {
-      this.flushRoom(room);
-    }
-  }
-  
-  tick(now) {
-    for (const [room, events] of this._gameEvents) {
-      const filtered = events.filter(ev => now - ev.timestamp <= this.eventTTL);
-      if (filtered.length !== events.length) {
-        this._gameEvents.set(room, filtered);
-      }
-    }
-  }
-  
-  getStats() {
-    let totalEvents = 0;
-    for (const events of this._gameEvents.values()) {
-      totalEvents += events.length;
-    }
-    return { bufferedGames: totalEvents, roomsWithBuffer: this._gameEvents.size };
-  }
-  
-  async destroy() {
-    this.flushAll();
-    this._gameEvents.clear();
     this._flushCallback = null;
   }
 }
@@ -559,12 +471,7 @@ export class ChatServer2 {
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg, msgId) => this._sendDirectToRoom(room, msg, msgId));
     
-    this.gameBuffer = new GameEventBuffer();
-    this.gameBuffer.setFlushCallback((room, event, ws, data) => {
-      if (this.lowcard && GAME_ROOMS.includes(room)) {
-        this.lowcard.handleEvent(ws, data).catch(e => console.error("Game event error:", e));
-      }
-    });
+    // GAME BUFFER TIDAK DIPAKAI LAGI - LANGSUNG PROSES
     
     this.pmBuffer = new PMBuffer();
     this.pmBuffer.setFlushCallback(async (targetId, message) => {
@@ -582,6 +489,7 @@ export class ChatServer2 {
     this.lowcard = null;
     try {
       this.lowcard = new LowCardGameManager(this);
+      console.log("[ChatServer2] LowCardGameManager initialized successfully");
     } catch (error) { 
       console.error("Failed to initialize LowCardGameManager:", error);
       this.lowcard = null; 
@@ -613,7 +521,6 @@ export class ChatServer2 {
       }
       
       if (this.chatBuffer) this.chatBuffer.tick(now);
-      if (this.gameBuffer) this.gameBuffer.tick(now);
       
       if (this._masterTickCounter % CONSTANTS.ZOMBIE_CLEANUP_TICKS === 0) {
         this._cleanupZombieWebSocketsAndData();
@@ -641,7 +548,6 @@ export class ChatServer2 {
     } else if (heapUsedMB > CONSTANTS.MEMORY_WARNING_THRESHOLD) {
       console.log(`[MEMORY] WARNING: ${heapUsedMB}MB, cleaning buffers`);
       this.chatBuffer._flush();
-      this.gameBuffer.flushAll();
     }
   }
   
@@ -649,7 +555,6 @@ export class ChatServer2 {
     console.log("[EMERGENCY] Starting emergency cleanup");
     
     await this.chatBuffer.flushAll();
-    this.gameBuffer.flushAll();
     await this.pmBuffer.flushAll();
     
     const allWS = Array.from(this._activeClients);
@@ -758,9 +663,6 @@ export class ChatServer2 {
     }
   }
   
-  // ==========================================
-  // LANGSUNG HAPUS SAAT CLOSE ATAU ERROR
-  // ==========================================
   async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._cleaningUp.has(ws)) return;
     this._cleaningUp.add(ws);
@@ -771,35 +673,28 @@ export class ChatServer2 {
     try {
       console.log(`[CLEANUP] Force cleaning WebSocket for user: ${userId || 'unknown'}, room: ${room || 'none'}`);
       
-      // SET closing flag
       ws._isClosing = true;
       
-      // LANGSUNG HAPUS KURSI DAN POINT
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
       
-      // LANGSUNG HAPUS dari semua Map
       if (userId) {
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         await this._removeUserConnection(userId, ws);
       }
       
-      // LANGSUNG HAPUS dari room clients
       if (room) {
         this._removeFromRoomClients(ws, room);
       }
       
-      // LANGSUNG HAPUS event listeners
       this._cleanupWebSocketListeners(ws);
       
-      // LANGSUNG HAPUS dari semua collection
       this.clients.delete(ws);
       this._activeClients.delete(ws);
       this._clientWebSockets.delete(ws);
       
-      // TUTUP koneksi jika masih open
       if (ws.readyState === 1) {
         try { 
           ws.close(1000, "Cleanup completed"); 
@@ -816,7 +711,6 @@ export class ChatServer2 {
     }
   }
   
-  // LANGSUNG HAPUS KURSI DAN POINT DARI ROOM
   async _removeUserSeatAndPointFromRoom(userId, room) {
     const seatInfo = this.userToSeat.get(userId);
     if (!seatInfo || seatInfo.room !== room) return false;
@@ -827,11 +721,8 @@ export class ChatServer2 {
     if (roomManager) {
       const seatData = roomManager.getSeat(seatNumber);
       if (seatData && seatData.namauser === userId) {
-        // LANGSUNG HAPUS KURSI
         roomManager.removeSeat(seatNumber);
-        // LANGSUNG HAPUS POINT
         roomManager.removePoint(seatNumber);
-        // LANGSUNG BROADCAST ke semua user di room
         this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
         this.broadcastToRoom(room, ["pointRemoved", room, seatNumber]);
         this.updateRoomCount(room);
@@ -1437,18 +1328,30 @@ export class ChatServer2 {
           this.pmBuffer.add(idtarget, ["private", idtarget, noimageUrl, message, Date.now(), sender]);
           break;
         }
+        // ==========================================
+        // GAME EVENTS - LANGSUNG PROSES, TIDAK DI-BUFFER!
+        // ==========================================
         case "gameLowCardStart":
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
           if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
-            this.gameBuffer.add(ws.roomname, evt, ws, data);
+            try { 
+              console.log(`[GAME] ✅ Processing ${evt} for ${ws.idtarget} in ${ws.roomname}`);
+              await this.lowcard.handleEvent(ws, data); 
+            } catch (error) {
+              console.error(`[GAME] Error processing ${evt}:`, error);
+              await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
+            }
+          } else {
+            console.log(`[GAME] ❌ Rejected ${evt} - room: ${ws.roomname}, lowcard exists: ${!!this.lowcard}, inGameRoom: ${GAME_ROOMS.includes(ws.roomname)}`);
           }
           break;
         case "onDestroy":
           await this._forceFullCleanupWebSocket(ws);
           break;
-        default: break;
+        default: 
+          break;
       }
     } catch (error) {
       console.error(`Unhandled error in _processMessage for event ${evt}:`, error);
@@ -1486,7 +1389,6 @@ export class ChatServer2 {
       userConnections: this.userConnections.size,
       userToSeatSize: this.userToSeat.size,
       chatBuffer: this.chatBuffer.getStats(),
-      gameBuffer: this.gameBuffer.getStats(),
       pmBuffer: this.pmBuffer.getStats(),
       seats: totalSeats,
       points: totalPoints
@@ -1499,8 +1401,6 @@ export class ChatServer2 {
     if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
     await this.chatBuffer.flushAll();
     await this.chatBuffer.destroy();
-    await this.gameBuffer.flushAll();
-    await this.gameBuffer.destroy();
     await this.pmBuffer.destroy();
     if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch(e) { console.error("Lowcard destroy error:", e); }
     this.lowcard = null;
@@ -1540,7 +1440,6 @@ export class ChatServer2 {
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime, 
             chatBuffer: this.chatBuffer.getStats(),
-            gameBuffer: this.gameBuffer.getStats(),
             pmBuffer: this.pmBuffer.getStats(),
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
@@ -1584,9 +1483,6 @@ export class ChatServer2 {
       this._activeClients.add(ws);
       this._clientWebSockets.add(client);
       
-      // ==========================================
-      // EVENT HANDLER - LANGSUNG HAPUS SAAT ERROR ATAU CLOSE
-      // ==========================================
       const messageHandler = (ev) => { 
         this.handleMessage(ws, ev.data).catch(e => console.error("Message handler error:", e)); 
       };
