@@ -1,23 +1,5 @@
-name = "chatserver3"
+name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-14"
 
-# ==================== FREE TIER OPTIMIZATION ====================
-# Tanpa Durable Objects (lebih stabil untuk free tier)
-# Tanpa Migrations
-# Semua state disimpan di memory (global variable)
-
-# ==================== LIMITS ====================
-[limits]
-cpu_ms = 30
-
-# ==================== OPSIONAL: KV untuk persistent storage ====================
-# Jika ingin menyimpan data agar tidak hilang saat worker idle
-# [[kv_namespaces]]
-# binding = "CHAT_KV"
-# id = "your-kv-namespace-id"
-
-# ==================== OPSIONAL: Environment Variables ====================
-# [vars]
-# ENVIRONMENT = "production"
-# MAX_CONNECTIONS = "100"
+# Tidak ada konfigurasi Durable Objects
