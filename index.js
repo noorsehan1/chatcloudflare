@@ -795,7 +795,6 @@ export class ChatServer2 {
   
   // ==================== JOIN ROOM LOGIC ====================
   async handleJoinRoom(ws, room) {
-    // Validasi awal
     if (!ws?.userId) { 
       await this.safeSend(ws, ["error", "User ID not set"]); 
       return false; 
@@ -810,25 +809,22 @@ export class ChatServer2 {
   
   async _handleJoinRoomInternal(ws, room) {
     try {
-      // ==================== LANGKAH 1: CEK APAKAH USER SUDAH PUNYA SEAT DI ROOM INI? ====================
+      // LANGKAH 1: CEK APAKAH USER SUDAH PUNYA SEAT DI ROOM INI?
       const existingSeatInfo = this.userToSeat.get(ws.userId);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.userId);
       
-      // CASE A: User sudah punya seat di room ini
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const roomManager = this.roomManagers.get(room);
         const seatData = roomManager.getSeat(seatNum);
         
         if (seatData && seatData.namauser === ws.userId) {
-          // User valid, langsung masuk
           ws.roomname = room;
           ws.seatNumber = seatNum;
           this._addToRoomClients(ws, room);
           await this._addUserConnection(ws.userId, ws);
           this.userCurrentRoom.set(ws.userId, room);
           
-          // Kirim response ke user
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
@@ -842,7 +838,7 @@ export class ChatServer2 {
         }
       }
       
-      // ==================== LANGKAH 2: JIKA USER SEDANG DI ROOM LAIN, KELUARKAN DULU ====================
+      // LANGKAH 2: JIKA USER SEDANG DI ROOM LAIN, KELUARKAN DULU
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
         const oldSeatInfo = this.userToSeat.get(ws.userId);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
@@ -854,20 +850,20 @@ export class ChatServer2 {
         this.userCurrentRoom.delete(ws.userId);
       }
       
-      // ==================== LANGKAH 3: CEK APAKAH ROOM PENUH? (MAX 35 SEAT) ====================
+      // LANGKAH 3: CEK APAKAH ROOM PENUH? (MAX 35 SEAT)
       if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
         await this.safeSend(ws, ["roomFull", room]);
         return false;
       }
       
-      // ==================== LANGKAH 4: ASSIGN SEAT BARU ====================
+      // LANGKAH 4: ASSIGN SEAT BARU
       const assignedSeat = await this.assignNewSeat(room, ws.userId);
       if (!assignedSeat) { 
         await this.safeSend(ws, ["roomFull", room]); 
         return false; 
       }
       
-      // ==================== LANGKAH 5: UPDATE DATA USER ====================
+      // LANGKAH 5: UPDATE DATA USER
       this.userToSeat.set(ws.userId, { room, seat: assignedSeat });
       this.userCurrentRoom.set(ws.userId, room);
       ws.roomname = room;
@@ -877,13 +873,13 @@ export class ChatServer2 {
       
       const roomManager = this.roomManagers.get(room);
       
-      // ==================== LANGKAH 6: KIRIM RESPONSE KE USER YANG JOIN ====================
+      // LANGKAH 6: KIRIM RESPONSE KE USER YANG JOIN
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
       
-      // ==================== LANGKAH 7: KIRIM SEMUA STATE SETELAH DELAY ====================
+      // LANGKAH 7: KIRIM SEMUA STATE SETELAH DELAY
       setTimeout(async () => {
         if (ws.readyState === 1 && ws.roomname === room) {
           await this.sendAllStateTo(ws, room);
