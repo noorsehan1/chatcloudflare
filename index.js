@@ -473,7 +473,7 @@ export class ChatServer2 {
     this._cleaningUp = new Set();
 
     // GRACE PERIOD
-    this.disconnectGracePeriod = 5000;
+    this.disconnectGracePeriod = 10000;
     this.pendingDisconnects = new Map();
 
     this.seatLocker = new AsyncLock(2000);
