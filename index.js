@@ -462,7 +462,6 @@ export class ChatServer2 {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
-    // Grace period untuk reconnect
     this.disconnectGracePeriod = 5000;
     this.pendingDisconnects = new Map();
 
@@ -747,12 +746,16 @@ export class ChatServer2 {
     }
   }
 
+  // ⭐ INI METHOD YANG DIPERBAIKI - pendingDisconnects.delete() di PALING ATAS
   async _reconnectInGracePeriod(userId, newWs) {
+    // KRUSIAL: Hapus dari pendingDisconnects SEBELUM apapun
     const pending = this.pendingDisconnects.get(userId);
     if (!pending) return false;
     
-    clearTimeout(pending.timeout);
+    // HAPUS LANGSUNG DI SINI (PALING ATAS)
     this.pendingDisconnects.delete(userId);
+    
+    clearTimeout(pending.timeout);
     
     const seatNumber = pending.seat;
     const room = pending.room;
@@ -794,6 +797,7 @@ export class ChatServer2 {
       return false;
     }
     
+    // Setup koneksi baru
     newWs.roomname = room;
     newWs.idtarget = userId;
     newWs._isClosing = false;
@@ -806,16 +810,18 @@ export class ChatServer2 {
     this.userToSeat.set(userId, { room, seat: seatNumber });
     this.userCurrentRoom.set(userId, room);
     
+    // Kirim semua state
     await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
     await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
     await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
     await this.safeSend(newWs, ["muteTypeResponse", roomManager.getMute(), room]);
     await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
-    
     await this.sendAllStateTo(newWs, room, false);
     await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
     
-    this.broadcastToRoom(room, ["userBackOnline", room, seatNumber, userId]);
+    // Broadcast ke semua user di room untuk refresh
+    this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
+    this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
     return true;
   }
