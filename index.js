@@ -1218,25 +1218,30 @@ export class ChatServer2 {
   async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
   
-  // =========================================================
-  // JIKA baru === false, INI ADALAH RECONNECT
-  // LANGSUNG KEMBALIKAN KURSI LAMA, TIDAK JOIN ROOM BARU
-  // =========================================================
+  // RECONNECT (baru = false)
   if (baru === false) {
-    console.log(`🔄 Reconnect detected for ${id}, attempting to restore seat...`);
+    console.log(`🔄 Reconnect detected for ${id}`);
     
-    const reconnected = await this._reconnectInGracePeriod(id, ws);
-    
-    if (reconnected) {
-      console.log(`✅ Reconnect successful for ${id}, seat restored.`);
-      return; // ← LANGSUNG KELUAR, TIDAK JOIN ROOM BARU
+    try {
+      const reconnected = await this._reconnectInGracePeriod(id, ws);
+      console.log(`🔍 _reconnectInGracePeriod returned: ${reconnected}`);
+      
+      if (reconnected) {
+        console.log(`✅ Reconnect success for ${id}, returning early`);
+        return;
+      }
+    } catch (error) {
+      console.log(`❌ Error in _reconnectInGracePeriod: ${error.message}`);
     }
     
-    console.log(`⚠️ Reconnect failed for ${id}, will continue to normal flow`);
+    // ⭐ JIKA RECONNECT GAGAL, TETAP KELUAR (JANGAN LANJUT KE NEEDJOINROOM)
+    console.log(`⚠️ Reconnect failed for ${id}, but returning to prevent auto-join`);
+    await this.safeSend(ws, ["reconnectFailed", "Connection lost, please refresh"]);
+    return;
   }
   
   // =========================================================
-  // PROSES NORMAL (koneksi baru ATAU reconnect gagal)
+  // KONEKSI BARU (baru = true)
   // =========================================================
   try {
     const existingConnections = this.userConnections.get(id);
@@ -1249,7 +1254,6 @@ export class ChatServer2 {
       }
     }
 
-    // KONEKSI BARU (baru = true)
     if (baru === true) {
       ws.idtarget = id;
       ws.roomname = undefined;
@@ -1261,7 +1265,7 @@ export class ChatServer2 {
       return;
     }
 
-    // SITUASI LAIN (baru = false TAPI reconnect gagal, atau undefined)
+    // SITUASI LAIN (seharusnya tidak sampai sini untuk reconnect)
     ws.idtarget = id;
     ws._isClosing = false;
     ws._connectionTime = Date.now();
@@ -1296,11 +1300,10 @@ export class ChatServer2 {
     await this._addUserConnection(id, ws);
     await this.safeSend(ws, ["needJoinRoom"]);
   } catch (error) {
-    console.error(`Error in handleSetIdTarget2 for ${id}:`, error);
+    console.error(`Error in handleSetIdTarget2:`, error);
     await this.safeSend(ws, ["error", "Reconnection failed"]);
   }
 }
-
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
     let messageStr = raw;
