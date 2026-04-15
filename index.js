@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FULLY FIXED VERSION ====================
+// ==================== CHAT SERVER - FULLY FIXED VERSION WITH GRACE PERIOD ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
 // Fixes:
 //   1. Hapus process.memoryUsage() - tidak ada di CF Workers
@@ -8,6 +8,7 @@
 //   5. _processRetryQueue bug re-add diperbaiki
 //   6. Cek readyState setelah delay 1s di handleJoinRoom
 //   7. Return value broadcastToRoom untuk "chat" diperbaiki
+//   8. Grace period 5 detik untuk reconnect ke kursi lama
 
 let LowCardGameManager;
 try {
@@ -28,7 +29,7 @@ const CONSTANTS = Object.freeze({
 
   MAX_GLOBAL_CONNECTIONS: 250,
   MAX_ACTIVE_CLIENTS_LIMIT: 250,
-  MAX_SEATS: 25,
+  MAX_SEATS: 35,
   MAX_NUMBER: 6,
 
   MAX_MESSAGE_SIZE: 5000,
@@ -46,13 +47,11 @@ const CONSTANTS = Object.freeze({
   PM_BATCH_SIZE: 5,
   PM_BATCH_DELAY_MS: 30,
 
-  WS_ACCEPT_TIMEOUT_MS: 5000,
+  WS_ACCEPT_TIMEOUT_MS: 10000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
 
-  // FIX #1: Ganti memory threshold ke connection-count-based
-  // (process.memoryUsage() tidak tersedia di Cloudflare Workers)
-  CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,  // 90% dari MAX_GLOBAL_CONNECTIONS
-  CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,   // 75% dari MAX_GLOBAL_CONNECTIONS
+  CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
+  CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
   FORCE_CLEANUP_MEMORY_TICKS: 30,
 });
 
@@ -196,7 +195,6 @@ class GlobalChatBuffer {
     this._roomQueueSizes = new Map();
     this.MAX_PER_ROOM = 25;
 
-    // FIX #5: Pisahkan retry queue agar tidak ada re-entrant bug
     this._retryQueue = [];
   }
 
@@ -254,30 +252,23 @@ class GlobalChatBuffer {
     }
   }
 
-  // FIX #5: Perbaiki bug re-add pada retry queue
-  // Dulu: push ke this._retryQueue lalu langsung filter → item baru bisa ikut terhapus
-  // Sekarang: kumpulkan nextRetry dulu ke array terpisah, lalu set ulang
   _processRetryQueue(now) {
     const remaining = [];
 
     for (const item of this._retryQueue) {
       if (now < item.nextRetry) {
-        // Belum saatnya retry, pertahankan
         remaining.push(item);
         continue;
       }
       if (item.retries >= 2) {
-        // Sudah max retry, buang
         continue;
       }
-      // Coba kirim ulang
       const sent = this._sendWithCallback(item.room, item.message, item.msgId);
       if (!sent) {
         item.retries++;
         item.nextRetry = now + (1000 * Math.pow(2, item.retries));
         remaining.push(item);
       }
-      // Kalau sent, tidak dimasukkan kembali (sukses)
     }
 
     this._retryQueue = remaining;
@@ -296,13 +287,11 @@ class GlobalChatBuffer {
       const batch = this._messageQueue.splice(0);
       this._totalQueued = 0;
 
-      // Reset room queue sizes untuk batch ini
       for (const item of batch) {
         const roomSize = this._roomQueueSizes.get(item.room) || 0;
         this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
       }
 
-      // Kirim per room (grouped)
       const roomGroups = new Map();
       for (const item of batch) {
         if (!roomGroups.has(item.room)) roomGroups.set(item.room, []);
@@ -482,20 +471,22 @@ export class ChatServer2 {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
+    // Grace period untuk reconnect
+    this.disconnectGracePeriod = 5000; // 5 detik grace period
+    this.pendingDisconnects = new Map(); // userId -> { timeout, ws, seat, room, userId }
+
     this.seatLocker = new AsyncLock(2000);
     this.connectionLocker = new AsyncLock(1500);
-    this.roomLocker = new AsyncLock(1500);    // FIX #2: dipakai untuk join room
+    this.roomLocker = new AsyncLock(1500);
 
     this._activeClients = new Set();
     this.roomManagers = new Map();
-    // FIX #3: Hapus `this.clients` dan `this._clientWebSockets` (dead code)
 
     this.userToSeat = new Map();
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
 
-    // FIX #4: roomClients pakai Set bukan Array
-    this.roomClients = new Map();   // Map<string, Set<WebSocket>>
+    this.roomClients = new Map();
 
     this._activeListeners = new Map();
 
@@ -527,7 +518,7 @@ export class ChatServer2 {
 
     for (const room of roomList) {
       this.roomManagers.set(room, new RoomManager(room));
-      this.roomClients.set(room, new Set());   // FIX #4: Set
+      this.roomClients.set(room, new Set());
     }
 
     this._masterTickCounter = 0;
@@ -566,7 +557,6 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // FIX #1: Ganti cek memory (tidak tersedia di CF Workers) ke cek connection count
   async _checkConnectionPressure() {
     const total = this._activeClients.size;
     const max = CONSTANTS.MAX_GLOBAL_CONNECTIONS;
@@ -671,7 +661,6 @@ export class ChatServer2 {
         }
       }
 
-      // FIX #4: roomClients adalah Set sekarang, cleanup lebih efisien
       for (const [room, clientSet] of this.roomClients) {
         for (const ws of clientSet) {
           if (!ws || ws.readyState !== 1 || ws.roomname !== room) {
@@ -686,43 +675,128 @@ export class ChatServer2 {
     }
   }
 
-  async _forceFullCleanupWebSocket(ws) {
+  async _forceFullCleanupWebSocket(ws, isGraceful = true) {
     if (!ws || this._cleaningUp.has(ws)) return;
-    this._cleaningUp.add(ws);
-
+    
     const userId = ws.idtarget;
     const room = ws.roomname;
-
+    const seatInfo = userId ? this.userToSeat.get(userId) : null;
+    
+    // GRACE PERIOD: jika graceful dan user punya seat, tunggu 5 detik
+    if (isGraceful && userId && room && seatInfo && !ws._isForceCleanup) {
+      const existing = this.pendingDisconnects.get(userId);
+      if (existing) {
+        clearTimeout(existing.timeout);
+        this.pendingDisconnects.delete(userId);
+      }
+      
+      ws._isPendingDisconnect = true;
+      
+      const timeout = setTimeout(async () => {
+        const pending = this.pendingDisconnects.get(userId);
+        if (pending) {
+          if (pending.ws && pending.ws._isPendingDisconnect) {
+            pending.ws._isForceCleanup = true;
+            await this._forceFullCleanupWebSocket(pending.ws, false);
+          }
+          this.pendingDisconnects.delete(userId);
+        }
+      }, this.disconnectGracePeriod);
+      
+      this.pendingDisconnects.set(userId, {
+        timeout: timeout,
+        ws: ws,
+        seat: seatInfo.seat,
+        room: room,
+        userId: userId
+      });
+      
+      return;
+    }
+    
+    // CLEANUP LANGSUNG (setelah grace period habis atau force)
+    this._cleaningUp.add(ws);
+    
     try {
       ws._isClosing = true;
-
+      
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
-
+      
       if (userId) {
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         await this._removeUserConnection(userId, ws);
       }
-
+      
       if (room) {
         this._removeFromRoomClients(ws, room);
       }
-
+      
       this._cleanupWebSocketListeners(ws);
-
-      // FIX #3: Hapus referensi ke `this.clients` dan `this._clientWebSockets`
       this._activeClients.delete(ws);
-
+      
       if (ws.readyState === 1) {
         try { ws.close(1000, "Cleanup completed"); } catch (e) {}
       }
-
     } catch (error) {}
     finally {
       this._cleaningUp.delete(ws);
+      delete ws._isForceCleanup;
+      delete ws._isPendingDisconnect;
     }
+  }
+
+  async _reconnectInGracePeriod(userId, newWs) {
+    const pending = this.pendingDisconnects.get(userId);
+    if (!pending) return false;
+    
+    clearTimeout(pending.timeout);
+    this.pendingDisconnects.delete(userId);
+    
+    const seatNumber = pending.seat;
+    const room = pending.room;
+    const oldWs = pending.ws;
+    
+    if (oldWs) {
+      oldWs._isForceCleanup = true;
+      oldWs._isClosing = true;
+    }
+    
+    const roomManager = this.roomManagers.get(room);
+    if (!roomManager) return false;
+    
+    const seatData = roomManager.getSeat(seatNumber);
+    if (!seatData || seatData.namauser !== userId) {
+      return false;
+    }
+    
+    newWs.roomname = room;
+    newWs.idtarget = userId;
+    newWs._isClosing = false;
+    newWs._connectionTime = Date.now();
+    
+    this._addToRoomClients(newWs, room);
+    this._activeClients.add(newWs);
+    await this._addUserConnection(userId, newWs);
+    
+    this.userToSeat.set(userId, { room, seat: seatNumber });
+    this.userCurrentRoom.set(userId, room);
+    
+    await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
+    await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
+    await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
+    
+    const muteStatus = roomManager.getMute();
+    await this.safeSend(newWs, ["muteTypeResponse", muteStatus, room]);
+    await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
+    
+    await this.sendAllStateTo(newWs, room);
+    
+    this.broadcastToRoom(room, ["userBackOnline", room, seatNumber, userId]);
+    
+    return true;
   }
 
   async _removeUserSeatAndPointFromRoom(userId, room) {
@@ -782,7 +856,6 @@ export class ChatServer2 {
   }
 
   async assignNewSeat(room, userId) {
-    // Dipanggil dari dalam roomLocker (via _handleJoinRoomInternal), tidak perlu double lock
     const roomManager = this.roomManagers.get(room);
     if (!roomManager || roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
 
@@ -896,7 +969,6 @@ export class ChatServer2 {
     } finally { release(); }
   }
 
-  // FIX #4: roomClients pakai Set, add/remove O(1)
   _addToRoomClients(ws, room) {
     if (!ws || !room) return;
     let clientSet = this.roomClients.get(room);
@@ -949,7 +1021,6 @@ export class ChatServer2 {
     return roomManager.updatePoint(seatNumber, point);
   }
 
-  // FIX #4: iterasi Set langsung
   _sendDirectToRoom(room, msg, msgId = null) {
     const clientSet = this.roomClients.get(room);
     if (!clientSet?.size) return 0;
@@ -967,7 +1038,6 @@ export class ChatServer2 {
     return sentCount;
   }
 
-  // FIX #7: broadcastToRoom "chat" sekarang return jumlah klien yang menerima
   broadcastToRoom(room, msg) {
     if (!room || !roomList.includes(room)) return 0;
 
@@ -977,7 +1047,6 @@ export class ChatServer2 {
 
     if (msg[0] === "chat") {
       this.chatBuffer.add(room, msg);
-      // Return client count (estimasi, bukan sentCount karena buffered)
       return this.roomClients.get(room)?.size || 0;
     }
 
@@ -1026,8 +1095,6 @@ export class ChatServer2 {
     return this._handleJoinRoomInternal(ws, room);
   }
 
-  // FIX #2: Seluruh join room dibungkus room-level lock untuk cegah race condition
-  // Dua koneksi dari user yang sama tidak bisa assign seat secara bersamaan
   async _handleJoinRoomInternal(ws, room) {
     const release = await this.roomLocker.acquire(`joinroom_${room}_${ws.idtarget}`);
     try {
@@ -1042,7 +1109,6 @@ export class ChatServer2 {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
 
-      // Sudah punya seat di room yang sama
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const roomManager = this.roomManagers.get(room);
@@ -1057,7 +1123,6 @@ export class ChatServer2 {
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-          // FIX #6: Cek readyState setelah delay
           await new Promise(resolve => setTimeout(resolve, 1000));
           if (!ws || ws.readyState !== 1 || ws._isClosing) return true;
 
@@ -1068,7 +1133,6 @@ export class ChatServer2 {
         }
       }
 
-      // Pindah dari room lain
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
         const oldSeatInfo = this.userToSeat.get(ws.idtarget);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
@@ -1101,7 +1165,6 @@ export class ChatServer2 {
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-      // FIX #6: Cek readyState setelah delay
       await new Promise(resolve => setTimeout(resolve, 1000));
       if (!ws || ws.readyState !== 1 || ws._isClosing) return true;
 
@@ -1131,6 +1194,13 @@ export class ChatServer2 {
 
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
+    
+    // CEK GRACE PERIOD: apakah user reconnect dalam 5 detik?
+    const reconnected = await this._reconnectInGracePeriod(id, ws);
+    if (reconnected) {
+      return;
+    }
+    
     try {
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
@@ -1386,7 +1456,6 @@ export class ChatServer2 {
     return true;
   }
 
-  // FIX #1: getMemoryStats tidak lagi pakai process.memoryUsage()
   async getMemoryStats() {
     let activeReal = 0;
     for (const c of this._activeClients) if (c?.readyState === 1) activeReal++;
@@ -1403,7 +1472,6 @@ export class ChatServer2 {
     return {
       timestamp: Date.now(),
       uptime: Date.now() - this._startTime,
-      // CF Workers tidak expose memory — gunakan connection metrics sebagai proxy
       memory: {
         note: "process.memoryUsage() not available in Cloudflare Workers",
         activeConnections: activeReal,
@@ -1416,7 +1484,8 @@ export class ChatServer2 {
       chatBuffer: this.chatBuffer.getStats(),
       pmBuffer: this.pmBuffer.getStats(),
       seats: totalSeats,
-      points: totalPoints
+      points: totalPoints,
+      pendingDisconnects: this.pendingDisconnects.size
     };
   }
 
@@ -1424,6 +1493,17 @@ export class ChatServer2 {
     if (this._isClosing) return;
     this._isClosing = true;
     if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
+    
+    // Bersihkan semua pending disconnect
+    for (const [userId, pending] of this.pendingDisconnects) {
+      clearTimeout(pending.timeout);
+      if (pending.ws) {
+        pending.ws._isForceCleanup = true;
+        await this._forceFullCleanupWebSocket(pending.ws, false);
+      }
+    }
+    this.pendingDisconnects.clear();
+    
     await this.chatBuffer.flushAll();
     await this.chatBuffer.destroy();
     await this.pmBuffer.destroy();
@@ -1459,12 +1539,12 @@ export class ChatServer2 {
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeCount,
-            // FIX #1: Hapus memoryMB, ganti ke connection pressure
             connectionPressure: `${Math.round((activeCount / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
             chatBuffer: this.chatBuffer.getStats(),
             pmBuffer: this.pmBuffer.getStats(),
+            pendingDisconnects: this.pendingDisconnects.size
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/debug/memory") {
@@ -1507,7 +1587,6 @@ export class ChatServer2 {
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
 
-      // FIX #3: Hapus this.clients.add(ws) dan this._clientWebSockets.add(client) (dead code)
       this._activeClients.add(ws);
 
       const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
