@@ -1,15 +1,5 @@
 // ==================== CHAT SERVER - FULLY FIXED VERSION ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
-// Fixes:
-//   1. Hapus process.memoryUsage() - tidak ada di CF Workers
-//   2. Race condition pada join room → pakai room-level lock
-//   3. Dead code: Set `clients` & `_clientWebSockets` dihapus
-//   4. roomClients pakai Set bukan Array (O(1) add/remove)
-//   5. _processRetryQueue bug re-add diperbaiki
-//   6. Cek readyState setelah delay 1s di handleJoinRoom
-//   7. Return value broadcastToRoom untuk "chat" diperbaiki
-//   8. Grace period 5 detik untuk reconnect
-//   9. Handle reconnect ketika baru = false
 
 let LowCardGameManager;
 try {
@@ -463,7 +453,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer (Durable Object)
 // ─────────────────────────────────────────────
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -472,8 +462,8 @@ export class ChatServer2 {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
-    // GRACE PERIOD
-    this.disconnectGracePeriod = 10000;
+    // GRACE PERIOD - 30 DETIK
+    this.disconnectGracePeriod = 30000;
     this.pendingDisconnects = new Map();
 
     this.seatLocker = new AsyncLock(2000);
@@ -525,6 +515,8 @@ export class ChatServer2 {
     this._masterTickCounter = 0;
     this._masterTimer = null;
     this._startMasterTimer();
+    
+    console.log("🚀 ChatServer initialized with grace period 30s");
   }
 
   _startMasterTimer() {
@@ -677,6 +669,8 @@ export class ChatServer2 {
   }
 
   async _forceFullCleanupWebSocket(ws, isGraceful = true) {
+    console.log(`🧹 _forceFullCleanupWebSocket called, isGraceful=${isGraceful}, userId=${ws?.idtarget}`);
+    
     if (!ws || this._cleaningUp.has(ws)) return;
     
     let userId = ws.idtarget;
@@ -688,10 +682,13 @@ export class ChatServer2 {
     }
     
     if (!userId) {
+      console.log(`❌ Cannot cleanup: no userId for ws`);
       this._activeClients.delete(ws);
       try { if (ws.readyState === 1) ws.close(); } catch(e) {}
       return;
     }
+    
+    console.log(`🧹 Cleanup for userId=${userId}, room=${room}, seat=${seatInfo?.seat}, isGraceful=${isGraceful}`);
     
     if (isGraceful && userId && room && seatInfo && !ws._isForceCleanup) {
       const existing = this.pendingDisconnects.get(userId);
@@ -702,7 +699,10 @@ export class ChatServer2 {
       
       ws._isPendingDisconnect = true;
       
+      console.log(`⏳ Creating GRACE PERIOD for ${userId}, seat ${seatInfo.seat} in ${room}, duration=${this.disconnectGracePeriod}ms`);
+      
       const timeout = setTimeout(async () => {
+        console.log(`⏰ Grace period EXPIRED for ${userId}, cleaning up now`);
         const pending = this.pendingDisconnects.get(userId);
         if (pending) {
           if (pending.ws && pending.ws._isPendingDisconnect) {
@@ -720,8 +720,12 @@ export class ChatServer2 {
         room: room,
         userId: userId
       });
+      
+      console.log(`✅ Grace period STARTED for ${userId}, pendingDisconnects size: ${this.pendingDisconnects.size}`);
       return;
     }
+    
+    console.log(`💀 Direct cleanup (no grace) for ${userId}`);
     
     this._cleaningUp.add(ws);
     try {
@@ -751,11 +755,16 @@ export class ChatServer2 {
   }
 
   async _reconnectInGracePeriod(userId, newWs) {
-    let pending = this.pendingDisconnects.get(userId);
+    console.log(`🟢 RECONNECT ATTEMPT for ${userId}`);
+    console.log(`📊 Current pendingDisconnects: ${JSON.stringify([...this.pendingDisconnects.keys()])}`);
+    
+    const pending = this.pendingDisconnects.get(userId);
     
     if (!pending) {
+      console.log(`❌ No pending for ${userId}, checking seat...`);
       const seatInfo = this.userToSeat.get(userId);
       if (seatInfo) {
+        console.log(`✅ Found seat ${seatInfo.seat} in ${seatInfo.room}, creating manual pending`);
         pending = {
           seat: seatInfo.seat,
           room: seatInfo.room,
@@ -765,8 +774,11 @@ export class ChatServer2 {
         };
         this.pendingDisconnects.set(userId, pending);
       } else {
+        console.log(`❌ No seat found for ${userId}`);
         return false;
       }
+    } else {
+      console.log(`✅ Pending FOUND for ${userId}: seat=${pending.seat}, room=${pending.room}`);
     }
     
     this.pendingDisconnects.delete(userId);
@@ -777,6 +789,7 @@ export class ChatServer2 {
     const oldWs = pending.ws;
     
     if (oldWs) {
+      console.log(`🧹 Cleaning old WebSocket for ${userId}`);
       oldWs._isForceCleanup = true;
       oldWs._isClosing = true;
       this._activeClients.delete(oldWs);
@@ -791,13 +804,22 @@ export class ChatServer2 {
     }
     
     const roomManager = this.roomManagers.get(room);
-    if (!roomManager) return false;
+    if (!roomManager) {
+      console.log(`❌ RoomManager not found for ${room}`);
+      return false;
+    }
     
     const seatData = roomManager.getSeat(seatNumber);
-    if (!seatData || seatData.namauser !== userId) return false;
+    if (!seatData || seatData.namauser !== userId) {
+      console.log(`❌ Seat ${seatNumber} not owned by ${userId}, owner=${seatData?.namauser}`);
+      return false;
+    }
+    
+    console.log(`✅ Seat verified, seat=${seatNumber}, room=${room}, owner=${seatData.namauser}`);
     
     newWs.roomname = room;
     newWs.idtarget = userId;
+    newWs._userId = userId;
     newWs._isClosing = false;
     newWs._connectionTime = Date.now();
     
@@ -818,6 +840,8 @@ export class ChatServer2 {
     
     this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
     this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
+    
+    console.log(`✅ RECONNECT SUCCESS for ${userId} to seat ${seatNumber} in ${room}`);
     
     return true;
   }
@@ -1216,94 +1240,98 @@ export class ChatServer2 {
   }
 
   async handleSetIdTarget2(ws, id, baru) {
-  if (!id || !ws) return;
-  
-  // RECONNECT (baru = false)
-  if (baru === false) {
-    console.log(`🔄 Reconnect detected for ${id}`);
+    if (!id || !ws) return;
     
-    try {
-      const reconnected = await this._reconnectInGracePeriod(id, ws);
-      console.log(`🔍 _reconnectInGracePeriod returned: ${reconnected}`);
+    // SET _userId SEBELUM APAPUN
+    ws._userId = id;
+    ws.idtarget = id;
+    
+    // JIKA baru === false, INI ADALAH RECONNECT
+    if (baru === false) {
+      console.log(`🔄 Reconnect detected for ${id}`);
       
-      if (reconnected) {
-        console.log(`✅ Reconnect success for ${id}, returning early`);
-        return;
-      }
-    } catch (error) {
-      console.log(`❌ Error in _reconnectInGracePeriod: ${error.message}`);
-    }
-    
-    // ⭐ JIKA RECONNECT GAGAL, TETAP KELUAR (JANGAN LANJUT KE NEEDJOINROOM)
-    console.log(`⚠️ Reconnect failed for ${id}, but returning to prevent auto-join`);
-    await this.safeSend(ws, ["reconnectFailed", "Connection lost, please refresh"]);
-    return;
-  }
-  
-  // =========================================================
-  // KONEKSI BARU (baru = true)
-  // =========================================================
-  try {
-    const existingConnections = this.userConnections.get(id);
-    if (existingConnections && existingConnections.size > 0) {
-      for (const oldWs of existingConnections) {
-        if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
-          try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
-          await this._forceFullCleanupWebSocket(oldWs);
+      try {
+        const reconnected = await this._reconnectInGracePeriod(id, ws);
+        console.log(`🔍 _reconnectInGracePeriod returned: ${reconnected}`);
+        
+        if (reconnected) {
+          console.log(`✅ Reconnect success for ${id}, returning early`);
+          return;
         }
+      } catch (error) {
+        console.log(`❌ Error in _reconnectInGracePeriod: ${error.message}`);
       }
-    }
-
-    if (baru === true) {
-      ws.idtarget = id;
-      ws.roomname = undefined;
-      ws._isClosing = false;
-      ws._connectionTime = Date.now();
-      await this._addUserConnection(id, ws);
-      this._activeClients.add(ws);
-      await this.safeSend(ws, ["joinroomawal"]);
+      
+      // JIKA RECONNECT GAGAL, TETAP KELUAR (JANGAN LANJUT KE NEEDJOINROOM)
+      console.log(`⚠️ Reconnect failed for ${id}, but returning to prevent auto-join`);
+      await this.safeSend(ws, ["reconnectFailed", "Connection lost, please refresh"]);
       return;
     }
-
-    // SITUASI LAIN (seharusnya tidak sampai sini untuk reconnect)
-    ws.idtarget = id;
-    ws._isClosing = false;
-    ws._connectionTime = Date.now();
-    this._activeClients.add(ws);
-
-    const seatInfo = this.userToSeat.get(id);
-    if (seatInfo) {
-      const { room, seat } = seatInfo;
-      if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
-        const roomManager = this.roomManagers.get(room);
-        if (roomManager) {
-          const seatData = roomManager.getSeat(seat);
-          if (seatData && seatData.namauser === id) {
-            ws.roomname = room;
-            this._addToRoomClients(ws, room);
-            await this._addUserConnection(id, ws);
-            await this.sendAllStateTo(ws, room);
-            const point = roomManager.getPoint(seat);
-            if (point) {
-              await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
-            }
-            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-            await this.safeSend(ws, ["numberKursiSaya", seat]);
-            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-            return;
+    
+    // =========================================================
+    // KONEKSI BARU (baru = true)
+    // =========================================================
+    try {
+      const existingConnections = this.userConnections.get(id);
+      if (existingConnections && existingConnections.size > 0) {
+        for (const oldWs of existingConnections) {
+          if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
+            try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
+            await this._forceFullCleanupWebSocket(oldWs);
           }
         }
       }
-      this.userToSeat.delete(id);
-      this.userCurrentRoom.delete(id);
+
+      if (baru === true) {
+        ws.idtarget = id;
+        ws.roomname = undefined;
+        ws._isClosing = false;
+        ws._connectionTime = Date.now();
+        await this._addUserConnection(id, ws);
+        this._activeClients.add(ws);
+        await this.safeSend(ws, ["joinroomawal"]);
+        return;
+      }
+
+      ws.idtarget = id;
+      ws._isClosing = false;
+      ws._connectionTime = Date.now();
+      this._activeClients.add(ws);
+
+      const seatInfo = this.userToSeat.get(id);
+      if (seatInfo) {
+        const { room, seat } = seatInfo;
+        if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
+          const roomManager = this.roomManagers.get(room);
+          if (roomManager) {
+            const seatData = roomManager.getSeat(seat);
+            if (seatData && seatData.namauser === id) {
+              ws.roomname = room;
+              this._addToRoomClients(ws, room);
+              await this._addUserConnection(id, ws);
+              await this.sendAllStateTo(ws, room);
+              const point = roomManager.getPoint(seat);
+              if (point) {
+                await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
+              }
+              await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+              await this.safeSend(ws, ["numberKursiSaya", seat]);
+              await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+              return;
+            }
+          }
+        }
+        this.userToSeat.delete(id);
+        this.userCurrentRoom.delete(id);
+      }
+      await this._addUserConnection(id, ws);
+      await this.safeSend(ws, ["needJoinRoom"]);
+    } catch (error) {
+      console.error(`Error in handleSetIdTarget2:`, error);
+      await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
-    await this._addUserConnection(id, ws);
-    await this.safeSend(ws, ["needJoinRoom"]);
-  } catch (error) {
-    console.error(`Error in handleSetIdTarget2:`, error);
-    await this.safeSend(ws, ["error", "Reconnection failed"]);
   }
-}
+
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
     let messageStr = raw;
@@ -1615,6 +1643,7 @@ export class ChatServer2 {
       const ws = server;
       ws.roomname = undefined;
       ws.idtarget = undefined;
+      ws._userId = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
@@ -1622,8 +1651,14 @@ export class ChatServer2 {
       this._activeClients.add(ws);
 
       const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
-      const errorHandler = () => { this._forceFullCleanupWebSocket(ws, true).catch(() => {}); };
-      const closeHandler = () => { this._forceFullCleanupWebSocket(ws, true).catch(() => {}); };
+      const errorHandler = () => { 
+        console.log(`⚠️ WebSocket error for user: ${ws._userId || ws.idtarget}`);
+        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
+      };
+      const closeHandler = () => { 
+        console.log(`🔌 WebSocket closed for user: ${ws._userId || ws.idtarget}`);
+        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
+      };
 
       ws.addEventListener("message", messageHandler, { signal: abortController.signal });
       ws.addEventListener("error", errorHandler, { signal: abortController.signal });
@@ -1645,8 +1680,8 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER_2.get(chatId);
+      const chatId = env.CHAT_SERVER.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
       if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
