@@ -1,5 +1,15 @@
-// ==================== CHAT SERVER - FULLY FIXED VERSION WITH GRACE PERIOD ====================
+// ==================== CHAT SERVER - FULLY FIXED VERSION ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
+// Fixes:
+//   1. Hapus process.memoryUsage() - tidak ada di CF Workers
+//   2. Race condition pada join room → pakai room-level lock
+//   3. Dead code: Set `clients` & `_clientWebSockets` dihapus
+//   4. roomClients pakai Set bukan Array (O(1) add/remove)
+//   5. _processRetryQueue bug re-add diperbaiki
+//   6. Cek readyState setelah delay 1s di handleJoinRoom
+//   7. Return value broadcastToRoom untuk "chat" diperbaiki
+//   8. Grace period 5 detik untuk reconnect
+//   9. Handle reconnect ketika baru = false
 
 let LowCardGameManager;
 try {
@@ -20,7 +30,7 @@ const CONSTANTS = Object.freeze({
 
   MAX_GLOBAL_CONNECTIONS: 250,
   MAX_ACTIVE_CLIENTS_LIMIT: 250,
-  MAX_SEATS: 35,
+  MAX_SEATS: 25,
   MAX_NUMBER: 6,
 
   MAX_MESSAGE_SIZE: 5000,
@@ -38,9 +48,10 @@ const CONSTANTS = Object.freeze({
   PM_BATCH_SIZE: 5,
   PM_BATCH_DELAY_MS: 30,
 
-  WS_ACCEPT_TIMEOUT_MS: 10000,
+  WS_ACCEPT_TIMEOUT_MS: 5000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
 
+  // FIX #1: Ganti memory threshold ke connection-count-based
   CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
   CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
   FORCE_CLEANUP_MEMORY_TICKS: 30,
@@ -453,7 +464,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer (Durable Object)
 // ─────────────────────────────────────────────
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -462,6 +473,7 @@ export class ChatServer2 {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
+    // ⭐ TAMBAHAN GRACE PERIOD
     this.disconnectGracePeriod = 5000;
     this.pendingDisconnects = new Map();
 
@@ -514,8 +526,6 @@ export class ChatServer2 {
     this._masterTickCounter = 0;
     this._masterTimer = null;
     this._startMasterTimer();
-    
-    console.log("🚀 ChatServer2 initialized");
   }
 
   _startMasterTimer() {
@@ -566,10 +576,6 @@ export class ChatServer2 {
 
     for (const ws of Array.from(this._activeClients)) {
       if (ws && ws.readyState !== 1) {
-        const userId = ws._userId || ws.idtarget;
-        if (userId && this.pendingDisconnects.has(userId)) {
-          continue;
-        }
         await this._forceFullCleanupWebSocket(ws);
       }
     }
@@ -626,10 +632,6 @@ export class ChatServer2 {
       }
 
       for (const ws of zombies) {
-        const userId = ws._userId || ws.idtarget;
-        if (userId && this.pendingDisconnects.has(userId)) {
-          continue;
-        }
         await this._forceFullCleanupWebSocket(ws);
       }
 
@@ -642,9 +644,7 @@ export class ChatServer2 {
             break;
           }
         }
-        if (!hasLiveConnection && !this.pendingDisconnects.has(userId)) {
-          orphanedUsers.push(userId);
-        }
+        if (!hasLiveConnection) orphanedUsers.push(userId);
       }
 
       for (const userId of orphanedUsers) {
@@ -677,10 +677,11 @@ export class ChatServer2 {
     }
   }
 
+  // ⭐ METHOD _forceFullCleanupWebSocket YANG SUDAH DITAMBAH GRACE PERIOD
   async _forceFullCleanupWebSocket(ws, isGraceful = true) {
     if (!ws || this._cleaningUp.has(ws)) return;
     
-    let userId = ws._userId || ws.idtarget;
+    let userId = ws.idtarget;
     const room = ws.roomname;
     const seatInfo = userId ? this.userToSeat.get(userId) : null;
     
@@ -689,7 +690,6 @@ export class ChatServer2 {
     }
     
     if (!userId) {
-      console.log(`❌ Cannot cleanup: no userId for ws`);
       this._activeClients.delete(ws);
       try { if (ws.readyState === 1) ws.close(); } catch(e) {}
       return;
@@ -722,33 +722,25 @@ export class ChatServer2 {
         room: room,
         userId: userId
       });
-      
-      console.log(`⏳ Grace period started for ${userId}, seat ${seatInfo.seat} in ${room}`);
       return;
     }
     
     this._cleaningUp.add(ws);
-    
     try {
       ws._isClosing = true;
-      
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
-      
       if (userId) {
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         await this._removeUserConnection(userId, ws);
       }
-      
       if (room) {
         this._removeFromRoomClients(ws, room);
       }
-      
       this._cleanupWebSocketListeners(ws);
       this._activeClients.delete(ws);
-      
       if (ws.readyState === 1) {
         try { ws.close(1000, "Cleanup completed"); } catch (e) {}
       }
@@ -760,96 +752,78 @@ export class ChatServer2 {
     }
   }
 
+  // ⭐ METHOD BARU UNTUK RECONNECT
   async _reconnectInGracePeriod(userId, newWs) {
-  console.log(`🟢 RECONNECT ATTEMPT for ${userId}`);
-  
-  let pending = this.pendingDisconnects.get(userId);
-  
-  // JIKA TIDAK ADA PENDING, COBA BUAT MANUAL
-  if (!pending) {
-    console.log(`⚠️ No pending for ${userId}, checking seat...`);
-    const seatInfo = this.userToSeat.get(userId);
-    if (seatInfo) {
-      console.log(`✅ Found seat ${seatInfo.seat} in ${seatInfo.room}, creating manual pending`);
-      pending = {
-        seat: seatInfo.seat,
-        room: seatInfo.room,
-        ws: null,
-        userId: userId,
-        timeout: null
-      };
-      this.pendingDisconnects.set(userId, pending);
-    } else {
-      console.log(`❌ No seat found for ${userId}`);
-      return false;
+    let pending = this.pendingDisconnects.get(userId);
+    
+    if (!pending) {
+      const seatInfo = this.userToSeat.get(userId);
+      if (seatInfo) {
+        pending = {
+          seat: seatInfo.seat,
+          room: seatInfo.room,
+          ws: null,
+          userId: userId,
+          timeout: null
+        };
+        this.pendingDisconnects.set(userId, pending);
+      } else {
+        return false;
+      }
     }
-  }
-  
-  console.log(`✅ Pending found/created: seat=${pending.seat}, room=${pending.room}`);
-  
-  this.pendingDisconnects.delete(userId);
-  if (pending.timeout) clearTimeout(pending.timeout);
-  
-  const seatNumber = pending.seat;
-  const room = pending.room;
-  const oldWs = pending.ws;
-  
-  if (oldWs) {
-    oldWs._isForceCleanup = true;
-    oldWs._isClosing = true;
-    this._activeClients.delete(oldWs);
-    if (oldWs.roomname) this._removeFromRoomClients(oldWs, oldWs.roomname);
-    const userConns = this.userConnections.get(userId);
-    if (userConns) {
-      userConns.delete(oldWs);
-      if (userConns.size === 0) this.userConnections.delete(userId);
+    
+    this.pendingDisconnects.delete(userId);
+    if (pending.timeout) clearTimeout(pending.timeout);
+    
+    const seatNumber = pending.seat;
+    const room = pending.room;
+    const oldWs = pending.ws;
+    
+    if (oldWs) {
+      oldWs._isForceCleanup = true;
+      oldWs._isClosing = true;
+      this._activeClients.delete(oldWs);
+      if (oldWs.roomname) this._removeFromRoomClients(oldWs, oldWs.roomname);
+      const userConns = this.userConnections.get(userId);
+      if (userConns) {
+        userConns.delete(oldWs);
+        if (userConns.size === 0) this.userConnections.delete(userId);
+      }
+      this._activeListeners.delete(oldWs);
+      try { if (oldWs.readyState === 1) oldWs.close(1000, "Replaced"); } catch (e) {}
     }
-    this._activeListeners.delete(oldWs);
-    try { if (oldWs.readyState === 1) oldWs.close(1000, "Replaced"); } catch (e) {}
+    
+    const roomManager = this.roomManagers.get(room);
+    if (!roomManager) return false;
+    
+    const seatData = roomManager.getSeat(seatNumber);
+    if (!seatData || seatData.namauser !== userId) return false;
+    
+    newWs.roomname = room;
+    newWs.idtarget = userId;
+    newWs._isClosing = false;
+    newWs._connectionTime = Date.now();
+    
+    this._addToRoomClients(newWs, room);
+    this._activeClients.add(newWs);
+    await this._addUserConnection(userId, newWs);
+    
+    this.userToSeat.set(userId, { room, seat: seatNumber });
+    this.userCurrentRoom.set(userId, room);
+    
+    await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
+    await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
+    await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
+    await this.safeSend(newWs, ["muteTypeResponse", roomManager.getMute(), room]);
+    await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
+    await this.sendAllStateTo(newWs, room, false);
+    await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
+    
+    this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
+    this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
+    
+    return true;
   }
-  
-  const roomManager = this.roomManagers.get(room);
-  if (!roomManager) {
-    console.log(`❌ RoomManager not found for ${room}`);
-    return false;
-  }
-  
-  const seatData = roomManager.getSeat(seatNumber);
-  if (!seatData || seatData.namauser !== userId) {
-    console.log(`❌ Seat ${seatNumber} not owned by ${userId}`);
-    return false;
-  }
-  
-  console.log(`✅ Seat verified, proceeding with reconnect`);
-  
-  newWs.roomname = room;
-  newWs.idtarget = userId;
-  newWs._userId = userId;
-  newWs._isClosing = false;
-  newWs._connectionTime = Date.now();
-  
-  this._addToRoomClients(newWs, room);
-  this._activeClients.add(newWs);
-  await this._addUserConnection(userId, newWs);
-  
-  this.userToSeat.set(userId, { room, seat: seatNumber });
-  this.userCurrentRoom.set(userId, room);
-  
-  await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
-  await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
-  await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
-  await this.safeSend(newWs, ["muteTypeResponse", roomManager.getMute(), room]);
-  await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
-  await this.sendAllStateTo(newWs, room, false);
-  await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
-  
-  this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
-  this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
-  
-  console.log(`✅ RECONNECT SUCCESS for ${userId} to seat ${seatNumber} in ${room}`);
-  
-  return true;
-}
 
   async _removeUserSeatAndPointFromRoom(userId, room) {
     const seatInfo = this.userToSeat.get(userId);
@@ -1127,7 +1101,7 @@ export class ChatServer2 {
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
       const allKursiMeta = roomManager.getAllSeatsMeta();
       const lastPointsData = roomManager.getAllPoints();
-      const seatInfo = this.userToSeat.get(ws._userId || ws.idtarget);
+      const seatInfo = this.userToSeat.get(ws.idtarget);
       const selfSeat = seatInfo?.room === room ? seatInfo.seat : null;
       let filteredMeta = allKursiMeta;
       if (excludeSelfSeat && selfSeat) {
@@ -1142,15 +1116,13 @@ export class ChatServer2 {
   }
 
   async handleJoinRoom(ws, room) {
-    const userId = ws._userId || ws.idtarget;
-    if (!userId) { await this.safeSend(ws, ["error", "User ID not set"]); return false; }
+    if (!ws?.idtarget) { await this.safeSend(ws, ["error", "User ID not set"]); return false; }
     if (!roomList.includes(room)) { await this.safeSend(ws, ["error", "Invalid room"]); return false; }
     return this._handleJoinRoomInternal(ws, room);
   }
 
   async _handleJoinRoomInternal(ws, room) {
-    const userId = ws._userId || ws.idtarget;
-    const release = await this.roomLocker.acquire(`joinroom_${room}_${userId}`);
+    const release = await this.roomLocker.acquire(`joinroom_${room}_${ws.idtarget}`);
     try {
       return await this._doJoinRoom(ws, room);
     } finally {
@@ -1159,20 +1131,19 @@ export class ChatServer2 {
   }
 
   async _doJoinRoom(ws, room) {
-    const userId = ws._userId || ws.idtarget;
     try {
-      const existingSeatInfo = this.userToSeat.get(userId);
-      const currentRoomBeforeJoin = this.userCurrentRoom.get(userId);
+      const existingSeatInfo = this.userToSeat.get(ws.idtarget);
+      const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
 
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const roomManager = this.roomManagers.get(room);
         const seatData = roomManager.getSeat(seatNum);
-        if (seatData && seatData.namauser === userId) {
+        if (seatData && seatData.namauser === ws.idtarget) {
           ws.roomname = room;
           this._addToRoomClients(ws, room);
-          await this._addUserConnection(userId, ws);
-          this.userCurrentRoom.set(userId, room);
+          await this._addUserConnection(ws.idtarget, ws);
+          this.userCurrentRoom.set(ws.idtarget, room);
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
@@ -1184,20 +1155,20 @@ export class ChatServer2 {
           await this.sendAllStateTo(ws, room);
           return true;
         } else {
-          this.userToSeat.delete(userId);
+          this.userToSeat.delete(ws.idtarget);
         }
       }
 
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
-        const oldSeatInfo = this.userToSeat.get(userId);
+        const oldSeatInfo = this.userToSeat.get(ws.idtarget);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-          await this.safeRemoveSeat(currentRoomBeforeJoin, oldSeatInfo.seat, userId);
+          await this.safeRemoveSeat(currentRoomBeforeJoin, oldSeatInfo.seat, ws.idtarget);
           this.broadcastToRoom(currentRoomBeforeJoin, ["removeKursi", currentRoomBeforeJoin, oldSeatInfo.seat]);
           this.broadcastToRoom(currentRoomBeforeJoin, ["pointRemoved", currentRoomBeforeJoin, oldSeatInfo.seat]);
         }
         this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-        this.userToSeat.delete(userId);
-        this.userCurrentRoom.delete(userId);
+        this.userToSeat.delete(ws.idtarget);
+        this.userCurrentRoom.delete(ws.idtarget);
       }
 
       if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
@@ -1205,14 +1176,14 @@ export class ChatServer2 {
         return false;
       }
 
-      const assignedSeat = await this.assignNewSeat(room, userId);
+      const assignedSeat = await this.assignNewSeat(room, ws.idtarget);
       if (!assignedSeat) { await this.safeSend(ws, ["roomFull", room]); return false; }
 
-      this.userToSeat.set(userId, { room, seat: assignedSeat });
-      this.userCurrentRoom.set(userId, room);
+      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+      this.userCurrentRoom.set(ws.idtarget, room);
       ws.roomname = room;
       this._addToRoomClients(ws, room);
-      await this._addUserConnection(userId, ws);
+      await this._addUserConnection(ws.idtarget, ws);
 
       const roomManager = this.roomManagers.get(room);
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
@@ -1232,124 +1203,93 @@ export class ChatServer2 {
   }
 
   async cleanupFromRoom(ws, room) {
-    const userId = ws._userId || ws.idtarget;
-    if (!userId || !ws.roomname) return;
+    if (!ws?.idtarget || !ws.roomname) return;
     try {
-      const seatInfo = this.userToSeat.get(userId);
+      const seatInfo = this.userToSeat.get(ws.idtarget);
       if (seatInfo && seatInfo.room === room) {
-        await this.safeRemoveSeat(room, seatInfo.seat, userId);
+        await this.safeRemoveSeat(room, seatInfo.seat, ws.idtarget);
         this.broadcastToRoom(room, ["removeKursi", room, seatInfo.seat]);
         this.broadcastToRoom(room, ["pointRemoved", room, seatInfo.seat]);
       }
       this._removeFromRoomClients(ws, room);
-      await this._removeUserConnection(userId, ws);
+      await this._removeUserConnection(ws.idtarget, ws);
       ws.roomname = undefined;
       this.updateRoomCount(room);
     } catch (error) {}
   }
 
+  // ⭐ METHOD handleSetIdTarget2 YANG SUDAH DITAMBAH CEK baru === false
   async handleSetIdTarget2(ws, id, baru) {
-  console.log(`🔵 handleSetIdTarget2 called for ${id}, baru=${baru}`);
-  
-  if (!id || !ws) return;
-  
-  ws._userId = id;
-  
-  console.log(`🔵 About to call _reconnectInGracePeriod for ${id}`);
-  
-  // ⭐ TRY-CATCH UNTUK TANGKAP ERROR
-  let reconnected = false;
-  try {
-    reconnected = await this._reconnectInGracePeriod(id, ws);
-    console.log(`🔵 _reconnectInGracePeriod returned: ${reconnected}`);
-  } catch (error) {
-    console.log(`🔵 ERROR in _reconnectInGracePeriod: ${error.message}`);
-    console.log(`🔵 Stack: ${error.stack}`);
-    reconnected = false;
-  }
-  
-  if (reconnected) {
-    console.log(`✅ Reconnect success for ${id}, returning early`);
-    return;
-  }
-  
-  console.log(`🔵 No grace period, continuing normal flow for ${id}`);
-  
-  try {
-    const existingConnections = this.userConnections.get(id);
-    if (existingConnections && existingConnections.size > 0) {
-      for (const oldWs of existingConnections) {
-        if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
-          try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
-          await this._forceFullCleanupWebSocket(oldWs);
-        }
+    if (!id || !ws) return;
+    
+    // JIKA baru === false, INI ADALAH RECONNECT!
+    if (baru === false) {
+      const reconnected = await this._reconnectInGracePeriod(id, ws);
+      if (reconnected) {
+        return;
       }
     }
-
-    if (baru === true) {
-      ws.idtarget = id;
-      ws.roomname = undefined;
-      ws._isClosing = false;
-      ws._connectionTime = Date.now();
-      await this._addUserConnection(id, ws);
-      this._activeClients.add(ws);
-      await this.safeSend(ws, ["joinroomawal"]);
-      return;
-    }
-
-    ws.idtarget = id;
-    ws._isClosing = false;
-    ws._connectionTime = Date.now();
-    this._activeClients.add(ws);
-
-    const seatInfo = this.userToSeat.get(id);
-    if (seatInfo) {
-      const { room, seat } = seatInfo;
-      if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
-        const roomManager = this.roomManagers.get(room);
-        if (roomManager) {
-          const seatData = roomManager.getSeat(seat);
-          if (seatData && seatData.namauser === id) {
-            ws.roomname = room;
-            this._addToRoomClients(ws, room);
-            await this._addUserConnection(id, ws);
-            await this.sendAllStateTo(ws, room);
-            const point = roomManager.getPoint(seat);
-            if (point) await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
-            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-            await this.safeSend(ws, ["numberKursiSaya", seat]);
-            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-            return;
+    
+    try {
+      const existingConnections = this.userConnections.get(id);
+      if (existingConnections && existingConnections.size > 0) {
+        for (const oldWs of existingConnections) {
+          if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
+            try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
+            await this._forceFullCleanupWebSocket(oldWs);
           }
         }
       }
-      this.userToSeat.delete(id);
-      this.userCurrentRoom.delete(id);
+
+      if (baru === true) {
+        ws.idtarget = id;
+        ws.roomname = undefined;
+        ws._isClosing = false;
+        ws._connectionTime = Date.now();
+        await this._addUserConnection(id, ws);
+        this._activeClients.add(ws);
+        await this.safeSend(ws, ["joinroomawal"]);
+        return;
+      }
+
+      ws.idtarget = id;
+      ws._isClosing = false;
+      ws._connectionTime = Date.now();
+      this._activeClients.add(ws);
+
+      const seatInfo = this.userToSeat.get(id);
+      if (seatInfo) {
+        const { room, seat } = seatInfo;
+        if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
+          const roomManager = this.roomManagers.get(room);
+          if (roomManager) {
+            const seatData = roomManager.getSeat(seat);
+            if (seatData && seatData.namauser === id) {
+              ws.roomname = room;
+              this._addToRoomClients(ws, room);
+              await this._addUserConnection(id, ws);
+              await this.sendAllStateTo(ws, room);
+              const point = roomManager.getPoint(seat);
+              if (point) await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
+              await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+              await this.safeSend(ws, ["numberKursiSaya", seat]);
+              await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+              return;
+            }
+          }
+        }
+        this.userToSeat.delete(id);
+        this.userCurrentRoom.delete(id);
+      }
+      await this._addUserConnection(id, ws);
+      await this.safeSend(ws, ["needJoinRoom"]);
+    } catch (error) {
+      await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
-    await this._addUserConnection(id, ws);
-    await this.safeSend(ws, ["needJoinRoom"]);
-  } catch (error) {
-    console.log(`❌ Error in handleSetIdTarget2: ${error.message}`);
-    await this.safeSend(ws, ["error", "Reconnection failed"]);
   }
-}
+
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
-    
-    // ⭐ SET _userId DARI PESAN PERTAMA KALAU BELUM ADA
-    if (!ws._userId && !ws.idtarget) {
-      try {
-        let messageStr = raw;
-        if (raw instanceof ArrayBuffer) messageStr = new TextDecoder().decode(raw);
-        let data = JSON.parse(messageStr);
-        if (data && data[0] === "setIdTarget2" && data[1]) {
-          ws._userId = data[1];
-          ws.idtarget = data[1];
-          console.log(`✅ Set _userId from first message: ${ws._userId}`);
-        }
-      } catch(e) {}
-    }
-    
     let messageStr = raw;
     if (raw instanceof ArrayBuffer) try { messageStr = new TextDecoder().decode(raw); } catch (e) { return; }
     if (messageStr.length > CONSTANTS.MAX_MESSAGE_SIZE) return;
@@ -1360,11 +1300,10 @@ export class ChatServer2 {
   }
 
   async _processMessage(ws, data, evt) {
-    const userId = ws._userId || ws.idtarget;
     try {
       switch (evt) {
         case "isInRoom":
-          await this.safeSend(ws, ["inRoomStatus", this.userCurrentRoom.get(userId) !== undefined]);
+          await this.safeSend(ws, ["inRoomStatus", this.userCurrentRoom.get(ws.idtarget) !== undefined]);
           break;
         case "setIdTarget2":
           await this.handleSetIdTarget2(ws, data[1], data[2]);
@@ -1384,7 +1323,7 @@ export class ChatServer2 {
         }
         case "chat": {
           const [, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
-          if (ws.roomname !== roomname || userId !== username) return;
+          if (ws.roomname !== roomname || ws.idtarget !== username) return;
           if (!roomList.includes(roomname)) return;
           const sanitizedMessage = message?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "";
           if (sanitizedMessage.includes('\0')) return;
@@ -1394,7 +1333,7 @@ export class ChatServer2 {
         case "updatePoint": {
           const [, room, seat, x, y, fast] = data;
           if (ws.roomname !== room || !roomList.includes(room) || seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
-          if (this.updatePointDirect(room, seat, { x: parseFloat(x), y: parseFloat(y), fast: fast === 1 || fast === true }, userId)) {
+          if (this.updatePointDirect(room, seat, { x: parseFloat(x), y: parseFloat(y), fast: fast === 1 || fast === true }, ws.idtarget)) {
             this.broadcastToRoom(room, ["pointUpdated", room, seat, x, y, fast]);
           }
           break;
@@ -1402,7 +1341,7 @@ export class ChatServer2 {
         case "removeKursiAndPoint": {
           const [, room, seat] = data;
           if (seat < 1 || seat > CONSTANTS.MAX_SEATS || ws.roomname !== room || !roomList.includes(room)) return;
-          if (await this.safeRemoveSeat(room, seat, userId)) {
+          if (await this.safeRemoveSeat(room, seat, ws.idtarget)) {
             this.broadcastToRoom(room, ["removeKursi", room, seat]);
             this.broadcastToRoom(room, ["pointRemoved", room, seat]);
             this.updateRoomCount(room);
@@ -1412,7 +1351,7 @@ export class ChatServer2 {
         case "updateKursi": {
           const [, room, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
           if (seat < 1 || seat > CONSTANTS.MAX_SEATS || ws.roomname !== room || !roomList.includes(room)) return;
-          if (namauser !== userId) return;
+          if (namauser !== ws.idtarget) return;
           const updatedSeat = {
             noimageUrl: noimageUrl?.slice(0, 255) || "",
             namauser: namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || "",
@@ -1423,7 +1362,7 @@ export class ChatServer2 {
             viptanda: viptanda || 0,
             lastUpdated: Date.now()
           };
-          const success = await this.updateSeatWithLock(room, seat, updatedSeat, userId);
+          const success = await this.updateSeatWithLock(room, seat, updatedSeat, ws.idtarget);
           if (!success) await this.safeSend(ws, ["error", "Failed to update seat"]);
           break;
         }
@@ -1574,8 +1513,7 @@ export class ChatServer2 {
       chatBuffer: this.chatBuffer.getStats(),
       pmBuffer: this.pmBuffer.getStats(),
       seats: totalSeats,
-      points: totalPoints,
-      pendingDisconnects: this.pendingDisconnects.size
+      points: totalPoints
     };
   }
 
@@ -1583,16 +1521,6 @@ export class ChatServer2 {
     if (this._isClosing) return;
     this._isClosing = true;
     if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
-    
-    for (const [userId, pending] of this.pendingDisconnects) {
-      clearTimeout(pending.timeout);
-      if (pending.ws) {
-        pending.ws._isForceCleanup = true;
-        await this._forceFullCleanupWebSocket(pending.ws, false);
-      }
-    }
-    this.pendingDisconnects.clear();
-    
     await this.chatBuffer.flushAll();
     await this.chatBuffer.destroy();
     await this.pmBuffer.destroy();
@@ -1633,7 +1561,6 @@ export class ChatServer2 {
             uptime: Date.now() - this._startTime,
             chatBuffer: this.chatBuffer.getStats(),
             pmBuffer: this.pmBuffer.getStats(),
-            pendingDisconnects: this.pendingDisconnects.size
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/debug/memory") {
@@ -1672,7 +1599,6 @@ export class ChatServer2 {
       const ws = server;
       ws.roomname = undefined;
       ws.idtarget = undefined;
-      ws._userId = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
@@ -1680,14 +1606,8 @@ export class ChatServer2 {
       this._activeClients.add(ws);
 
       const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
-      const errorHandler = () => { 
-        console.log(`⚠️ WebSocket error for user: ${ws._userId || ws.idtarget}`);
-        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
-      };
-      const closeHandler = () => { 
-        console.log(`🔌 WebSocket closed for user: ${ws._userId || ws.idtarget}`);
-        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
-      };
+      const errorHandler = () => { this._forceFullCleanupWebSocket(ws, true).catch(() => {}); };
+      const closeHandler = () => { this._forceFullCleanupWebSocket(ws, true).catch(() => {}); };
 
       ws.addEventListener("message", messageHandler, { signal: abortController.signal });
       ws.addEventListener("error", errorHandler, { signal: abortController.signal });
@@ -1709,8 +1629,8 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER_2.get(chatId);
+      const chatId = env.CHAT_SERVER.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
       if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
