@@ -1070,7 +1070,6 @@ export class ChatServer2 {
           await this._addUserConnection(ws.idtarget, ws);
           this.userCurrentRoom.set(ws.idtarget, room);
           
-          await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
