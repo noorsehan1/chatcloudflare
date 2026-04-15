@@ -1094,7 +1094,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           
           // Delay lebih kecil untuk reconnect cepat
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, 1500));
           
           if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
           
