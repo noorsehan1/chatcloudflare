@@ -51,7 +51,6 @@ const CONSTANTS = Object.freeze({
   WS_ACCEPT_TIMEOUT_MS: 5000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
 
-  // FIX #1: Ganti memory threshold ke connection-count-based
   CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
   CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
   FORCE_CLEANUP_MEMORY_TICKS: 30,
@@ -464,7 +463,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer (Durable Object)
 // ─────────────────────────────────────────────
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -473,7 +472,7 @@ export class ChatServer {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
-    // ⭐ TAMBAHAN GRACE PERIOD
+    // GRACE PERIOD
     this.disconnectGracePeriod = 5000;
     this.pendingDisconnects = new Map();
 
@@ -677,7 +676,6 @@ export class ChatServer {
     }
   }
 
-  // ⭐ METHOD _forceFullCleanupWebSocket YANG SUDAH DITAMBAH GRACE PERIOD
   async _forceFullCleanupWebSocket(ws, isGraceful = true) {
     if (!ws || this._cleaningUp.has(ws)) return;
     
@@ -752,7 +750,6 @@ export class ChatServer {
     }
   }
 
-  // ⭐ METHOD BARU UNTUK RECONNECT
   async _reconnectInGracePeriod(userId, newWs) {
     let pending = this.pendingDisconnects.get(userId);
     
@@ -1218,7 +1215,6 @@ export class ChatServer {
     } catch (error) {}
   }
 
-  // ⭐ METHOD handleSetIdTarget2 YANG SUDAH DITAMBAH CEK baru === false
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
     
@@ -1572,7 +1568,7 @@ export class ChatServer {
           return new Response(JSON.stringify({ counts, total: Object.values(counts).reduce((a, b) => a + b, 0) }), { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/shutdown") { await this.shutdown(); return new Response("Shutting down...", { status: 200 }); }
-        return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200 });
+        return new Response("ChatServer Running - Cloudflare Workers", { status: 200 });
       }
 
       if (this._activeClients.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
@@ -1629,12 +1625,12 @@ export class ChatServer {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER.get(chatId);
+      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER_2.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
       if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
-      return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
+      return new Response("ChatServer Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
     } catch (error) {
       return new Response("Server error", { status: 500 });
     }
