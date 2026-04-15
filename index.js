@@ -749,55 +749,86 @@ export class ChatServer2 {
   }
 
   async _reconnectInGracePeriod(userId, newWs) {
-    const pending = this.pendingDisconnects.get(userId);
-    if (!pending) return false;
+  const pending = this.pendingDisconnects.get(userId);
+  if (!pending) return false;
+  
+  clearTimeout(pending.timeout);
+  this.pendingDisconnects.delete(userId);
+  
+  const seatNumber = pending.seat;
+  const room = pending.room;
+  const oldWs = pending.ws;
+  
+  // ⭐ KRUSIAL: HAPUS OLD WS DARI SEMUA STRUKTUR DATA
+  if (oldWs) {
+    oldWs._isForceCleanup = true;
+    oldWs._isClosing = true;
     
-    clearTimeout(pending.timeout);
-    this.pendingDisconnects.delete(userId);
+    // Hapus dari _activeClients
+    this._activeClients.delete(oldWs);
     
-    const seatNumber = pending.seat;
-    const room = pending.room;
-    const oldWs = pending.ws;
-    
-    if (oldWs) {
-      oldWs._isForceCleanup = true;
-      oldWs._isClosing = true;
+    // Hapus dari roomClients
+    if (oldWs.roomname) {
+      this._removeFromRoomClients(oldWs, oldWs.roomname);
     }
     
-    const roomManager = this.roomManagers.get(room);
-    if (!roomManager) return false;
-    
-    const seatData = roomManager.getSeat(seatNumber);
-    if (!seatData || seatData.namauser !== userId) {
-      return false;
+    // Hapus dari userConnections
+    const userConns = this.userConnections.get(userId);
+    if (userConns) {
+      userConns.delete(oldWs);
+      if (userConns.size === 0) {
+        this.userConnections.delete(userId);
+      }
     }
     
-    newWs.roomname = room;
-    newWs.idtarget = userId;
-    newWs._isClosing = false;
-    newWs._connectionTime = Date.now();
+    // Hapus dari _activeListeners
+    this._activeListeners.delete(oldWs);
     
-    this._addToRoomClients(newWs, room);
-    this._activeClients.add(newWs);
-    await this._addUserConnection(userId, newWs);
-    
-    this.userToSeat.set(userId, { room, seat: seatNumber });
-    this.userCurrentRoom.set(userId, room);
-    
-    await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
-    await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
-    await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
-    
-    const muteStatus = roomManager.getMute();
-    await this.safeSend(newWs, ["muteTypeResponse", muteStatus, room]);
-    await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
-    
-    await this.sendAllStateTo(newWs, room);
-    
-    this.broadcastToRoom(room, ["userBackOnline", room, seatNumber, userId]);
-    
-    return true;
+    // Tutup koneksi lama
+    try {
+      if (oldWs.readyState === 1) {
+        oldWs.close(1000, "Replaced by new connection");
+      }
+    } catch (e) {}
   }
+  
+  const roomManager = this.roomManagers.get(room);
+  if (!roomManager) return false;
+  
+  const seatData = roomManager.getSeat(seatNumber);
+  if (!seatData || seatData.namauser !== userId) {
+    return false;
+  }
+  
+  // Setup koneksi baru
+  newWs.roomname = room;
+  newWs.idtarget = userId;
+  newWs._isClosing = false;
+  newWs._connectionTime = Date.now();
+  
+  this._addToRoomClients(newWs, room);
+  this._activeClients.add(newWs);
+  await this._addUserConnection(userId, newWs);
+  
+  this.userToSeat.set(userId, { room, seat: seatNumber });
+  this.userCurrentRoom.set(userId, room);
+  
+  // Kirim semua state ke user
+  await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
+  await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
+  await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
+  await this.safeSend(newWs, ["muteTypeResponse", roomManager.getMute(), room]);
+  await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
+  
+  // Kirim semua data (termasuk kursi sendiri)
+  await this.sendAllStateTo(newWs, room, false);
+  
+  // Kirim jumlah semua room
+  await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
+
+  
+  return true;
+}
 
   async _removeUserSeatAndPointFromRoom(userId, room) {
     const seatInfo = this.userToSeat.get(userId);
