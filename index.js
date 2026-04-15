@@ -46,7 +46,7 @@ const CONSTANTS = Object.freeze({
   PM_BATCH_SIZE: 5,
   PM_BATCH_DELAY_MS: 30,
 
-  WS_ACCEPT_TIMEOUT_MS: 5000,
+  WS_ACCEPT_TIMEOUT_MS: 10000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
 
   // FIX #1: Ganti memory threshold ke connection-count-based
