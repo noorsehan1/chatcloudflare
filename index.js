@@ -680,19 +680,16 @@ export class ChatServer2 {
   async _forceFullCleanupWebSocket(ws, isGraceful = true) {
     if (!ws || this._cleaningUp.has(ws)) return;
     
-    // ⭐ AMBIL userId dari ws._userId (cadangan) atau ws.idtarget
     let userId = ws._userId || ws.idtarget;
     const room = ws.roomname;
     const seatInfo = userId ? this.userToSeat.get(userId) : null;
     
-    // ⭐ Jika userId masih null, coba cari dari seatInfo
     if (!userId && seatInfo) {
       userId = seatInfo.namauser;
     }
     
-    // ⭐ Jika tetap null, tidak bisa buat grace period
     if (!userId) {
-      console.log(`❌ Cannot cleanup: no userId for ws, langsung hapus dari activeClients`);
+      console.log(`❌ Cannot cleanup: no userId for ws`);
       this._activeClients.delete(ws);
       try { if (ws.readyState === 1) ws.close(); } catch(e) {}
       return;
@@ -774,26 +771,20 @@ export class ChatServer2 {
     
     console.log(`✅ Pending found: seat=${pending.seat}, room=${pending.room}`);
     
-    // Hapus dari MAP paling atas
     this.pendingDisconnects.delete(userId);
-    
     clearTimeout(pending.timeout);
     
     const seatNumber = pending.seat;
     const room = pending.room;
     const oldWs = pending.ws;
     
-    // HAPUS OLD WS DARI SEMUA STRUKTUR DATA
     if (oldWs) {
       oldWs._isForceCleanup = true;
       oldWs._isClosing = true;
-      
       this._activeClients.delete(oldWs);
-      
       if (oldWs.roomname) {
         this._removeFromRoomClients(oldWs, oldWs.roomname);
       }
-      
       const userConns = this.userConnections.get(userId);
       if (userConns) {
         userConns.delete(oldWs);
@@ -801,9 +792,7 @@ export class ChatServer2 {
           this.userConnections.delete(userId);
         }
       }
-      
       this._activeListeners.delete(oldWs);
-      
       try {
         if (oldWs.readyState === 1) {
           oldWs.close(1000, "Replaced by new connection");
@@ -825,10 +814,9 @@ export class ChatServer2 {
     
     console.log(`✅ Seat ${seatNumber} verified, owner=${seatData.namauser}`);
     
-    // Setup koneksi baru
     newWs.roomname = room;
     newWs.idtarget = userId;
-    newWs._userId = userId;  // ⭐ SIMPAN CADANGAN
+    newWs._userId = userId;
     newWs._isClosing = false;
     newWs._connectionTime = Date.now();
     
@@ -839,7 +827,6 @@ export class ChatServer2 {
     this.userToSeat.set(userId, { room, seat: seatNumber });
     this.userCurrentRoom.set(userId, room);
     
-    // Kirim semua state
     await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
     await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
     await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
@@ -848,7 +835,6 @@ export class ChatServer2 {
     await this.sendAllStateTo(newWs, room, false);
     await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
     
-    // Broadcast ke semua user di room
     this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
     this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
@@ -1148,8 +1134,8 @@ export class ChatServer2 {
   }
 
   async handleJoinRoom(ws, room) {
-    if (!ws?._userId && !ws?.idtarget) { await this.safeSend(ws, ["error", "User ID not set"]); return false; }
     const userId = ws._userId || ws.idtarget;
+    if (!userId) { await this.safeSend(ws, ["error", "User ID not set"]); return false; }
     if (!roomList.includes(room)) { await this.safeSend(ws, ["error", "Invalid room"]); return false; }
     return this._handleJoinRoomInternal(ws, room);
   }
@@ -1255,15 +1241,22 @@ export class ChatServer2 {
   }
 
   async handleSetIdTarget2(ws, id, baru) {
+    console.log(`🔵 handleSetIdTarget2 called for ${id}, baru=${baru}`);
+    
     if (!id || !ws) return;
     
-    // ⭐ SIMPAN userId di cadangan ws._userId
     ws._userId = id;
     
+    console.log(`🔵 About to call _reconnectInGracePeriod for ${id}`);
     const reconnected = await this._reconnectInGracePeriod(id, ws);
+    console.log(`🔵 _reconnectInGracePeriod returned: ${reconnected}`);
+    
     if (reconnected) {
+      console.log(`✅ Reconnect success for ${id}, returning early`);
       return;
     }
+    
+    console.log(`🔵 No grace period, continuing normal flow for ${id}`);
     
     try {
       const existingConnections = this.userConnections.get(id);
@@ -1325,6 +1318,21 @@ export class ChatServer2 {
 
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
+    
+    // ⭐ SET _userId DARI PESAN PERTAMA KALAU BELUM ADA
+    if (!ws._userId && !ws.idtarget) {
+      try {
+        let messageStr = raw;
+        if (raw instanceof ArrayBuffer) messageStr = new TextDecoder().decode(raw);
+        let data = JSON.parse(messageStr);
+        if (data && data[0] === "setIdTarget2" && data[1]) {
+          ws._userId = data[1];
+          ws.idtarget = data[1];
+          console.log(`✅ Set _userId from first message: ${ws._userId}`);
+        }
+      } catch(e) {}
+    }
+    
     let messageStr = raw;
     if (raw instanceof ArrayBuffer) try { messageStr = new TextDecoder().decode(raw); } catch (e) { return; }
     if (messageStr.length > CONSTANTS.MAX_MESSAGE_SIZE) return;
@@ -1647,7 +1655,7 @@ export class ChatServer2 {
       const ws = server;
       ws.roomname = undefined;
       ws.idtarget = undefined;
-      ws._userId = undefined;  // ⭐ CADANGAN USER ID
+      ws._userId = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
