@@ -1,17 +1,5 @@
 // ==================== CHAT SERVER - FULLY FIXED VERSION ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
-// 
-// SEMUA PERBAIKAN:
-// 1. Hapus process.memoryUsage() - tidak ada di CF Workers
-// 2. Race condition pada join room → pakai room-level lock
-// 3. Dead code: Set `clients` & `_clientWebSockets` dihapus
-// 4. roomClients pakai Set bukan Array (O(1) add/remove)
-// 5. _processRetryQueue bug re-add diperbaiki
-// 6. Cek readyState setelah delay 1s di handleJoinRoom
-// 7. Return value broadcastToRoom untuk "chat" diperbaiki
-// 8. FIX ZOMBIE CLEANUP - Tidak mempengaruhi user lain!
-// 9. FIX RECONNECT - Tidak menyebabkan disconnect user lain!
-// 10. FIX handleSetIdTarget2 - Cleanup hanya user yang sama!
 
 let LowCardGameManager;
 try {
@@ -612,15 +600,13 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ==================== FIX ZOMBIE CLEANUP ====================
-  // TIDAK MEMPENGARUHI USER LAIN!
+  // ==================== ZOMBIE CLEANUP - HANYA YANG MATI ====================
   async _cleanupZombieWebSocketsAndData() {
     if (this._isCleaningUp) return;
     this._isCleaningUp = true;
 
     try {
       const zombies = [];
-      const now = Date.now();
       
       for (const ws of this._activeClients) {
         if (!ws) {
@@ -628,15 +614,8 @@ export class ChatServer2 {
           continue;
         }
         
-        // HANYA cleanup yang BENAR-BENAR MATI
-        const isDead = ws.readyState !== 1;
-        const isMarkedClosing = ws._isClosing === true;
-        const isReallyOld = ws._connectionTime && (now - ws._connectionTime) > 300000; // 5 menit
-        
-        if (isDead || isMarkedClosing) {
-          zombies.push(ws);
-        }
-        else if (isReallyOld && ws.roomname === undefined && !ws.idtarget) {
+        // HANYA cleanup yang readyState BUKAN 1 (sudah closed/closing)
+        if (ws.readyState !== 1) {
           zombies.push(ws);
         }
       }
@@ -665,7 +644,7 @@ export class ChatServer2 {
       for (const room of roomList) {
         const roomManager = this.roomManagers.get(room);
         if (roomManager && roomManager.getOccupiedCount() === 0) {
-          const idleTime = now - roomManager.lastActivity;
+          const idleTime = Date.now() - roomManager.lastActivity;
           if (idleTime > CONSTANTS.ROOM_IDLE_BEFORE_CLEANUP) {
             roomManager.destroy();
             this.roomManagers.set(room, new RoomManager(room));
@@ -673,7 +652,6 @@ export class ChatServer2 {
         }
       }
 
-      // Cleanup roomClients - HANYA hapus yang sudah mati
       for (const [room, clientSet] of this.roomClients) {
         for (const ws of clientSet) {
           if (!ws || ws.readyState !== 1 || ws._isClosing) {
@@ -691,16 +669,13 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== FIX FORCE CLEANUP ====================
+  // ==================== FORCE CLEANUP - CEK KONEKSI LAIN ====================
   async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._cleaningUp.has(ws)) return;
     
-    // Jangan cleanup jika WebSocket masih sehat
-    if (ws.readyState === 1 && !ws._isClosing) {
-      const isHealthy = ws.idtarget && ws.roomname;
-      if (isHealthy) {
-        return;
-      }
+    // Jangan cleanup WebSocket yang sehat
+    if (ws.readyState === 1 && !ws._isClosing && ws.idtarget && ws.roomname) {
+      return;
     }
     
     this._cleaningUp.add(ws);
@@ -715,13 +690,28 @@ export class ChatServer2 {
         this._removeFromRoomClients(ws, room);
       }
 
-      if (userId && room) {
+      // CEK: Apakah masih ada koneksi lain untuk user ini?
+      let hasOtherConnection = false;
+      const connections = this.userConnections.get(userId);
+      if (connections) {
+        for (const conn of connections) {
+          if (conn !== ws && conn.readyState === 1 && !conn._isClosing) {
+            hasOtherConnection = true;
+            break;
+          }
+        }
+      }
+
+      // HANYA hapus seat jika TIDAK ada koneksi lain
+      if (userId && room && !hasOtherConnection) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
 
       if (userId) {
-        this.userToSeat.delete(userId);
-        this.userCurrentRoom.delete(userId);
+        if (!hasOtherConnection) {
+          this.userToSeat.delete(userId);
+          this.userCurrentRoom.delete(userId);
+        }
         await this._removeUserConnection(userId, ws);
       }
 
@@ -893,9 +883,11 @@ export class ChatServer2 {
       }
 
       userConnections.add(ws);
+      ws.idtarget = userId;
     } finally { release(); }
   }
 
+  // ==================== REMOVE USER CONNECTION - JANGAN HAPUS MAP ====================
   async _removeUserConnection(userId, ws) {
     if (!userId || !ws) return;
     const release = await this.connectionLocker.acquire(`conn_${userId}`);
@@ -903,7 +895,7 @@ export class ChatServer2 {
       const userConnections = this.userConnections.get(userId);
       if (userConnections) {
         userConnections.delete(ws);
-        if (userConnections.size === 0) this.userConnections.delete(userId);
+        // JANGAN hapus userConnections dari Map - biarkan saja
       }
     } finally { release(); }
   }
@@ -1138,8 +1130,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ==================== FIX HANDLE SET ID TARGET ====================
-  // HANYA CLEANUP USER YANG SAMA, TIDAK MEMPENGARUHI USER LAIN
+  // ==================== HANDLE SET ID TARGET 2 ====================
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
     try {
