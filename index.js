@@ -1,22 +1,10 @@
-CEK INI KODE NYA // ==================== CHAT SERVER 2 - FULLY FIXED VERSION ====================
+// ==================== CHAT SERVER 2 - FULLY FIXED VERSION ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
 //
 // Durable Object Binding: CHAT_SERVER_2
 // Class Name: ChatServer2
-//
-// Fixes:
-//   1. Hapus process.memoryUsage() - tidak ada di CF Workers
-//   2. Race condition pada join room → pakai room-level lock
-//   3. Dead code dihapus
-//   4. roomClients pakai Set bukan Array
-//   5. _processRetryQueue bug re-add diperbaiki
-//   6. Cek readyState setelah delay di handleJoinRoom
-//   7. Return value broadcastToRoom untuk "chat" diperbaiki
-//   8. WebSocket disconnect tidak mempengaruhi koneksi lain
-//   9. Reconnect issue - graceful reconnect dengan grace period
-//  10. MAX_CONNECTIONS_PER_USER dari 1 jadi 2 untuk allow reconnect
 
 let LowCardGameManager;
 try {
@@ -48,7 +36,6 @@ const CONSTANTS = Object.freeze({
   MAX_TOTAL_BUFFER_MESSAGES: 50,
   MESSAGE_TTL_MS: 8000,
 
-  // FIX #9: Ganti dari 1 ke 2 untuk allow reconnect gracefully
   MAX_CONNECTIONS_PER_USER: 2,
 
   ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
@@ -63,7 +50,6 @@ const CONSTANTS = Object.freeze({
   CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
   FORCE_CLEANUP_MEMORY_TICKS: 30,
   
-  // FIX #9: Tambahan untuk reconnect
   RECONNECT_GRACE_PERIOD_MS: 3000,
   SEAT_RELEASE_DELAY_MS: 500,
 });
@@ -492,7 +478,6 @@ export class ChatServer2 {
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
 
-    // Track per-WebSocket cleanup status
     this._wsCleaningUp = new Map();
 
     this.roomClients = new Map();
@@ -626,7 +611,6 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // Cleanup yang ISOLATED per WebSocket
   async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._wsCleaningUp.get(ws)) return;
     
@@ -650,7 +634,6 @@ export class ChatServer2 {
         if (userConnSet) {
           userConnSet.delete(ws);
           
-          // Jangan hapus seat jika masih ada koneksi lain yang valid
           let hasOtherValidConnection = false;
           for (const otherWs of userConnSet) {
             if (otherWs && otherWs !== ws && otherWs.readyState === 1 && !otherWs._isClosing && !this._wsCleaningUp.get(otherWs)) {
@@ -896,7 +879,6 @@ export class ChatServer2 {
         this.userConnections.set(userId, userConnections);
       }
 
-      // Hapus koneksi lama dengan grace period
       if (userConnections.size >= CONSTANTS.MAX_CONNECTIONS_PER_USER) {
         const oldConnections = Array.from(userConnections);
         for (const oldWs of oldConnections) {
@@ -1181,7 +1163,7 @@ export class ChatServer2 {
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     }
-}
+  }
 
   async cleanupFromRoom(ws, room) {
     if (!ws?.idtarget || !ws.roomname) return;
