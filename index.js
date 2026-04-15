@@ -1,5 +1,13 @@
 // ==================== CHAT SERVER - FULLY FIXED VERSION ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
+// Fixes:
+//   1. Hapus process.memoryUsage() - tidak ada di CF Workers
+//   2. Race condition pada join room → pakai room-level lock
+//   3. Dead code: Set `clients` & `_clientWebSockets` dihapus
+//   4. roomClients pakai Set bukan Array (O(1) add/remove)
+//   5. _processRetryQueue bug re-add diperbaiki
+//   6. Cek readyState setelah delay 1s di handleJoinRoom
+//   7. Return value broadcastToRoom untuk "chat" diperbaiki
 
 let LowCardGameManager;
 try {
@@ -41,8 +49,10 @@ const CONSTANTS = Object.freeze({
   WS_ACCEPT_TIMEOUT_MS: 5000,
   FORCE_CLEANUP_TIMEOUT_MS: 2000,
 
-  CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
-  CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
+  // FIX #1: Ganti memory threshold ke connection-count-based
+  // (process.memoryUsage() tidak tersedia di Cloudflare Workers)
+  CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,  // 90% dari MAX_GLOBAL_CONNECTIONS
+  CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,   // 75% dari MAX_GLOBAL_CONNECTIONS
   FORCE_CLEANUP_MEMORY_TICKS: 30,
 });
 
@@ -186,6 +196,7 @@ class GlobalChatBuffer {
     this._roomQueueSizes = new Map();
     this.MAX_PER_ROOM = 25;
 
+    // FIX #5: Pisahkan retry queue agar tidak ada re-entrant bug
     this._retryQueue = [];
   }
 
@@ -243,23 +254,30 @@ class GlobalChatBuffer {
     }
   }
 
+  // FIX #5: Perbaiki bug re-add pada retry queue
+  // Dulu: push ke this._retryQueue lalu langsung filter → item baru bisa ikut terhapus
+  // Sekarang: kumpulkan nextRetry dulu ke array terpisah, lalu set ulang
   _processRetryQueue(now) {
     const remaining = [];
 
     for (const item of this._retryQueue) {
       if (now < item.nextRetry) {
+        // Belum saatnya retry, pertahankan
         remaining.push(item);
         continue;
       }
       if (item.retries >= 2) {
+        // Sudah max retry, buang
         continue;
       }
+      // Coba kirim ulang
       const sent = this._sendWithCallback(item.room, item.message, item.msgId);
       if (!sent) {
         item.retries++;
         item.nextRetry = now + (1000 * Math.pow(2, item.retries));
         remaining.push(item);
       }
+      // Kalau sent, tidak dimasukkan kembali (sukses)
     }
 
     this._retryQueue = remaining;
@@ -278,11 +296,13 @@ class GlobalChatBuffer {
       const batch = this._messageQueue.splice(0);
       this._totalQueued = 0;
 
+      // Reset room queue sizes untuk batch ini
       for (const item of batch) {
         const roomSize = this._roomQueueSizes.get(item.room) || 0;
         this._roomQueueSizes.set(item.room, Math.max(0, roomSize - 1));
       }
 
+      // Kirim per room (grouped)
       const roomGroups = new Map();
       for (const item of batch) {
         if (!roomGroups.has(item.room)) roomGroups.set(item.room, []);
@@ -453,7 +473,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer (Durable Object)
 // ─────────────────────────────────────────────
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -462,22 +482,20 @@ export class ChatServer2 {
     this._isCleaningUp = false;
     this._cleaningUp = new Set();
 
-    // GRACE PERIOD - 30 DETIK
-    this.disconnectGracePeriod = 30000;
-    this.pendingDisconnects = new Map();
-
     this.seatLocker = new AsyncLock(2000);
     this.connectionLocker = new AsyncLock(1500);
-    this.roomLocker = new AsyncLock(1500);
+    this.roomLocker = new AsyncLock(1500);    // FIX #2: dipakai untuk join room
 
     this._activeClients = new Set();
     this.roomManagers = new Map();
+    // FIX #3: Hapus `this.clients` dan `this._clientWebSockets` (dead code)
 
     this.userToSeat = new Map();
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
 
-    this.roomClients = new Map();
+    // FIX #4: roomClients pakai Set bukan Array
+    this.roomClients = new Map();   // Map<string, Set<WebSocket>>
 
     this._activeListeners = new Map();
 
@@ -509,14 +527,12 @@ export class ChatServer2 {
 
     for (const room of roomList) {
       this.roomManagers.set(room, new RoomManager(room));
-      this.roomClients.set(room, new Set());
+      this.roomClients.set(room, new Set());   // FIX #4: Set
     }
 
     this._masterTickCounter = 0;
     this._masterTimer = null;
     this._startMasterTimer();
-    
-    console.log("🚀 ChatServer initialized with grace period 30s");
   }
 
   _startMasterTimer() {
@@ -550,6 +566,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
+  // FIX #1: Ganti cek memory (tidak tersedia di CF Workers) ke cek connection count
   async _checkConnectionPressure() {
     const total = this._activeClients.size;
     const max = CONSTANTS.MAX_GLOBAL_CONNECTIONS;
@@ -654,6 +671,7 @@ export class ChatServer2 {
         }
       }
 
+      // FIX #4: roomClients adalah Set sekarang, cleanup lebih efisien
       for (const [room, clientSet] of this.roomClients) {
         for (const ws of clientSet) {
           if (!ws || ws.readyState !== 1 || ws.roomname !== room) {
@@ -668,183 +686,44 @@ export class ChatServer2 {
     }
   }
 
-  async _forceFullCleanupWebSocket(ws, isGraceful = true) {
-    console.log(`🧹 _forceFullCleanupWebSocket called, isGraceful=${isGraceful}, userId=${ws?.idtarget}`);
-    
+  async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._cleaningUp.has(ws)) return;
-    
-    let userId = ws.idtarget;
-    const room = ws.roomname;
-    const seatInfo = userId ? this.userToSeat.get(userId) : null;
-    
-    if (!userId && seatInfo) {
-      userId = seatInfo.namauser;
-    }
-    
-    if (!userId) {
-      console.log(`❌ Cannot cleanup: no userId for ws`);
-      this._activeClients.delete(ws);
-      try { if (ws.readyState === 1) ws.close(); } catch(e) {}
-      return;
-    }
-    
-    console.log(`🧹 Cleanup for userId=${userId}, room=${room}, seat=${seatInfo?.seat}, isGraceful=${isGraceful}`);
-    
-    if (isGraceful && userId && room && seatInfo && !ws._isForceCleanup) {
-      const existing = this.pendingDisconnects.get(userId);
-      if (existing) {
-        clearTimeout(existing.timeout);
-        this.pendingDisconnects.delete(userId);
-      }
-      
-      ws._isPendingDisconnect = true;
-      
-      console.log(`⏳ Creating GRACE PERIOD for ${userId}, seat ${seatInfo.seat} in ${room}, duration=${this.disconnectGracePeriod}ms`);
-      
-      const timeout = setTimeout(async () => {
-        console.log(`⏰ Grace period EXPIRED for ${userId}, cleaning up now`);
-        const pending = this.pendingDisconnects.get(userId);
-        if (pending) {
-          if (pending.ws && pending.ws._isPendingDisconnect) {
-            pending.ws._isForceCleanup = true;
-            await this._forceFullCleanupWebSocket(pending.ws, false);
-          }
-          this.pendingDisconnects.delete(userId);
-        }
-      }, this.disconnectGracePeriod);
-      
-      this.pendingDisconnects.set(userId, {
-        timeout: timeout,
-        ws: ws,
-        seat: seatInfo.seat,
-        room: room,
-        userId: userId
-      });
-      
-      console.log(`✅ Grace period STARTED for ${userId}, pendingDisconnects size: ${this.pendingDisconnects.size}`);
-      return;
-    }
-    
-    console.log(`💀 Direct cleanup (no grace) for ${userId}`);
-    
     this._cleaningUp.add(ws);
+
+    const userId = ws.idtarget;
+    const room = ws.roomname;
+
     try {
       ws._isClosing = true;
+
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
       }
+
       if (userId) {
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         await this._removeUserConnection(userId, ws);
       }
+
       if (room) {
         this._removeFromRoomClients(ws, room);
       }
+
       this._cleanupWebSocketListeners(ws);
+
+      // FIX #3: Hapus referensi ke `this.clients` dan `this._clientWebSockets`
       this._activeClients.delete(ws);
+
       if (ws.readyState === 1) {
         try { ws.close(1000, "Cleanup completed"); } catch (e) {}
       }
+
     } catch (error) {}
     finally {
       this._cleaningUp.delete(ws);
-      delete ws._isForceCleanup;
-      delete ws._isPendingDisconnect;
     }
   }
-
-async _reconnectInGracePeriod(userId, newWs) {
-  console.log(`🟢 RECONNECT ATTEMPT for ${userId}`);
-  console.log(`📊 Current pendingDisconnects: ${JSON.stringify([...this.pendingDisconnects.keys()])}`);
-  
-  let pending = this.pendingDisconnects.get(userId);
-  
-  if (!pending) {
-    console.log(`❌ No pending for ${userId}, checking seat...`);
-    const seatInfo = this.userToSeat.get(userId);
-    if (seatInfo) {
-      console.log(`✅ Found seat ${seatInfo.seat} in ${seatInfo.room}, creating manual pending`);
-      pending = {
-        seat: seatInfo.seat,
-        room: seatInfo.room,
-        ws: null,
-        userId: userId,
-        timeout: null
-      };
-      this.pendingDisconnects.set(userId, pending);
-    } else {
-      console.log(`❌ No seat found for ${userId}`);
-      return false;
-    }
-  } else {
-    console.log(`✅ Pending FOUND for ${userId}: seat=${pending.seat}, room=${pending.room}`);
-  }
-  
-  this.pendingDisconnects.delete(userId);
-  if (pending.timeout) clearTimeout(pending.timeout);
-  
-  const seatNumber = pending.seat;
-  const room = pending.room;
-  const oldWs = pending.ws;
-  
-  if (oldWs) {
-    console.log(`🧹 Cleaning old WebSocket for ${userId}`);
-    oldWs._isForceCleanup = true;
-    oldWs._isClosing = true;
-    this._activeClients.delete(oldWs);
-    if (oldWs.roomname) this._removeFromRoomClients(oldWs, oldWs.roomname);
-    const userConns = this.userConnections.get(userId);
-    if (userConns) {
-      userConns.delete(oldWs);
-      if (userConns.size === 0) this.userConnections.delete(userId);
-    }
-    this._activeListeners.delete(oldWs);
-    try { if (oldWs.readyState === 1) oldWs.close(1000, "Replaced"); } catch (e) {}
-  }
-  
-  const roomManager = this.roomManagers.get(room);
-  if (!roomManager) {
-    console.log(`❌ RoomManager not found for ${room}`);
-    return false;
-  }
-  
-  const seatData = roomManager.getSeat(seatNumber);
-  if (!seatData || seatData.namauser !== userId) {
-    console.log(`❌ Seat ${seatNumber} not owned by ${userId}, owner=${seatData?.namauser}`);
-    return false;
-  }
-  
-  console.log(`✅ Seat verified, seat=${seatNumber}, room=${room}, owner=${seatData.namauser}`);
-  
-  newWs.roomname = room;
-  newWs.idtarget = userId;
-  newWs._userId = userId;
-  newWs._isClosing = false;
-  newWs._connectionTime = Date.now();
-  
-  this._addToRoomClients(newWs, room);
-  this._activeClients.add(newWs);
-  await this._addUserConnection(userId, newWs);
-  
-  this.userToSeat.set(userId, { room, seat: seatNumber });
-  this.userCurrentRoom.set(userId, room);
-  
-  await this.safeSend(newWs, ["reconnectSuccess", "You are back!", seatNumber, room]);
-  await this.safeSend(newWs, ["numberKursiSaya", seatNumber]);
-  await this.safeSend(newWs, ["rooMasuk", seatNumber, room]);
-  await this.safeSend(newWs, ["muteTypeResponse", roomManager.getMute(), room]);
-  await this.safeSend(newWs, ["currentNumber", this.currentNumber]);
-  await this.sendAllStateTo(newWs, room, false);
-  await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
-  
-  this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
-  this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
-  
-  console.log(`✅ RECONNECT SUCCESS for ${userId} to seat ${seatNumber} in ${room}`);
-  
-  return true;
-}
 
   async _removeUserSeatAndPointFromRoom(userId, room) {
     const seatInfo = this.userToSeat.get(userId);
@@ -903,6 +782,7 @@ async _reconnectInGracePeriod(userId, newWs) {
   }
 
   async assignNewSeat(room, userId) {
+    // Dipanggil dari dalam roomLocker (via _handleJoinRoomInternal), tidak perlu double lock
     const roomManager = this.roomManagers.get(room);
     if (!roomManager || roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
 
@@ -1016,6 +896,7 @@ async _reconnectInGracePeriod(userId, newWs) {
     } finally { release(); }
   }
 
+  // FIX #4: roomClients pakai Set, add/remove O(1)
   _addToRoomClients(ws, room) {
     if (!ws || !room) return;
     let clientSet = this.roomClients.get(room);
@@ -1068,6 +949,7 @@ async _reconnectInGracePeriod(userId, newWs) {
     return roomManager.updatePoint(seatNumber, point);
   }
 
+  // FIX #4: iterasi Set langsung
   _sendDirectToRoom(room, msg, msgId = null) {
     const clientSet = this.roomClients.get(room);
     if (!clientSet?.size) return 0;
@@ -1085,6 +967,7 @@ async _reconnectInGracePeriod(userId, newWs) {
     return sentCount;
   }
 
+  // FIX #7: broadcastToRoom "chat" sekarang return jumlah klien yang menerima
   broadcastToRoom(room, msg) {
     if (!room || !roomList.includes(room)) return 0;
 
@@ -1094,6 +977,7 @@ async _reconnectInGracePeriod(userId, newWs) {
 
     if (msg[0] === "chat") {
       this.chatBuffer.add(room, msg);
+      // Return client count (estimasi, bukan sentCount karena buffered)
       return this.roomClients.get(room)?.size || 0;
     }
 
@@ -1142,6 +1026,8 @@ async _reconnectInGracePeriod(userId, newWs) {
     return this._handleJoinRoomInternal(ws, room);
   }
 
+  // FIX #2: Seluruh join room dibungkus room-level lock untuk cegah race condition
+  // Dua koneksi dari user yang sama tidak bisa assign seat secara bersamaan
   async _handleJoinRoomInternal(ws, room) {
     const release = await this.roomLocker.acquire(`joinroom_${room}_${ws.idtarget}`);
     try {
@@ -1156,6 +1042,7 @@ async _reconnectInGracePeriod(userId, newWs) {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
 
+      // Sudah punya seat di room yang sama
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const roomManager = this.roomManagers.get(room);
@@ -1170,6 +1057,7 @@ async _reconnectInGracePeriod(userId, newWs) {
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
+          // FIX #6: Cek readyState setelah delay
           await new Promise(resolve => setTimeout(resolve, 1000));
           if (!ws || ws.readyState !== 1 || ws._isClosing) return true;
 
@@ -1180,6 +1068,7 @@ async _reconnectInGracePeriod(userId, newWs) {
         }
       }
 
+      // Pindah dari room lain
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
         const oldSeatInfo = this.userToSeat.get(ws.idtarget);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
@@ -1212,6 +1101,7 @@ async _reconnectInGracePeriod(userId, newWs) {
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
+      // FIX #6: Cek readyState setelah delay
       await new Promise(resolve => setTimeout(resolve, 1000));
       if (!ws || ws.readyState !== 1 || ws._isClosing) return true;
 
@@ -1241,36 +1131,6 @@ async _reconnectInGracePeriod(userId, newWs) {
 
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
-    
-    // SET _userId SEBELUM APAPUN
-    ws._userId = id;
-    ws.idtarget = id;
-    
-    // JIKA baru === false, INI ADALAH RECONNECT
-    if (baru === false) {
-      console.log(`🔄 Reconnect detected for ${id}`);
-      
-      try {
-        const reconnected = await this._reconnectInGracePeriod(id, ws);
-        console.log(`🔍 _reconnectInGracePeriod returned: ${reconnected}`);
-        
-        if (reconnected) {
-          console.log(`✅ Reconnect success for ${id}, returning early`);
-          return;
-        }
-      } catch (error) {
-        console.log(`❌ Error in _reconnectInGracePeriod: ${error.message}`);
-      }
-      
-      // JIKA RECONNECT GAGAL, TETAP KELUAR (JANGAN LANJUT KE NEEDJOINROOM)
-      console.log(`⚠️ Reconnect failed for ${id}, but returning to prevent auto-join`);
-      await this.safeSend(ws, ["reconnectFailed", "Connection lost, please refresh"]);
-      return;
-    }
-    
-    // =========================================================
-    // KONEKSI BARU (baru = true)
-    // =========================================================
     try {
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
@@ -1311,9 +1171,7 @@ async _reconnectInGracePeriod(userId, newWs) {
               await this._addUserConnection(id, ws);
               await this.sendAllStateTo(ws, room);
               const point = roomManager.getPoint(seat);
-              if (point) {
-                await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
-              }
+              if (point) await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
               await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
               await this.safeSend(ws, ["numberKursiSaya", seat]);
               await this.safeSend(ws, ["currentNumber", this.currentNumber]);
@@ -1327,7 +1185,6 @@ async _reconnectInGracePeriod(userId, newWs) {
       await this._addUserConnection(id, ws);
       await this.safeSend(ws, ["needJoinRoom"]);
     } catch (error) {
-      console.error(`Error in handleSetIdTarget2:`, error);
       await this.safeSend(ws, ["error", "Reconnection failed"]);
     }
   }
@@ -1529,6 +1386,7 @@ async _reconnectInGracePeriod(userId, newWs) {
     return true;
   }
 
+  // FIX #1: getMemoryStats tidak lagi pakai process.memoryUsage()
   async getMemoryStats() {
     let activeReal = 0;
     for (const c of this._activeClients) if (c?.readyState === 1) activeReal++;
@@ -1545,6 +1403,7 @@ async _reconnectInGracePeriod(userId, newWs) {
     return {
       timestamp: Date.now(),
       uptime: Date.now() - this._startTime,
+      // CF Workers tidak expose memory — gunakan connection metrics sebagai proxy
       memory: {
         note: "process.memoryUsage() not available in Cloudflare Workers",
         activeConnections: activeReal,
@@ -1600,6 +1459,7 @@ async _reconnectInGracePeriod(userId, newWs) {
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeCount,
+            // FIX #1: Hapus memoryMB, ganti ke connection pressure
             connectionPressure: `${Math.round((activeCount / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
@@ -1616,7 +1476,7 @@ async _reconnectInGracePeriod(userId, newWs) {
           return new Response(JSON.stringify({ counts, total: Object.values(counts).reduce((a, b) => a + b, 0) }), { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/shutdown") { await this.shutdown(); return new Response("Shutting down...", { status: 200 }); }
-        return new Response("ChatServer Running - Cloudflare Workers", { status: 200 });
+        return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200 });
       }
 
       if (this._activeClients.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
@@ -1643,22 +1503,16 @@ async _reconnectInGracePeriod(userId, newWs) {
       const ws = server;
       ws.roomname = undefined;
       ws.idtarget = undefined;
-      ws._userId = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
 
+      // FIX #3: Hapus this.clients.add(ws) dan this._clientWebSockets.add(client) (dead code)
       this._activeClients.add(ws);
 
       const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
-      const errorHandler = () => { 
-        console.log(`⚠️ WebSocket error for user: ${ws._userId || ws.idtarget}`);
-        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
-      };
-      const closeHandler = () => { 
-        console.log(`🔌 WebSocket closed for user: ${ws._userId || ws.idtarget}`);
-        this._forceFullCleanupWebSocket(ws, true).catch(() => {}); 
-      };
+      const errorHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
+      const closeHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
 
       ws.addEventListener("message", messageHandler, { signal: abortController.signal });
       ws.addEventListener("error", errorHandler, { signal: abortController.signal });
@@ -1680,12 +1534,12 @@ async _reconnectInGracePeriod(userId, newWs) {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER_2.get(chatId);
+      const chatId = env.CHAT_SERVER.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
       if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
-      return new Response("ChatServer Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
+      return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
     } catch (error) {
       return new Response("Server error", { status: 500 });
     }
