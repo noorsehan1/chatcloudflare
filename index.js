@@ -1,14 +1,22 @@
-// ==================== CHAT SERVER - FULLY FIXED VERSION ====================
-// index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
+// ==================== CHAT SERVER 2 - FULLY FIXED VERSION ====================
+// name = "chatcloudnew"
+// main = "index.js"
+// compatibility_date = "2026-04-03"
+//
+// Durable Object Binding: CHAT_SERVER_2
+// Class Name: ChatServer2
+//
 // Fixes:
 //   1. Hapus process.memoryUsage() - tidak ada di CF Workers
 //   2. Race condition pada join room → pakai room-level lock
-//   3. Dead code: Set `clients` & `_clientWebSockets` dihapus
-//   4. roomClients pakai Set bukan Array (O(1) add/remove)
+//   3. Dead code dihapus
+//   4. roomClients pakai Set bukan Array
 //   5. _processRetryQueue bug re-add diperbaiki
-//   6. Cek readyState setelah delay 1s di handleJoinRoom
+//   6. Cek readyState setelah delay di handleJoinRoom
 //   7. Return value broadcastToRoom untuk "chat" diperbaiki
-//   8. FIX KRITIKAL: WebSocket disconnect tidak mempengaruhi koneksi lain
+//   8. WebSocket disconnect tidak mempengaruhi koneksi lain
+//   9. Reconnect issue - graceful reconnect dengan grace period
+//  10. MAX_CONNECTIONS_PER_USER dari 1 jadi 2 untuk allow reconnect
 
 let LowCardGameManager;
 try {
@@ -40,7 +48,8 @@ const CONSTANTS = Object.freeze({
   MAX_TOTAL_BUFFER_MESSAGES: 50,
   MESSAGE_TTL_MS: 8000,
 
-  MAX_CONNECTIONS_PER_USER: 1,
+  // FIX #9: Ganti dari 1 ke 2 untuk allow reconnect gracefully
+  MAX_CONNECTIONS_PER_USER: 2,
 
   ROOM_IDLE_BEFORE_CLEANUP: 15 * 60 * 1000,
 
@@ -53,6 +62,10 @@ const CONSTANTS = Object.freeze({
   CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
   CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
   FORCE_CLEANUP_MEMORY_TICKS: 30,
+  
+  // FIX #9: Tambahan untuk reconnect
+  RECONNECT_GRACE_PERIOD_MS: 3000,
+  SEAT_RELEASE_DELAY_MS: 500,
 });
 
 const roomList = Object.freeze([
@@ -459,7 +472,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer (Durable Object)
+// ChatServer2 (Durable Object)
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -479,7 +492,7 @@ export class ChatServer2 {
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
 
-    // FIX #8: Pakai Map untuk track per-WebSocket cleanup status
+    // Track per-WebSocket cleanup status
     this._wsCleaningUp = new Map();
 
     this.roomClients = new Map();
@@ -613,7 +626,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // FIX #8: Cleanup yang ISOLATED per WebSocket
+  // Cleanup yang ISOLATED per WebSocket
   async _forceFullCleanupWebSocket(ws) {
     if (!ws || this._wsCleaningUp.get(ws)) return;
     
@@ -636,49 +649,28 @@ export class ChatServer2 {
         const userConnSet = this.userConnections.get(userId);
         if (userConnSet) {
           userConnSet.delete(ws);
-          if (userConnSet.size === 0) {
-            this.userConnections.delete(userId);
-          }
-        }
-      }
-
-      // Hanya hapus seat jika tidak ada koneksi lain dari user yang sama di room yang sama
-      if (userId && room) {
-        const seatInfo = this.userToSeat.get(userId);
-        if (seatInfo && seatInfo.room === room) {
-          let hasOtherConnectionInSameRoom = false;
-          const otherConnections = this.userConnections.get(userId);
-          if (otherConnections) {
-            for (const otherWs of otherConnections) {
-              if (otherWs !== ws && otherWs.roomname === room && otherWs.readyState === 1 && !otherWs._isClosing && !this._wsCleaningUp.get(otherWs)) {
-                hasOtherConnectionInSameRoom = true;
-                break;
-              }
-            }
-          }
           
-          if (!hasOtherConnectionInSameRoom) {
-            await this._removeUserSeatAndPointFromRoom(userId, room);
-          }
-        }
-      }
-
-      // Hapus dari userToSeat & userCurrentRoom hanya jika tidak ada koneksi lain
-      if (userId) {
-        let hasAnyConnection = false;
-        const otherConnections = this.userConnections.get(userId);
-        if (otherConnections && otherConnections.size > 0) {
-          for (const otherWs of otherConnections) {
-            if (otherWs !== ws && otherWs.readyState === 1 && !otherWs._isClosing && !this._wsCleaningUp.get(otherWs)) {
-              hasAnyConnection = true;
+          // Jangan hapus seat jika masih ada koneksi lain yang valid
+          let hasOtherValidConnection = false;
+          for (const otherWs of userConnSet) {
+            if (otherWs && otherWs !== ws && otherWs.readyState === 1 && !otherWs._isClosing && !this._wsCleaningUp.get(otherWs)) {
+              hasOtherValidConnection = true;
               break;
             }
           }
-        }
-        
-        if (!hasAnyConnection) {
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
+          
+          if (userConnSet.size === 0 || !hasOtherValidConnection) {
+            this.userConnections.delete(userId);
+            
+            if (userId && room) {
+              const seatInfo = this.userToSeat.get(userId);
+              if (seatInfo && seatInfo.room === room) {
+                await this._removeUserSeatAndPointFromRoom(userId, room);
+              }
+              this.userToSeat.delete(userId);
+              this.userCurrentRoom.delete(userId);
+            }
+          }
         }
       }
 
@@ -904,18 +896,25 @@ export class ChatServer2 {
         this.userConnections.set(userId, userConnections);
       }
 
+      // Hapus koneksi lama dengan grace period
       if (userConnections.size >= CONSTANTS.MAX_CONNECTIONS_PER_USER) {
-        const existing = Array.from(userConnections)[0];
-        if (existing && existing !== ws) {
-          if (existing.readyState === 1 && !this._wsCleaningUp.get(existing)) {
-            try {
-              await this.safeSend(existing, ["connectionReplaced", "New connection detected"]);
-              existing.close(1000, "Replaced");
-            } catch (e) {}
+        const oldConnections = Array.from(userConnections);
+        for (const oldWs of oldConnections) {
+          if (oldWs !== ws) {
+            if (oldWs.readyState === 1 && !oldWs._isClosing && !this._wsCleaningUp.get(oldWs)) {
+              try {
+                await this.safeSend(oldWs, ["connectionReplaced", "Reconnecting..."]);
+                oldWs._toBeReplaced = true;
+                setTimeout(() => {
+                  if (oldWs && !this._wsCleaningUp.get(oldWs)) {
+                    this._forceFullCleanupWebSocket(oldWs).catch(() => {});
+                  }
+                }, CONSTANTS.RECONNECT_GRACE_PERIOD_MS);
+              } catch (e) {}
+            }
+            userConnections.delete(oldWs);
+            this._activeClients.delete(oldWs);
           }
-          userConnections.delete(existing);
-          this._activeClients.delete(existing);
-          await this._forceFullCleanupWebSocket(existing);
         }
       }
 
@@ -1077,23 +1076,28 @@ export class ChatServer2 {
       const existingSeatInfo = this.userToSeat.get(ws.idtarget);
       const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
 
+      // Jika sudah punya seat di room yang sama, reuse dengan cepat
       if (existingSeatInfo && existingSeatInfo.room === room) {
         const seatNum = existingSeatInfo.seat;
         const roomManager = this.roomManagers.get(room);
         const seatData = roomManager.getSeat(seatNum);
+        
         if (seatData && seatData.namauser === ws.idtarget) {
           ws.roomname = room;
           this._addToRoomClients(ws, room);
           await this._addUserConnection(ws.idtarget, ws);
           this.userCurrentRoom.set(ws.idtarget, room);
+          
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           await this.safeSend(ws, ["numberKursiSaya", seatNum]);
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Delay lebih kecil untuk reconnect cepat
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
           if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
-
+          
           await this.sendAllStateTo(ws, room);
           return true;
         } else {
@@ -1101,16 +1105,29 @@ export class ChatServer2 {
         }
       }
 
+      // Pindah room dengan lebih hati-hati
       if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
         const oldSeatInfo = this.userToSeat.get(ws.idtarget);
         if (oldSeatInfo && oldSeatInfo.room === currentRoomBeforeJoin) {
-          await this.safeRemoveSeat(currentRoomBeforeJoin, oldSeatInfo.seat, ws.idtarget);
-          this.broadcastToRoom(currentRoomBeforeJoin, ["removeKursi", currentRoomBeforeJoin, oldSeatInfo.seat]);
-          this.broadcastToRoom(currentRoomBeforeJoin, ["pointRemoved", currentRoomBeforeJoin, oldSeatInfo.seat]);
+          let hasOtherConnection = false;
+          const otherConnections = this.userConnections.get(ws.idtarget);
+          if (otherConnections) {
+            for (const otherWs of otherConnections) {
+              if (otherWs !== ws && otherWs.roomname === currentRoomBeforeJoin && 
+                  otherWs.readyState === 1 && !otherWs._isClosing) {
+                hasOtherConnection = true;
+                break;
+              }
+            }
+          }
+          
+          if (!hasOtherConnection) {
+            await this.safeRemoveSeat(currentRoomBeforeJoin, oldSeatInfo.seat, ws.idtarget);
+            this.broadcastToRoom(currentRoomBeforeJoin, ["removeKursi", currentRoomBeforeJoin, oldSeatInfo.seat]);
+            this.broadcastToRoom(currentRoomBeforeJoin, ["pointRemoved", currentRoomBeforeJoin, oldSeatInfo.seat]);
+          }
         }
         this._removeFromRoomClients(ws, currentRoomBeforeJoin);
-        this.userToSeat.delete(ws.idtarget);
-        this.userCurrentRoom.delete(ws.idtarget);
       }
 
       if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
@@ -1118,8 +1135,26 @@ export class ChatServer2 {
         return false;
       }
 
-      const assignedSeat = await this.assignNewSeat(room, ws.idtarget);
-      if (!assignedSeat) { await this.safeSend(ws, ["roomFull", room]); return false; }
+      // Assign seat dengan cek ulang apakah user sudah punya seat
+      let assignedSeat = null;
+      const existingSeat = this.userToSeat.get(ws.idtarget);
+      if (existingSeat && existingSeat.room === room) {
+        assignedSeat = existingSeat.seat;
+        const roomManager = this.roomManagers.get(room);
+        const seatData = roomManager.getSeat(assignedSeat);
+        if (!seatData || seatData.namauser !== ws.idtarget) {
+          assignedSeat = null;
+        }
+      }
+      
+      if (!assignedSeat) {
+        assignedSeat = await this.assignNewSeat(room, ws.idtarget);
+      }
+      
+      if (!assignedSeat) { 
+        await this.safeSend(ws, ["roomFull", room]); 
+        return false; 
+      }
 
       this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
       this.userCurrentRoom.set(ws.idtarget, room);
@@ -1133,7 +1168,8 @@ export class ChatServer2 {
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
       if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
 
       await this.sendAllStateTo(ws, room);
@@ -1165,10 +1201,23 @@ export class ChatServer2 {
     try {
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
-        for (const oldWs of existingConnections) {
-          if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing && !this._wsCleaningUp.get(oldWs)) {
-            try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
-            await this._forceFullCleanupWebSocket(oldWs);
+        const oldConnections = Array.from(existingConnections);
+        for (const oldWs of oldConnections) {
+          if (oldWs !== ws) {
+            const isDead = oldWs.readyState !== 1 || oldWs._isClosing === true;
+            if (isDead) {
+              await this._forceFullCleanupWebSocket(oldWs);
+            } else if (!baru) {
+              try { 
+                await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]);
+                oldWs._toBeReplaced = true;
+                setTimeout(() => {
+                  if (oldWs && !this._wsCleaningUp.get(oldWs)) {
+                    this._forceFullCleanupWebSocket(oldWs).catch(() => {});
+                  }
+                }, CONSTANTS.RECONNECT_GRACE_PERIOD_MS);
+              } catch (e) {}
+            }
           }
         }
       }
@@ -1558,6 +1607,9 @@ export class ChatServer2 {
   }
 }
 
+// ─────────────────────────────────────────────
+// Worker Export
+// ─────────────────────────────────────────────
 export default {
   async fetch(req, env) {
     try {
