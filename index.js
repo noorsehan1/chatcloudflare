@@ -1216,73 +1216,90 @@ export class ChatServer2 {
   }
 
   async handleSetIdTarget2(ws, id, baru) {
-    if (!id || !ws) return;
+  if (!id || !ws) return;
+  
+  // =========================================================
+  // JIKA baru === false, INI ADALAH RECONNECT
+  // LANGSUNG KEMBALIKAN KURSI LAMA, TIDAK JOIN ROOM BARU
+  // =========================================================
+  if (baru === false) {
+    console.log(`🔄 Reconnect detected for ${id}, attempting to restore seat...`);
     
-    // JIKA baru === false, INI ADALAH RECONNECT!
-    if (baru === false) {
-      const reconnected = await this._reconnectInGracePeriod(id, ws);
-      if (reconnected) {
-        return;
-      }
+    const reconnected = await this._reconnectInGracePeriod(id, ws);
+    
+    if (reconnected) {
+      console.log(`✅ Reconnect successful for ${id}, seat restored.`);
+      return; // ← LANGSUNG KELUAR, TIDAK JOIN ROOM BARU
     }
     
-    try {
-      const existingConnections = this.userConnections.get(id);
-      if (existingConnections && existingConnections.size > 0) {
-        for (const oldWs of existingConnections) {
-          if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
-            try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
-            await this._forceFullCleanupWebSocket(oldWs);
-          }
+    console.log(`⚠️ Reconnect failed for ${id}, will continue to normal flow`);
+  }
+  
+  // =========================================================
+  // PROSES NORMAL (koneksi baru ATAU reconnect gagal)
+  // =========================================================
+  try {
+    const existingConnections = this.userConnections.get(id);
+    if (existingConnections && existingConnections.size > 0) {
+      for (const oldWs of existingConnections) {
+        if (oldWs !== ws && oldWs.readyState === 1 && !oldWs._isClosing) {
+          try { await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]); } catch (e) {}
+          await this._forceFullCleanupWebSocket(oldWs);
         }
       }
+    }
 
-      if (baru === true) {
-        ws.idtarget = id;
-        ws.roomname = undefined;
-        ws._isClosing = false;
-        ws._connectionTime = Date.now();
-        await this._addUserConnection(id, ws);
-        this._activeClients.add(ws);
-        await this.safeSend(ws, ["joinroomawal"]);
-        return;
-      }
-
+    // KONEKSI BARU (baru = true)
+    if (baru === true) {
       ws.idtarget = id;
+      ws.roomname = undefined;
       ws._isClosing = false;
       ws._connectionTime = Date.now();
+      await this._addUserConnection(id, ws);
       this._activeClients.add(ws);
+      await this.safeSend(ws, ["joinroomawal"]);
+      return;
+    }
 
-      const seatInfo = this.userToSeat.get(id);
-      if (seatInfo) {
-        const { room, seat } = seatInfo;
-        if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
-          const roomManager = this.roomManagers.get(room);
-          if (roomManager) {
-            const seatData = roomManager.getSeat(seat);
-            if (seatData && seatData.namauser === id) {
-              ws.roomname = room;
-              this._addToRoomClients(ws, room);
-              await this._addUserConnection(id, ws);
-              await this.sendAllStateTo(ws, room);
-              const point = roomManager.getPoint(seat);
-              if (point) await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
-              await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-              await this.safeSend(ws, ["numberKursiSaya", seat]);
-              await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-              return;
+    // SITUASI LAIN (baru = false TAPI reconnect gagal, atau undefined)
+    ws.idtarget = id;
+    ws._isClosing = false;
+    ws._connectionTime = Date.now();
+    this._activeClients.add(ws);
+
+    const seatInfo = this.userToSeat.get(id);
+    if (seatInfo) {
+      const { room, seat } = seatInfo;
+      if (seat >= 1 && seat <= CONSTANTS.MAX_SEATS) {
+        const roomManager = this.roomManagers.get(room);
+        if (roomManager) {
+          const seatData = roomManager.getSeat(seat);
+          if (seatData && seatData.namauser === id) {
+            ws.roomname = room;
+            this._addToRoomClients(ws, room);
+            await this._addUserConnection(id, ws);
+            await this.sendAllStateTo(ws, room);
+            const point = roomManager.getPoint(seat);
+            if (point) {
+              await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
             }
+            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+            await this.safeSend(ws, ["numberKursiSaya", seat]);
+            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+            return;
           }
         }
-        this.userToSeat.delete(id);
-        this.userCurrentRoom.delete(id);
       }
-      await this._addUserConnection(id, ws);
-      await this.safeSend(ws, ["needJoinRoom"]);
-    } catch (error) {
-      await this.safeSend(ws, ["error", "Reconnection failed"]);
+      this.userToSeat.delete(id);
+      this.userCurrentRoom.delete(id);
     }
+    await this._addUserConnection(id, ws);
+    await this.safeSend(ws, ["needJoinRoom"]);
+  } catch (error) {
+    console.error(`Error in handleSetIdTarget2 for ${id}:`, error);
+    await this.safeSend(ws, ["error", "Reconnection failed"]);
   }
+}
 
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
