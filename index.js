@@ -514,6 +514,8 @@ export class ChatServer2 {
     this._masterTickCounter = 0;
     this._masterTimer = null;
     this._startMasterTimer();
+    
+    console.log("🚀 ChatServer2 initialized");
   }
 
   _startMasterTimer() {
@@ -566,6 +568,7 @@ export class ChatServer2 {
       if (ws && ws.readyState !== 1) {
         const userId = ws.idtarget;
         if (userId && this.pendingDisconnects.has(userId)) {
+          console.log(`⏭️ Emergency cleanup skipping ${userId} (in grace period)`);
           continue;
         }
         await this._forceFullCleanupWebSocket(ws);
@@ -616,18 +619,25 @@ export class ChatServer2 {
     this._isCleaningUp = true;
 
     try {
+      console.log(`🧟 ZOMBIE CLEANUP START - Active clients: ${this._activeClients.size}, Pending: ${this.pendingDisconnects.size}`);
+      
       const zombies = [];
       for (const ws of this._activeClients) {
         const isZombie = !ws || ws.readyState !== 1 || ws._isClosing === true ||
           (ws._connectionTime && Date.now() - ws._connectionTime > 1800000);
-        if (isZombie) zombies.push(ws);
+        if (isZombie) {
+          console.log(`⚠️ Found zombie: userId=${ws.idtarget}, state=${ws.readyState}`);
+          zombies.push(ws);
+        }
       }
 
       for (const ws of zombies) {
         const userId = ws.idtarget;
         if (userId && this.pendingDisconnects.has(userId)) {
+          console.log(`⏭️ Skipping ${userId} - still in grace period`);
           continue;
         }
+        console.log(`💀 Cleaning zombie: ${userId}`);
         await this._forceFullCleanupWebSocket(ws);
       }
 
@@ -646,6 +656,7 @@ export class ChatServer2 {
       }
 
       for (const userId of orphanedUsers) {
+        console.log(`👤 Cleaning orphaned user: ${userId}`);
         await this._removeUserSeatAndPoint(userId);
         this.userConnections.delete(userId);
       }
@@ -669,6 +680,7 @@ export class ChatServer2 {
         }
       }
 
+      console.log(`🧟 ZOMBIE CLEANUP END - Active clients: ${this._activeClients.size}`);
     } catch (error) {}
     finally {
       this._isCleaningUp = false;
@@ -710,6 +722,7 @@ export class ChatServer2 {
         userId: userId
       });
       
+      console.log(`⏳ Grace period started for ${userId}, seat ${seatInfo.seat} in ${room}`);
       return;
     }
     
@@ -720,6 +733,7 @@ export class ChatServer2 {
       
       if (userId && room) {
         await this._removeUserSeatAndPointFromRoom(userId, room);
+        console.log(`🗑️ Cleaned up ${userId} from ${room}`);
       }
       
       if (userId) {
@@ -746,14 +760,20 @@ export class ChatServer2 {
     }
   }
 
-  // ⭐ INI METHOD YANG DIPERBAIKI - pendingDisconnects.delete() di PALING ATAS
   async _reconnectInGracePeriod(userId, newWs) {
-    // KRUSIAL: Hapus dari pendingDisconnects SEBELUM apapun
-    const pending = this.pendingDisconnects.get(userId);
-    if (!pending) return false;
+    console.log(`🟢 RECONNECT ATTEMPT for ${userId}`);
     
-    // HAPUS LANGSUNG DI SINI (PALING ATAS)
+    const pending = this.pendingDisconnects.get(userId);
+    if (!pending) {
+      console.log(`❌ No pending for ${userId}`);
+      return false;
+    }
+    
+    console.log(`✅ Pending found: seat=${pending.seat}, room=${pending.room}`);
+    
+    // ⭐ KRUSIAL: Hapus dari MAP PALING ATAS
     this.pendingDisconnects.delete(userId);
+    console.log(`🗑️ Pending deleted for ${userId}`);
     
     clearTimeout(pending.timeout);
     
@@ -763,6 +783,7 @@ export class ChatServer2 {
     
     // HAPUS OLD WS DARI SEMUA STRUKTUR DATA
     if (oldWs) {
+      console.log(`🧹 Cleaning oldWs for ${userId}`);
       oldWs._isForceCleanup = true;
       oldWs._isClosing = true;
       
@@ -790,12 +811,18 @@ export class ChatServer2 {
     }
     
     const roomManager = this.roomManagers.get(room);
-    if (!roomManager) return false;
+    if (!roomManager) {
+      console.log(`❌ RoomManager not found for ${room}`);
+      return false;
+    }
     
     const seatData = roomManager.getSeat(seatNumber);
     if (!seatData || seatData.namauser !== userId) {
+      console.log(`❌ Seat ${seatNumber} not owned by ${userId}, owner=${seatData?.namauser}`);
       return false;
     }
+    
+    console.log(`✅ Seat ${seatNumber} verified, owner=${seatData.namauser}`);
     
     // Setup koneksi baru
     newWs.roomname = room;
@@ -819,9 +846,13 @@ export class ChatServer2 {
     await this.sendAllStateTo(newWs, room, false);
     await this.safeSend(newWs, ["allRoomsUserCount", this.getAllRoomCountsArray()]);
     
-    // Broadcast ke semua user di room untuk refresh
+    // Broadcast ke semua user di room
     this.broadcastToRoom(room, ["allUpdateKursiList", room, roomManager.getAllSeatsMeta()]);
     this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
+    
+    console.log(`✅ RECONNECT SUCCESS for ${userId} to seat ${seatNumber} in ${room}`);
+    console.log(`📊 Current seats in ${room}: ${roomManager.getOccupiedCount()}`);
+    console.log(`📊 Pending disconnects left: ${this.pendingDisconnects.size}`);
     
     return true;
   }
