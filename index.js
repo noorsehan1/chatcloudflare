@@ -7,6 +7,13 @@
 //   - CHAT_SERVER_2 (Class Name: ChatServer2)
 //   - LOWCARD_GAME (Class Name: LowCardGameDO2)
 
+// ✅ IMPORT LowCardGameDO2 dari file terpisah
+import { LowCardGameDO2 } from "./lowcard-game-do2.js";
+
+// ✅ EXPORT kedua class yang dibutuhkan
+export { LowCardGameDO2 };
+export { ChatServer2 };
+
 const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL_TICKS: 900,
