@@ -1,4 +1,4 @@
- name = "chatcloudnew"
+name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-03"
 
@@ -12,4 +12,4 @@ class_name = "LowCardGameDO2"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer2", "LowCardGameDO2"]
+new_sqlite_classes = ["ChatServer2", "LowCardGameDO2"]
