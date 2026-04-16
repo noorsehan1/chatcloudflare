@@ -6,6 +6,10 @@ compatibility_date = "2026-04-03"
 name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
 
+[[durable_objects.bindings]]
+name = "LOWCARD_GAME_2"
+class_name = "LowCardGameDO2"
+
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer2"]
+new_classes = ["ChatServer2", "LowCardGameDO2"]
