@@ -7,7 +7,7 @@ name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
 
 [[durable_objects.bindings]]
-name = "LOWCARD_GAME_2"
+name = "LOWCARD_GAME"
 class_name = "LowCardGameDO2"
 
 [[migrations]]
