@@ -1054,29 +1054,16 @@ async _forceFullCleanupWebSocket(ws) {
     }
   }
 
-  async _doJoinRoom(ws, room) {
+async _doJoinRoom(ws, room) {
   try {
-    const existingSeatInfo = this.userToSeat.get(ws.idtarget);
-    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
-    let assignedSeat = null;
-    let roomManager = this.roomManagers.get(room);
-
-    // CASE 1: User sudah memiliki kursi di room ini
-    if (existingSeatInfo && existingSeatInfo.room === room) {
-      assignedSeat = existingSeatInfo.seat;
-      const seatData = roomManager.getSeat(assignedSeat);
-      
-      if (seatData && seatData.namauser === ws.idtarget) {
-        // UPDATE koneksi
-        ws.roomname = room;
-        this._addToRoomClients(ws, room);
-        await this._addUserConnection(ws.idtarget, ws);
-        this.userCurrentRoom.set(ws.idtarget, room);
-      } else {
-        this.userToSeat.delete(ws.idtarget);
-        assignedSeat = null;
-      }
+    // ============ CEK PERTAMA PALING AWAL ============
+    if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
+      await this.safeSend(ws, ["roomFull", room]);
+      return false;
     }
+
+    const currentRoomBeforeJoin = this.userCurrentRoom.get(ws.idtarget);
+    const roomManager = this.roomManagers.get(room);
 
     // HAPUS DARI ROOM LAMA JIKA ADA
     if (currentRoomBeforeJoin && currentRoomBeforeJoin !== room) {
@@ -1103,30 +1090,17 @@ async _forceFullCleanupWebSocket(ws) {
       this._removeFromRoomClients(ws, currentRoomBeforeJoin);
     }
 
-    // JIKA BELUM PUNYA KURSI, BUAT BARU
-    if (!assignedSeat) {
-      // CEK APAKAH ROOM PENUH
-      if (this.getRoomCount(room) >= CONSTANTS.MAX_SEATS) {
-        await this.safeSend(ws, ["roomFull", room]);
-        return false;
-      }
-      
-      assignedSeat = await this.assignNewSeat(room, ws.idtarget);
-      if (!assignedSeat) { 
-        await this.safeSend(ws, ["roomFull", room]); 
-        return false; 
-      }
-      
-      this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
-      this.userCurrentRoom.set(ws.idtarget, room);
-      ws.roomname = room;
-      this._addToRoomClients(ws, room);
-      await this._addUserConnection(ws.idtarget, ws);
-    }
+    // BUAT KURSI BARU (PASTI BERHASIL)
+    const assignedSeat = await this.assignNewSeat(room, ws.idtarget);
 
-    // ============ KIRIM SEMUA DATA SEKALI (HANYA 1X) ============
-    roomManager = this.roomManagers.get(room);
-    
+    // SET DATA USER
+    this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
+    this.userCurrentRoom.set(ws.idtarget, room);
+    ws.roomname = room;
+    this._addToRoomClients(ws, room);
+    await this._addUserConnection(ws.idtarget, ws);
+
+    // KIRIM SEMUA EVENT
     await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
     await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
@@ -1138,7 +1112,6 @@ async _forceFullCleanupWebSocket(ws) {
 
     await this.sendAllStateTo(ws, room);
     
-    // KIRIM ULANG SETELAH 200ms UNTUK PASTIKAN
     setTimeout(async () => {
       if (ws && ws.readyState === 1 && !ws._isClosing && !this._wsCleaningUp?.get(ws)) {
         await this.sendAllStateTo(ws, room);
