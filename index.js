@@ -1090,7 +1090,7 @@ async _doJoinRoom(ws, room) {
       this._removeFromRoomClients(ws, currentRoomBeforeJoin);
     }
 
-    // BUAT KURSI BARU (PASTI BERHASIL)
+    // BUAT KURSI BARU
     const assignedSeat = await this.assignNewSeat(room, ws.idtarget);
 
     // SET DATA USER
@@ -1100,24 +1100,17 @@ async _doJoinRoom(ws, room) {
     this._addToRoomClients(ws, room);
     await this._addUserConnection(ws.idtarget, ws);
 
-    // KIRIM SEMUA EVENT
+    // KIRIM rooMasuk LANGSUNG (PALING AWAL)
+    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+
+    // DELAY 1000ms SEBELUM KIRIM STATE
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // KIRIM SEMUA STATE SETELAH DELAY
     await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
     await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
-
-   
-    
-    if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
-
-   
-    
-    setTimeout(async () => {
-      if (ws && ws.readyState === 1 && !ws._isClosing && !this._wsCleaningUp?.get(ws)) {
-            await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-
-           await this.sendAllStateTo(ws, room);
-      }
-    }, 1000);
+    await this.sendAllStateTo(ws, room);
     
     return true;
   } catch (error) {
