@@ -1196,7 +1196,7 @@ export class ChatServer2 {
           await new Promise(resolve => setTimeout(resolve, 50));
           await this.safeSend(ws, ["rooMasuk", seatNum, room]);
           
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, 1000));
           
           if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
           
@@ -1269,7 +1269,7 @@ export class ChatServer2 {
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 1000));
       
       if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
 
