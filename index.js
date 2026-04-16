@@ -460,7 +460,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer2 (Durable Object) - FINAL STABLE
 // ─────────────────────────────────────────────
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
