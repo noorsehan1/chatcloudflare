@@ -1,4 +1,4 @@
-// ==================== lowcard-game-do.js ====================
+// ==================== lowcard-game-do2.js ====================
 // Durable Object khusus untuk game LowCard - 1 DO per room
 
 const CONSTANTS = Object.freeze({
@@ -14,7 +14,7 @@ const CONSTANTS = Object.freeze({
   CLEANUP_INTERVAL_MS: 60000,
 });
 
-export class LowCardGameDO {
+export class LowCardGameDO2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
