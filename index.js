@@ -6,7 +6,7 @@
 // Durable Object Binding: CHAT_SERVER_2
 // Class Name: ChatServer2
 
-let LowCardGameManager;
+ let LowCardGameManager;
 try {
   LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
 } catch (e) {
