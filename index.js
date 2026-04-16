@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - FINAL STABLE VERSION ====================
+// ==================== CHAT SERVER 2 - FULL AUTO RESET & AUTO CLEANUP ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
@@ -51,6 +51,8 @@ const CONSTANTS = Object.freeze({
   
   RECONNECT_GRACE_PERIOD_MS: 3000,
   SEAT_RELEASE_DELAY_MS: 500,
+  
+  ORPHAN_CLEANUP_INTERVAL_TICKS: 30,
 });
 
 const roomList = Object.freeze([
@@ -379,7 +381,7 @@ class RoomManager {
     if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return false;
     const existingSeat = this.seats.get(seatNumber);
     const entry = {
-      noimageUrl: seatData.noimageUrl || "",
+      noimageUrl: seatData.noimageUrl?.slice(0, 255) || "",
       namauser: seatData.namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || "",
       color: seatData.color || "",
       itembawah: seatData.itembawah || 0,
@@ -457,7 +459,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - FINAL STABLE
+// ChatServer2 (Durable Object) - FULL AUTO RESET & AUTO CLEANUP
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -514,8 +516,173 @@ export class ChatServer2 {
 
     this._masterTickCounter = 0;
     this._masterTimer = null;
+    
+    // AUTO RESET ON DEPLOY (OTOMATIS)
+    this._autoResetOnDeploy();
+    
     this._startMasterTimer();
   }
+
+  // ========== AUTO RESET ON DEPLOY (TANPA UBAH ANGKA) ==========
+  async _autoResetOnDeploy() {
+    try {
+      const currentDeployId = this._generateDeployId();
+      const lastDeployId = await this.state.storage.get("deploy_id") || "";
+      
+      if (lastDeployId !== currentDeployId) {
+        console.log(`[AUTO RESET] New deployment detected! Resetting all data...`);
+        await this.state.storage.put("deploy_id", currentDeployId);
+        await this._forceResetAllData();
+        console.log(`[AUTO RESET] All data has been reset successfully!`);
+      }
+    } catch (error) {
+      console.error(`[AUTO RESET] Error:`, error);
+    }
+  }
+  
+  _generateDeployId() {
+    const constantsStr = JSON.stringify({
+      maxSeats: CONSTANTS.MAX_SEATS,
+      maxNumber: CONSTANTS.MAX_NUMBER,
+      roomCount: roomList.length,
+      gameRoomsCount: GAME_ROOMS.length
+    });
+    
+    let hash = 0;
+    for (let i = 0; i < constantsStr.length; i++) {
+      const char = constantsStr.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    
+    return `${Math.abs(hash)}_${this._startTime}`;
+  }
+  
+  async _forceResetAllData() {
+    const snapshot = Array.from(this._activeClients);
+    for (const ws of snapshot) {
+      if (ws && ws.readyState === 1 && !ws._isClosing) {
+        try {
+          await this.safeSend(ws, ["serverRestart", "Server is restarting, please reconnect..."]);
+          ws.close(1000, "Server restart");
+        } catch (e) {}
+      }
+      this._wsCleaningUp.set(ws, true);
+    }
+    
+    this._activeClients.clear();
+    this.userToSeat.clear();
+    this.userCurrentRoom.clear();
+    this.userConnections.clear();
+    this._wsCleaningUp.clear();
+    this._activeListeners.clear();
+    
+    for (const room of roomList) {
+      if (this.roomManagers.has(room)) {
+        this.roomManagers.get(room).destroy();
+      }
+      this.roomManagers.set(room, new RoomManager(room));
+      this.roomClients.set(room, new Set());
+    }
+    
+    if (this.chatBuffer) {
+      await this.chatBuffer.destroy();
+      this.chatBuffer = new GlobalChatBuffer();
+      this.chatBuffer.setFlushCallback((room, msg, msgId) => this._sendDirectToRoom(room, msg, msgId));
+    }
+    
+    if (this.pmBuffer) {
+      await this.pmBuffer.destroy();
+      this.pmBuffer = new PMBuffer();
+      this.pmBuffer.setFlushCallback(async (targetId, message) => {
+        const targetConnections = this.userConnections.get(targetId);
+        if (targetConnections) {
+          for (const client of targetConnections) {
+            if (client && client.readyState === 1 && !client._isClosing && !this._wsCleaningUp.get(client)) {
+              await this.safeSend(client, message);
+              break;
+            }
+          }
+        }
+      });
+    }
+    
+    try {
+      if (this.lowcard && typeof this.lowcard.destroy === 'function') {
+        await this.lowcard.destroy();
+      }
+      this.lowcard = new LowCardGameManager(this);
+    } catch (error) {
+      this.lowcard = null;
+    }
+    
+    this.currentNumber = 1;
+    this._masterTickCounter = 0;
+    this._startTime = Date.now();
+  }
+  // ==========================================================
+
+  // ========== HAPUS SEMUA DATA USER (KURSI & POIN) ==========
+  async _removeAllUserData(userId) {
+    if (!userId) return;
+    
+    const seatInfo = this.userToSeat.get(userId);
+    if (seatInfo) {
+      const { room, seat } = seatInfo;
+      const roomManager = this.roomManagers.get(room);
+      if (roomManager) {
+        roomManager.removeSeat(seat);
+        roomManager.removePoint(seat);
+        this.broadcastToRoom(room, ["removeKursi", room, seat]);
+        this.broadcastToRoom(room, ["pointRemoved", room, seat]);
+        this.updateRoomCount(room);
+      }
+    }
+    
+    this.userToSeat.delete(userId);
+    this.userCurrentRoom.delete(userId);
+  }
+  
+  // Bersihkan user orphaned (punya kursi tapi ga ada koneksi)
+  async _cleanupOrphanedUsers() {
+    const orphanedUsers = [];
+    
+    for (const [userId, seatInfo] of this.userToSeat) {
+      const connections = this.userConnections.get(userId);
+      let hasActiveConnection = false;
+      
+      if (connections) {
+        for (const conn of connections) {
+          if (conn && conn.readyState === 1 && !conn._isClosing && !this._wsCleaningUp.get(conn)) {
+            hasActiveConnection = true;
+            break;
+          }
+        }
+      }
+      
+      if (!hasActiveConnection) {
+        orphanedUsers.push({ userId, seatInfo });
+      }
+    }
+    
+    for (const { userId, seatInfo } of orphanedUsers) {
+      const roomManager = this.roomManagers.get(seatInfo.room);
+      if (roomManager) {
+        roomManager.removeSeat(seatInfo.seat);
+        roomManager.removePoint(seatInfo.seat);
+        this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+        this.broadcastToRoom(seatInfo.room, ["pointRemoved", seatInfo.room, seatInfo.seat]);
+        this.updateRoomCount(seatInfo.room);
+      }
+      this.userToSeat.delete(userId);
+      this.userCurrentRoom.delete(userId);
+    }
+    
+    if (orphanedUsers.length > 0) {
+      console.log(`[ORPHAN CLEANUP] Removed ${orphanedUsers.length} orphaned users`);
+    }
+  }
+  // ==========================================================
 
   _startMasterTimer() {
     if (this._masterTimer) clearInterval(this._masterTimer);
@@ -528,6 +695,11 @@ export class ChatServer2 {
     const now = Date.now();
 
     try {
+      // CLEANUP ORPHANED USERS SETIAP 30 DETIK
+      if (this._masterTickCounter % CONSTANTS.ORPHAN_CLEANUP_INTERVAL_TICKS === 0) {
+        this._cleanupOrphanedUsers();
+      }
+
       if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) {
         this._handleNumberTick();
       }
@@ -639,13 +811,15 @@ export class ChatServer2 {
             }
           }
           
+          // HAPUS SEMUA DATA USER JIKA TIDAK ADA KONEKSI LAIN
           if (userConnSet.size === 0 || !hasOtherValidConnection) {
             this.userConnections.delete(userId);
-            
+            await this._removeAllUserData(userId);
+          } else {
+            // Masih ada koneksi lain, tapi hapus dari room saat ini
             if (userId && room) {
               const seatInfo = this.userToSeat.get(userId);
               if (seatInfo && seatInfo.room === room) {
-                // Hapus dari userToSeat SEBELUM remove kursi
                 this.userToSeat.delete(userId);
                 this.userCurrentRoom.delete(userId);
                 await this._removeUserSeatAndPointFromRoom(userId, room);
@@ -679,7 +853,6 @@ export class ChatServer2 {
 
     if (roomManager) {
       const seatData = roomManager.getSeat(seatNumber);
-      // GUARD: Cegah double cleanup jika kursi sudah di-remove
       if (!seatData || seatData.namauser !== userId) {
         return false;
       }
@@ -1116,6 +1289,9 @@ export class ChatServer2 {
         await this.safeRemoveSeat(room, seatInfo.seat, ws.idtarget);
         this.broadcastToRoom(room, ["removeKursi", room, seatInfo.seat]);
         this.broadcastToRoom(room, ["pointRemoved", room, seatInfo.seat]);
+        
+        // HAPUS SEMUA DATA USER KARENA LEAVE ROOM
+        await this._removeAllUserData(ws.idtarget);
       }
       this._removeFromRoomClients(ws, room);
       await this._removeUserConnection(ws.idtarget, ws);
@@ -1200,7 +1376,6 @@ export class ChatServer2 {
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return;
     
-    // Handle binary messages (jaga-jaga, Cloudflare otomatis handle PING/PONG)
     if (raw instanceof ArrayBuffer) {
       return;
     }
@@ -1424,13 +1599,14 @@ export class ChatServer2 {
         totalPoints += rm.points.size;
       }
 
+      const deployId = await this.state.storage.get("deploy_id") || "first_run";
+
       return {
         timestamp: Date.now(),
         uptime: Date.now() - this._startTime,
-        memory: {
-          note: "process.memoryUsage() not available in Cloudflare Workers",
-          activeConnections: activeReal,
-          connectionPressure: `${Math.round((activeReal / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`
+        deployInfo: {
+          currentDeployId: deployId.substring(0, 30) + "...",
+          autoResetEnabled: true
         },
         activeClients: { total: this._activeClients.size, real: activeReal },
         roomClients: { total: totalRoomClients },
@@ -1486,12 +1662,16 @@ export class ChatServer2 {
           let activeCount = 0;
           const snapshot = Array.from(this._activeClients);
           for (const c of snapshot) if (c && c.readyState === 1 && !this._wsCleaningUp.get(c)) activeCount++;
+          const deployId = await this.state.storage.get("deploy_id") || "first_run";
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeCount,
-            connectionPressure: `${Math.round((activeCount / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
+            autoReset: {
+              enabled: true,
+              deployId: deployId.substring(0, 20) + "..."
+            },
             chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
             pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
           }), { status: 200, headers: { "content-type": "application/json" } });
@@ -1505,6 +1685,11 @@ export class ChatServer2 {
           return new Response(JSON.stringify({ counts, total: Object.values(counts).reduce((a, b) => a + b, 0) }), { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/shutdown") { await this.shutdown(); return new Response("Shutting down...", { status: 200 }); }
+        if (url.pathname === "/reset") { 
+          await this._forceResetAllData();
+          await this.state.storage.put("last_reset_time", Date.now());
+          return new Response("All data has been reset successfully!", { status: 200 }); 
+        }
         return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200 });
       }
 
@@ -1578,10 +1763,10 @@ export default {
       const chatObj = env.CHAT_SERVER_2.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
-      if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
+      if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown", "/reset"].includes(url.pathname)) return chatObj.fetch(req);
       return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
     } catch (error) {
       return new Response("Server error", { status: 500 });
     }
   }
-};
+}
