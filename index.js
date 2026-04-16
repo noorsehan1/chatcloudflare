@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - WITH PROBE DETECTION ====================
+// ==================== CHAT SERVER 2 - FINAL VERSION (No Probe, No Age Limit) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
@@ -21,7 +21,7 @@ try {
 const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL_TICKS: 900,
-  ZOMBIE_CLEANUP_TICKS: 600,  // Kurangi frekuensi cleanup (jadi setiap 10 menit)
+  ZOMBIE_CLEANUP_TICKS: 600,        // Cek setiap 10 menit
 
   MAX_GLOBAL_CONNECTIONS: 250,
   MAX_ACTIVE_CLIENTS_LIMIT: 250,
@@ -48,15 +48,10 @@ const CONSTANTS = Object.freeze({
 
   CONNECTION_CRITICAL_THRESHOLD_RATIO: 0.9,
   CONNECTION_WARNING_THRESHOLD_RATIO: 0.75,
-  FORCE_CLEANUP_MEMORY_TICKS: 60,  // Kurangi frekuensi
+  FORCE_CLEANUP_MEMORY_TICKS: 60,
   
   RECONNECT_GRACE_PERIOD_MS: 3000,
   SEAT_RELEASE_DELAY_MS: 500,
-  
-  // PROBE CONFIG - Deteksi koneksi mati TANPA client heartbeat
-  PROBE_INTERVAL_TICKS: 60,        // Probe setiap 60 detik
-  MAX_PROBE_FAILURES: 2,           // 2 kali gagal = mati (sekitar 2 menit)
-  MAX_CONNECTION_AGE_HOURS: 24,    // Maksimal koneksi 24 jam
 });
 
 const roomList = Object.freeze([
@@ -463,7 +458,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - WITH PROBE DETECTION
+// ChatServer2 (Durable Object) - FINAL VERSION
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -484,10 +479,7 @@ export class ChatServer2 {
     this.userConnections = new Map();
 
     this._wsCleaningUp = new Map();
-    this._wsProbeFailures = new Map();  // Track probe failures
-
     this.roomClients = new Map();
-
     this._activeListeners = new Map();
 
     this.currentNumber = 1;
@@ -543,12 +535,6 @@ export class ChatServer2 {
 
       if (this.chatBuffer) this.chatBuffer.tick(now);
 
-      // PROBE: setiap 60 detik - deteksi koneksi mati
-      if (this._masterTickCounter % CONSTANTS.PROBE_INTERVAL_TICKS === 0) {
-        this._probeDeadConnections();
-      }
-
-      // Cleanup zombie lebih jarang (setiap 10 menit)
       if (this._masterTickCounter % CONSTANTS.ZOMBIE_CLEANUP_TICKS === 0) {
         this._cleanupZombieWebSocketsAndData();
       }
@@ -563,46 +549,6 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ============ PROBE DETECTION - TANPA CLIENT RESPON ============
-  async _probeDeadConnections() {
-    const toRemove = [];
-    const probeMsg = JSON.stringify(["__probe__", Date.now()]);
-    
-    for (const ws of this._activeClients) {
-      // Skip jika ws sudah bermasalah
-      if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) {
-        toRemove.push(ws);
-        continue;
-      }
-      
-      // Ambil atau inisialisasi failure count
-      let failures = this._wsProbeFailures.get(ws) || 0;
-      
-      try {
-        // Kirim probe - client bisa abaikan, tidak perlu respon
-        ws.send(probeMsg);
-        // Jika sukses, reset failures
-        if (failures > 0) {
-          this._wsProbeFailures.set(ws, 0);
-        }
-      } catch (error) {
-        // Gagal kirim = koneksi bermasalah
-        failures++;
-        this._wsProbeFailures.set(ws, failures);
-        
-        if (failures >= CONSTANTS.MAX_PROBE_FAILURES) {
-          toRemove.push(ws);
-        }
-      }
-    }
-    
-    // Bersihkan koneksi yang mati
-    for (const ws of toRemove) {
-      this._wsProbeFailures.delete(ws);
-      await this._forceFullCleanupWebSocket(ws);
-    }
-  }
-
   async _checkConnectionPressure() {
     const total = this._activeClients.size;
     const max = CONSTANTS.MAX_GLOBAL_CONNECTIONS;
@@ -610,7 +556,7 @@ export class ChatServer2 {
     if (total > max * CONSTANTS.CONNECTION_CRITICAL_THRESHOLD_RATIO) {
       await this._emergencyFullCleanup();
     } else if (total > max * CONSTANTS.CONNECTION_WARNING_THRESHOLD_RATIO) {
-      this.chatBuffer._flush();
+      if (this.chatBuffer) this.chatBuffer._flush();
     }
   }
 
@@ -618,7 +564,8 @@ export class ChatServer2 {
     await this.chatBuffer.flushAll();
     await this.pmBuffer.flushAll();
 
-    for (const ws of Array.from(this._activeClients)) {
+    const snapshot = Array.from(this._activeClients);
+    for (const ws of snapshot) {
       if (ws && ws.readyState !== 1 && !this._wsCleaningUp.get(ws)) {
         await this._forceFullCleanupWebSocket(ws);
       }
@@ -642,7 +589,9 @@ export class ChatServer2 {
 
       const message = JSON.stringify(["currentNumber", this.currentNumber]);
       const clientsToNotify = [];
-      for (const client of this._activeClients) {
+      const snapshot = Array.from(this._activeClients);
+      
+      for (const client of snapshot) {
         if (client && client.readyState === 1 && client.roomname && !client._isClosing && !this._wsCleaningUp.get(client)) {
           clientsToNotify.push(client);
         }
@@ -667,7 +616,6 @@ export class ChatServer2 {
     if (!ws || this._wsCleaningUp.get(ws)) return;
     
     this._wsCleaningUp.set(ws, true);
-    this._wsProbeFailures.delete(ws);  // Cleanup probe tracking
 
     const userId = ws.idtarget;
     const room = ws.roomname;
@@ -731,16 +679,13 @@ export class ChatServer2 {
 
     try {
       const zombies = [];
-      const now = Date.now();
-      const MAX_CONNECTION_AGE_MS = CONSTANTS.MAX_CONNECTION_AGE_HOURS * 60 * 60 * 1000;
+      const snapshot = Array.from(this._activeClients);
       
-      for (const ws of this._activeClients) {
-        // Hanya cleanup jika: koneksi mati ATAU terlalu tua (24 jam)
+      for (const ws of snapshot) {
+        // HANYA cleanup jika koneksi sudah MATI
         const isDead = !ws || ws.readyState !== 1 || ws._isClosing === true;
-        const isTooOld = ws._connectionTime && (now - ws._connectionTime > MAX_CONNECTION_AGE_MS);
-        const isZombie = isDead || isTooOld;
         
-        if (isZombie && !this._wsCleaningUp.get(ws)) {
+        if (isDead && !this._wsCleaningUp.get(ws)) {
           zombies.push(ws);
         }
       }
@@ -932,8 +877,9 @@ export class ChatServer2 {
   }
 
   async _addUserConnection(userId, ws) {
-    const release = await this.connectionLocker.acquire(`conn_${userId}`);
+    let release = null;
     try {
+      release = await this.connectionLocker.acquire(`conn_${userId}`);
       let userConnections = this.userConnections.get(userId);
       if (!userConnections) {
         userConnections = new Set();
@@ -962,19 +908,24 @@ export class ChatServer2 {
       }
 
       userConnections.add(ws);
-    } finally { release(); }
+    } finally { 
+      if (release) try { release(); } catch (e) {}
+    }
   }
 
   async _removeUserConnection(userId, ws) {
     if (!userId || !ws) return;
-    const release = await this.connectionLocker.acquire(`conn_${userId}`);
+    let release = null;
     try {
+      release = await this.connectionLocker.acquire(`conn_${userId}`);
       const userConnections = this.userConnections.get(userId);
       if (userConnections) {
         userConnections.delete(ws);
         if (userConnections.size === 0) this.userConnections.delete(userId);
       }
-    } finally { release(); }
+    } finally { 
+      if (release) try { release(); } catch (e) {}
+    }
   }
 
   _addToRoomClients(ws, room) {
@@ -989,7 +940,8 @@ export class ChatServer2 {
 
   _removeFromRoomClients(ws, room) {
     if (!ws || !room) return;
-    this.roomClients.get(room)?.delete(ws);
+    const clientSet = this.roomClients.get(room);
+    if (clientSet) clientSet.delete(ws);
   }
 
   _cleanupWebSocketListeners(ws) {
@@ -1050,17 +1002,21 @@ export class ChatServer2 {
 
   broadcastToRoom(room, msg) {
     if (!room || !roomList.includes(room)) return 0;
-
-    if (msg[0] === "gift") {
+    
+    try {
+      if (msg[0] === "gift") {
+        return this._sendDirectToRoom(room, msg);
+      }
+      
+      if (msg[0] === "chat") {
+        if (this.chatBuffer) this.chatBuffer.add(room, msg);
+        return this.roomClients.get(room)?.size || 0;
+      }
+      
       return this._sendDirectToRoom(room, msg);
+    } catch (error) {
+      return 0;
     }
-
-    if (msg[0] === "chat") {
-      this.chatBuffer.add(room, msg);
-      return this.roomClients.get(room)?.size || 0;
-    }
-
-    return this._sendDirectToRoom(room, msg);
   }
 
   async safeSend(ws, msg) {
@@ -1070,7 +1026,8 @@ export class ChatServer2 {
       ws.send(message);
       return true;
     } catch (error) {
-      if (error.code === 'ECONNRESET' || error.message?.includes('ECONNRESET') || error.message?.includes('CLOSED')) {
+      if (!ws._isCleaningUp && (error.code === 'ECONNRESET' || error.message?.includes('ECONNRESET') || error.message?.includes('CLOSED'))) {
+        ws._isCleaningUp = true;
         await this._forceFullCleanupWebSocket(ws);
       }
       return false;
@@ -1313,7 +1270,18 @@ export class ChatServer2 {
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return;
     let messageStr = raw;
-    if (raw instanceof ArrayBuffer) try { messageStr = new TextDecoder().decode(raw); } catch (e) { return; }
+    if (raw instanceof ArrayBuffer) {
+      // OkHttp PING - kirim PONG balik
+      try {
+        ws.send(new ArrayBuffer(0));
+      } catch (e) {}
+      return;
+    }
+    if (typeof raw === 'string') {
+      messageStr = raw;
+    } else {
+      try { messageStr = new TextDecoder().decode(raw); } catch (e) { return; }
+    }
     if (messageStr.length > CONSTANTS.MAX_MESSAGE_SIZE) return;
     let data;
     try { data = JSON.parse(messageStr); } catch (e) { return; }
@@ -1324,11 +1292,6 @@ export class ChatServer2 {
   async _processMessage(ws, data, evt) {
     try {
       switch (evt) {
-        case "__probe__":
-          // Client bisa abaikan, tidak perlu respon
-          // Tapi jika mau respon, bisa tambahkan case "__pong__"
-          break;
-          
         case "isInRoom":
           await this.safeSend(ws, ["inRoomStatus", this.userCurrentRoom.get(ws.idtarget) !== undefined]);
           break;
@@ -1513,49 +1476,58 @@ export class ChatServer2 {
   }
 
   async getMemoryStats() {
-    let activeReal = 0;
-    for (const c of this._activeClients) if (c?.readyState === 1 && !this._wsCleaningUp.get(c)) activeReal++;
+    try {
+      const snapshot = Array.from(this._activeClients);
+      let activeReal = 0;
+      for (const c of snapshot) {
+        if (c?.readyState === 1 && !this._wsCleaningUp.get(c)) activeReal++;
+      }
 
-    let totalRoomClients = 0;
-    for (const clientSet of this.roomClients.values()) totalRoomClients += clientSet.size;
+      let totalRoomClients = 0;
+      for (const clientSet of this.roomClients.values()) totalRoomClients += clientSet.size;
 
-    let totalSeats = 0, totalPoints = 0;
-    for (const rm of this.roomManagers.values()) {
-      totalSeats += rm.seats.size;
-      totalPoints += rm.points.size;
+      let totalSeats = 0, totalPoints = 0;
+      for (const rm of this.roomManagers.values()) {
+        totalSeats += rm.seats.size;
+        totalPoints += rm.points.size;
+      }
+
+      return {
+        timestamp: Date.now(),
+        uptime: Date.now() - this._startTime,
+        memory: {
+          note: "process.memoryUsage() not available in Cloudflare Workers",
+          activeConnections: activeReal,
+          connectionPressure: `${Math.round((activeReal / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`
+        },
+        activeClients: { total: this._activeClients.size, real: activeReal },
+        roomClients: { total: totalRoomClients },
+        userConnections: this.userConnections.size,
+        userToSeatSize: this.userToSeat.size,
+        chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
+        pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
+        seats: totalSeats,
+        points: totalPoints
+      };
+    } catch (error) {
+      return { error: "Failed to get stats" };
     }
-
-    return {
-      timestamp: Date.now(),
-      uptime: Date.now() - this._startTime,
-      memory: {
-        note: "process.memoryUsage() not available in Cloudflare Workers",
-        activeConnections: activeReal,
-        connectionPressure: `${Math.round((activeReal / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`
-      },
-      activeClients: { total: this._activeClients.size, real: activeReal },
-      roomClients: { total: totalRoomClients },
-      userConnections: this.userConnections.size,
-      userToSeatSize: this.userToSeat.size,
-      chatBuffer: this.chatBuffer.getStats(),
-      pmBuffer: this.pmBuffer.getStats(),
-      seats: totalSeats,
-      points: totalPoints,
-      probeFailures: this._wsProbeFailures.size
-    };
   }
 
   async shutdown() {
     if (this._isClosing) return;
     this._isClosing = true;
     if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
-    await this.chatBuffer.flushAll();
-    await this.chatBuffer.destroy();
-    await this.pmBuffer.destroy();
+    if (this.chatBuffer) {
+      await this.chatBuffer.flushAll();
+      await this.chatBuffer.destroy();
+    }
+    if (this.pmBuffer) await this.pmBuffer.destroy();
     if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch (e) {}
     this.lowcard = null;
 
-    for (const ws of Array.from(this._activeClients)) {
+    const snapshot = Array.from(this._activeClients);
+    for (const ws of snapshot) {
       if (ws && ws.readyState === 1 && !ws._isClosing && !this._wsCleaningUp.get(ws)) {
         try { this._cleanupWebSocketListeners(ws); ws.close(1000, "Server shutdown"); } catch (e) {}
       }
@@ -1570,7 +1542,6 @@ export class ChatServer2 {
     this.userConnections.clear();
     this._activeListeners.clear();
     this._wsCleaningUp.clear();
-    this._wsProbeFailures.clear();
   }
 
   async fetch(request) {
@@ -1581,16 +1552,16 @@ export class ChatServer2 {
       if (upgrade.toLowerCase() !== "websocket") {
         if (url.pathname === "/health") {
           let activeCount = 0;
-          for (const c of this._activeClients) if (c && c.readyState === 1 && !this._wsCleaningUp.get(c)) activeCount++;
+          const snapshot = Array.from(this._activeClients);
+          for (const c of snapshot) if (c && c.readyState === 1 && !this._wsCleaningUp.get(c)) activeCount++;
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeCount,
             connectionPressure: `${Math.round((activeCount / CONSTANTS.MAX_GLOBAL_CONNECTIONS) * 100)}%`,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
-            chatBuffer: this.chatBuffer.getStats(),
-            pmBuffer: this.pmBuffer.getStats(),
-            probeFailures: this._wsProbeFailures.size
+            chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
+            pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/debug/memory") {
@@ -1600,30 +1571,6 @@ export class ChatServer2 {
           const counts = {};
           for (const room of roomList) counts[room] = this.getRoomCount(room);
           return new Response(JSON.stringify({ counts, total: Object.values(counts).reduce((a, b) => a + b, 0) }), { headers: { "content-type": "application/json" } });
-        }
-        if (url.pathname === "/debug/probe") {
-          const probeStats = [];
-          const now = Date.now();
-          for (const ws of this._activeClients) {
-            if (ws && ws.readyState === 1) {
-              const failures = this._wsProbeFailures.get(ws) || 0;
-              probeStats.push({
-                user: ws.idtarget,
-                room: ws.roomname,
-                age_seconds: Math.round((now - ws._connectionTime) / 1000),
-                probe_failures: failures,
-                is_healthy: failures === 0
-              });
-            }
-          }
-          return new Response(JSON.stringify({
-            total: probeStats.length,
-            healthy: probeStats.filter(s => s.is_healthy).length,
-            unhealthy: probeStats.filter(s => !s.is_healthy).length,
-            probe_interval_seconds: CONSTANTS.PROBE_INTERVAL_TICKS,
-            max_failures: CONSTANTS.MAX_PROBE_FAILURES,
-            connections: probeStats
-          }, null, 2), { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/shutdown") { await this.shutdown(); return new Response("Shutting down...", { status: 200 }); }
         return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200 });
@@ -1647,6 +1594,7 @@ export class ChatServer2 {
         await Promise.race([acceptPromise, timeoutPromise]);
       } catch (acceptError) {
         abortController.abort();
+        try { server.close(); } catch (e) {}
         return new Response("WebSocket accept timeout", { status: 500 });
       }
 
@@ -1654,15 +1602,29 @@ export class ChatServer2 {
       ws.roomname = undefined;
       ws.idtarget = undefined;
       ws._isClosing = false;
+      ws._isCleaningUp = false;
       ws._connectionTime = Date.now();
       ws._abortController = abortController;
 
       this._activeClients.add(ws);
-      this._wsProbeFailures.set(ws, 0);  // Initialize probe failures
 
-      const messageHandler = (ev) => { this.handleMessage(ws, ev.data).catch(() => {}); };
-      const errorHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
-      const closeHandler = () => { this._forceFullCleanupWebSocket(ws).catch(() => {}); };
+      const messageHandler = async (ev) => {
+        // Handle OkHttp PING (ArrayBuffer)
+        if (ev.data instanceof ArrayBuffer) {
+          try {
+            ws.send(new ArrayBuffer(0)); // Kirim PONG
+          } catch (e) {}
+          return;
+        }
+        await this.handleMessage(ws, ev.data);
+      };
+      
+      const errorHandler = () => { 
+        this._forceFullCleanupWebSocket(ws).catch(() => {}); 
+      };
+      const closeHandler = () => { 
+        this._forceFullCleanupWebSocket(ws).catch(() => {}); 
+      };
 
       ws.addEventListener("message", messageHandler, { signal: abortController.signal });
       ws.addEventListener("error", errorHandler, { signal: abortController.signal });
@@ -1691,7 +1653,7 @@ export default {
       const chatObj = env.CHAT_SERVER_2.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       const url = new URL(req.url);
-      if (["/health", "/debug/memory", "/debug/roomcounts", "/debug/probe", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
+      if (["/health", "/debug/memory", "/debug/roomcounts", "/shutdown"].includes(url.pathname)) return chatObj.fetch(req);
       return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200, headers: { "content-type": "text/plain" } });
     } catch (error) {
       return new Response("Server error", { status: 500 });
