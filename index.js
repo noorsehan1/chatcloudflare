@@ -1101,22 +1101,23 @@ async _doJoinRoom(ws, room) {
     await this._addUserConnection(ws.idtarget, ws);
 
     // KIRIM SEMUA EVENT
-    await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
     await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
     await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
 
-    await new Promise(resolve => setTimeout(resolve, 150));
+   
     
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return true;
 
-    await this.sendAllStateTo(ws, room);
+   
     
     setTimeout(async () => {
       if (ws && ws.readyState === 1 && !ws._isClosing && !this._wsCleaningUp?.get(ws)) {
-        await this.sendAllStateTo(ws, room);
+            await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
+
+           await this.sendAllStateTo(ws, room);
       }
-    }, 200);
+    }, 1000);
     
     return true;
   } catch (error) {
