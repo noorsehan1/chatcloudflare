@@ -1,18 +1,22 @@
-// ==================== CHAT SERVER 2 - WITH SEPARATE LOWCARD GAME DO ====================
+// ==================== CHAT SERVER 2 - FULL STABLE WITH RECONNECT FIX ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
 //
-// Durable Object Bindings: 
-//   - CHAT_SERVER_2 (Class Name: ChatServer2)
-//   - LOWCARD_GAME (Class Name: LowCardGameDO2)
+// Durable Object Binding: CHAT_SERVER_2
+// Class Name: ChatServer2
 
-// ✅ IMPORT LowCardGameDO2 dari file terpisah
-import { LowCardGameDO2 } from "./lowcard-game-do2.js";
-
-// ✅ EXPORT kedua class yang dibutuhkan
-export { LowCardGameDO2 };
-export { ChatServer2 };
+let LowCardGameManager;
+try {
+  LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
+} catch (e) {
+  LowCardGameManager = class StubLowCardGameManager {
+    constructor() {}
+    masterTick() {}
+    async handleEvent() {}
+    async destroy() {}
+  };
+}
 
 const CONSTANTS = Object.freeze({
   MASTER_TICK_INTERVAL_MS: 1000,
@@ -463,7 +467,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - WITH LOWCARD GAME DO
+// ChatServer2 (Durable Object) - FINAL FULL CODE
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -508,8 +512,12 @@ export class ChatServer2 {
       }
     });
 
-    // Cache untuk Game DO references
-    this._gameDOCache = new Map();
+    this.lowcard = null;
+    try {
+      this.lowcard = new LowCardGameManager(this);
+    } catch (error) {
+      this.lowcard = null;
+    }
 
     for (const room of roomList) {
       this.roomManagers.set(room, new RoomManager(room));
@@ -520,34 +528,6 @@ export class ChatServer2 {
     this._masterTimer = null;
     this._startMasterTimer();
   }
-
-  // ==================== GAME DO METHODS ====================
-  
-  async _getGameDO(roomName) {
-    if (!GAME_ROOMS.includes(roomName)) return null;
-    
-    if (!this._gameDOCache.has(roomName)) {
-      const gameDOId = this.env.LOWCARD_GAME.idFromName(roomName);
-      const gameDO = this.env.LOWCARD_GAME.get(gameDOId);
-      this._gameDOCache.set(roomName, gameDO);
-    }
-    
-    return this._gameDOCache.get(roomName);
-  }
-
-  async sendToUser(userId, message) {
-    const connections = this.userConnections.get(userId);
-    if (!connections) return false;
-    
-    for (const client of connections) {
-      if (client && client.readyState === 1 && !client._isClosing && !this._wsCleaningUp.get(client)) {
-        return this.safeSend(client, message);
-      }
-    }
-    return false;
-  }
-
-  // ==================== TIMER METHODS ====================
 
   _startMasterTimer() {
     if (this._masterTimer) clearInterval(this._masterTimer);
@@ -571,6 +551,9 @@ export class ChatServer2 {
         this._cleanupStaleReconnectEntries();
       }
 
+      if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
+        this.lowcard.masterTick();
+      }
     } catch (error) {}
   }
 
@@ -645,8 +628,6 @@ export class ChatServer2 {
       }
     } catch (error) {}
   }
-
-  // ==================== WEBSOCKET CLEANUP ====================
 
   async _forceFullCleanupWebSocket(ws) {
     if (!ws) return;
@@ -725,8 +706,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== SEAT MANAGEMENT ====================
-
   async safeRemoveSeat(room, seatNumber, userId) {
     return this._withSeatLock(room, seatNumber, async () => {
       const roomManager = this.roomManagers.get(room);
@@ -746,6 +725,50 @@ export class ChatServer2 {
       }
       return success;
     });
+  }
+
+  async _removeUserSeatAndPointFromRoom(userId, room) {
+    const seatInfo = this.userToSeat.get(userId);
+    if (!seatInfo || seatInfo.room !== room) return false;
+
+    const seatNumber = seatInfo.seat;
+    const roomManager = this.roomManagers.get(room);
+
+    if (roomManager) {
+      const seatData = roomManager.getSeat(seatNumber);
+      if (!seatData || seatData.namauser !== userId) {
+        return false;
+      }
+      
+      roomManager.removeSeat(seatNumber);
+      roomManager.removePoint(seatNumber);
+      this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
+      this.updateRoomCount(room);
+      return true;
+    }
+    return false;
+  }
+
+  async _removeUserSeatAndPoint(userId) {
+    const seatInfo = this.userToSeat.get(userId);
+    if (!seatInfo) return false;
+
+    const { room, seat: seatNumber } = seatInfo;
+    const roomManager = this.roomManagers.get(room);
+
+    if (roomManager) {
+      const seatData = roomManager.getSeat(seatNumber);
+      if (seatData && seatData.namauser === userId) {
+        roomManager.removeSeat(seatNumber);
+        roomManager.removePoint(seatNumber);
+        this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
+        this.updateRoomCount(room);
+      }
+    }
+
+    this.userToSeat.delete(userId);
+    this.userCurrentRoom.delete(userId);
+    return true;
   }
 
   async _withSeatLock(room, seatNumber, operation) {
@@ -819,8 +842,6 @@ export class ChatServer2 {
       return true;
     });
   }
-
-  // ==================== CONNECTION MANAGEMENT ====================
 
   async _addUserConnection(userId, ws) {
     let release = null;
@@ -903,8 +924,6 @@ export class ChatServer2 {
       this._activeListeners.delete(ws);
     }
   }
-
-  // ==================== ROOM & BROADCAST METHODS ====================
 
   getJumlahRoom() {
     const counts = {};
@@ -1022,8 +1041,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== ROOM JOIN/LEAVE ====================
-
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) { 
       await this.safeSend(ws, ["error", "User ID not set"]); 
@@ -1119,8 +1136,6 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ==================== HANDLE SET ID TARGET ====================
-
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
     
@@ -1208,8 +1223,6 @@ export class ChatServer2 {
       await this.safeSend(ws, ["error", "Connection failed"]);
     }
   }
-
-  // ==================== MESSAGE HANDLER ====================
 
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return;
@@ -1387,62 +1400,15 @@ export class ChatServer2 {
           this.pmBuffer.add(idtarget, ["private", idtarget, noimageUrl, message, Date.now(), sender]);
           break;
         }
-        // ==================== GAME LOWCARD HANDLER - CALL GAME DO ====================
         case "gameLowCardStart":
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
-          if (GAME_ROOMS.includes(ws.roomname)) {
-            const gameDO = await this._getGameDO(ws.roomname);
-            if (!gameDO) {
-              await this.safeSend(ws, ["gameLowCardError", "Game not available"]);
-              break;
-            }
-            
-            let action, body;
-            switch (evt) {
-              case "gameLowCardStart":
-                action = "start";
-                body = { 
-                  userId: ws.idtarget, 
-                  username: ws.username || ws.idtarget, 
-                  bet: data[1] 
-                };
-                break;
-              case "gameLowCardJoin":
-                action = "join";
-                body = { 
-                  userId: ws.idtarget, 
-                  username: ws.username || ws.idtarget 
-                };
-                break;
-              case "gameLowCardNumber":
-                action = "submit";
-                body = { 
-                  userId: ws.idtarget, 
-                  number: data[1], 
-                  tanda: data[2] || "" 
-                };
-                break;
-              case "gameLowCardEnd":
-                action = "end";
-                body = {};
-                break;
-            }
-            
+          if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
             try {
-              const response = await gameDO.fetch(`https://internal/${action}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body)
-              });
-              const result = await response.json();
-              
-              if (!result.success && result.error) {
-                await this.safeSend(ws, ["gameLowCardError", result.error]);
-              }
+              await this.lowcard.handleEvent(ws, data);
             } catch (error) {
-              await this.safeSend(ws, ["gameLowCardError", "Game server error"]);
+              await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
             }
           }
           break;
@@ -1462,8 +1428,6 @@ export class ChatServer2 {
     this.broadcastToRoom(roomName, ["muteStatusChanged", muteValue, roomName]);
     return true;
   }
-
-  // ==================== STATS & SHUTDOWN ====================
 
   async getMemoryStats() {
     try {
@@ -1509,8 +1473,8 @@ export class ChatServer2 {
       await this.chatBuffer.destroy();
     }
     if (this.pmBuffer) await this.pmBuffer.destroy();
-
-    this._gameDOCache.clear();
+    if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch (e) {}
+    this.lowcard = null;
 
     const snapshot = Array.from(this._activeClients);
     for (const ws of snapshot) {
@@ -1530,8 +1494,6 @@ export class ChatServer2 {
     this._wsCleaningUp.clear();
     this._reconnectingUsers.clear();
   }
-
-  // ==================== FETCH HANDLER ====================
 
   async fetch(request) {
     try {
@@ -1678,7 +1640,14 @@ export class ChatServer2 {
       });
     }
     
-    this._gameDOCache.clear();
+    try {
+      if (this.lowcard && typeof this.lowcard.destroy === 'function') {
+        await this.lowcard.destroy();
+      }
+      this.lowcard = new LowCardGameManager(this);
+    } catch (error) {
+      this.lowcard = null;
+    }
     
     this.currentNumber = 1;
     this._masterTickCounter = 0;
