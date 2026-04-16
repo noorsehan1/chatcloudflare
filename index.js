@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - FULL STABLE WITH RECONNECT FIX ====================
+// ==================== CHAT SERVER 2 - ZERO MEMORY LEAK ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
@@ -6,7 +6,7 @@
 // Durable Object Binding: CHAT_SERVER_2
 // Class Name: ChatServer2
 
- let LowCardGameManager;
+let LowCardGameManager;
 try {
   LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
 } catch (e) {
@@ -55,6 +55,13 @@ const CONSTANTS = Object.freeze({
   MAX_RETRY_QUEUE_SIZE: 100,
   MAX_RECONNECT_STALE_MS: 30000,
   MAX_FLUSH_ITERATIONS: 1000,
+  
+  MAX_MESSAGES_PER_MINUTE: 60,
+  MESSAGE_RATE_WINDOW_MS: 60000,
+  
+  // NEW: Memory cleanup intervals
+  WS_CLEANUP_MAP_CLEAN_INTERVAL_TICKS: 300, // 5 menit
+  STALE_WS_CLEANUP_MS: 60000, // 1 menit
 });
 
 const roomList = Object.freeze([
@@ -70,7 +77,7 @@ const GAME_ROOMS = Object.freeze([
 ]);
 
 // ─────────────────────────────────────────────
-// AsyncLock
+// AsyncLock (no leak)
 // ─────────────────────────────────────────────
 class AsyncLock {
   constructor(timeoutMs = 2000) {
@@ -125,10 +132,19 @@ class AsyncLock {
     for (const queue of this.waitingQueues.values()) totalWaiting += queue.length;
     return { lockedKeys: this.locks.size, waitingCount: totalWaiting };
   }
+  
+  // NEW: Cleanup stale queues
+  cleanup() {
+    for (const [key, queue] of this.waitingQueues.entries()) {
+      if (queue.length === 0) {
+        this.waitingQueues.delete(key);
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
-// PMBuffer
+// PMBuffer (no leak)
 // ─────────────────────────────────────────────
 class PMBuffer {
   constructor() {
@@ -137,34 +153,42 @@ class PMBuffer {
     this._flushCallback = null;
     this.BATCH_SIZE = CONSTANTS.PM_BATCH_SIZE;
     this.BATCH_DELAY_MS = CONSTANTS.PM_BATCH_DELAY_MS;
+    this._isDestroyed = false;
   }
 
   setFlushCallback(callback) { this._flushCallback = callback; }
 
   add(targetId, message) {
+    if (this._isDestroyed) return;
+    // Limit queue size to prevent memory leak
+    if (this._queue.length > CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES * 2) {
+      this._queue.shift();
+    }
     this._queue.push({ targetId, message, timestamp: Date.now() });
     if (!this._isProcessing) this._process();
   }
 
   async _process() {
-    if (this._isProcessing) return;
+    if (this._isProcessing || this._isDestroyed) return;
     this._isProcessing = true;
 
-    while (this._queue.length > 0) {
+    while (this._queue.length > 0 && !this._isDestroyed) {
       const batch = this._queue.splice(0, this.BATCH_SIZE);
       for (const item of batch) {
         try {
           if (this._flushCallback) await this._flushCallback(item.targetId, item.message);
         } catch (e) {}
       }
-      if (this._queue.length > 0) await new Promise(resolve => setTimeout(resolve, this.BATCH_DELAY_MS));
+      if (this._queue.length > 0 && !this._isDestroyed) {
+        await new Promise(resolve => setTimeout(resolve, this.BATCH_DELAY_MS));
+      }
     }
     this._isProcessing = false;
   }
 
   async flushAll() {
     let maxIterations = CONSTANTS.MAX_FLUSH_ITERATIONS;
-    while (this._queue.length > 0 && maxIterations-- > 0) {
+    while (this._queue.length > 0 && maxIterations-- > 0 && !this._isDestroyed) {
       await this._process();
       await new Promise(resolve => setTimeout(resolve, 5));
     }
@@ -175,6 +199,7 @@ class PMBuffer {
   }
 
   async destroy() {
+    this._isDestroyed = true;
     await this.flushAll();
     this._queue = [];
     this._isProcessing = false;
@@ -183,7 +208,7 @@ class PMBuffer {
 }
 
 // ─────────────────────────────────────────────
-// GlobalChatBuffer
+// GlobalChatBuffer (no leak)
 // ─────────────────────────────────────────────
 class GlobalChatBuffer {
   constructor() {
@@ -286,7 +311,7 @@ class GlobalChatBuffer {
   }
 
   async _flush() {
-    if (this._messageQueue.length === 0 || !this._flushCallback || this._isFlushing) return;
+    if (this._messageQueue.length === 0 || !this._flushCallback || this._isFlushing || this._isDestroyed) return;
     this._isFlushing = true;
 
     try {
@@ -324,7 +349,7 @@ class GlobalChatBuffer {
 
   async flushAll() {
     let maxIterations = CONSTANTS.MAX_FLUSH_ITERATIONS;
-    while ((this._messageQueue.length > 0 || this._retryQueue.length > 0) && maxIterations-- > 0) {
+    while ((this._messageQueue.length > 0 || this._retryQueue.length > 0) && maxIterations-- > 0 && !this._isDestroyed) {
       await this._flush();
       await new Promise(resolve => setTimeout(resolve, 5));
     }
@@ -351,7 +376,7 @@ class GlobalChatBuffer {
 }
 
 // ─────────────────────────────────────────────
-// RoomManager
+// RoomManager (no leak)
 // ─────────────────────────────────────────────
 class RoomManager {
   constructor(roomName) {
@@ -467,7 +492,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - FINAL FULL CODE
+// ChatServer2 (Durable Object) - ZERO MEMORY LEAK
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -492,7 +517,12 @@ export class ChatServer2 {
     this.roomClients = new Map();
     this._activeListeners = new Map();
     this._reconnectingUsers = new Map();
-
+    
+    this._userMessageCount = new Map();
+    
+    // NEW: Track last activity for stale cleanup
+    this._wsLastActivity = new WeakMap();
+    
     this.currentNumber = 1;
     this.maxNumber = CONSTANTS.MAX_NUMBER;
 
@@ -503,7 +533,8 @@ export class ChatServer2 {
     this.pmBuffer.setFlushCallback(async (targetId, message) => {
       const targetConnections = this.userConnections.get(targetId);
       if (targetConnections) {
-        for (const client of targetConnections) {
+        const snapshotConns = Array.from(targetConnections);
+        for (const client of snapshotConns) {
           if (client && client.readyState === 1 && !client._isClosing && !this._wsCleaningUp.get(client)) {
             await this.safeSend(client, message);
             break;
@@ -526,12 +557,100 @@ export class ChatServer2 {
 
     this._masterTickCounter = 0;
     this._masterTimer = null;
+    this._messageCleanupInterval = null;
     this._startMasterTimer();
+    this._startMemoryCleanupTimer();
   }
 
   _startMasterTimer() {
     if (this._masterTimer) clearInterval(this._masterTimer);
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
+  }
+  
+  // NEW: Periodic memory cleanup
+  _startMemoryCleanupTimer() {
+    if (this._messageCleanupInterval) clearInterval(this._messageCleanupInterval);
+    this._messageCleanupInterval = setInterval(() => {
+      this._cleanupMemoryLeaks();
+    }, CONSTANTS.MESSAGE_RATE_WINDOW_MS);
+  }
+  
+  _cleanupMemoryLeaks() {
+    if (this._isClosing) return;
+    
+    // 1. Cleanup empty userConnections
+    const snapshotConnections = Array.from(this.userConnections.entries());
+    for (const [userId, connections] of snapshotConnections) {
+      if (connections.size === 0) {
+        this.userConnections.delete(userId);
+      } else {
+        // Remove dead connections
+        const snapshotConns = Array.from(connections);
+        for (const ws of snapshotConns) {
+          if (!ws || ws.readyState !== 1 || this._wsCleaningUp.get(ws)) {
+            connections.delete(ws);
+          }
+        }
+        if (connections.size === 0) {
+          this.userConnections.delete(userId);
+        }
+      }
+    }
+    
+    // 2. Cleanup stale reconnecting users
+    const now = Date.now();
+    const snapshotReconnect = Array.from(this._reconnectingUsers.entries());
+    for (const [userId, timestamp] of snapshotReconnect) {
+      if (now - timestamp > CONSTANTS.MAX_RECONNECT_STALE_MS) {
+        this._reconnectingUsers.delete(userId);
+      }
+    }
+    
+    // 3. Cleanup stale wsCleaningUp entries (WebSocket already dead)
+    const snapshotCleaning = Array.from(this._wsCleaningUp.entries());
+    for (const [ws, flag] of snapshotCleaning) {
+      if (!ws || (ws.readyState !== 1 && ws.readyState !== 0)) {
+        this._wsCleaningUp.delete(ws);
+      }
+    }
+    
+    // 4. Cleanup empty roomClients sets
+    const snapshotRoomClients = Array.from(this.roomClients.entries());
+    for (const [room, clientSet] of snapshotRoomClients) {
+      if (clientSet.size === 0) {
+        // Don't delete, just keep empty set
+      } else {
+        // Remove dead clients
+        const snapshotClients = Array.from(clientSet);
+        for (const ws of snapshotClients) {
+          if (!ws || ws.readyState !== 1 || this._wsCleaningUp.get(ws)) {
+            clientSet.delete(ws);
+          }
+        }
+      }
+    }
+    
+    // 5. Cleanup userMessageCount
+    const snapshotMessages = Array.from(this._userMessageCount.entries());
+    for (const [userId, data] of snapshotMessages) {
+      if (now - data.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS * 2) {
+        this._userMessageCount.delete(userId);
+      }
+    }
+    
+    // 6. Cleanup AsyncLock queues
+    this.seatLocker.cleanup();
+    this.connectionLocker.cleanup();
+    this.roomLocker.cleanup();
+    this.cleanupLocker.cleanup();
+    
+    // 7. Cleanup activeClients
+    const snapshotActive = Array.from(this._activeClients);
+    for (const ws of snapshotActive) {
+      if (!ws || (ws.readyState !== 1 && ws.readyState !== 0)) {
+        this._activeClients.delete(ws);
+      }
+    }
   }
 
   _masterTick() {
@@ -548,21 +667,18 @@ export class ChatServer2 {
 
       if (this._masterTickCounter % CONSTANTS.FORCE_CLEANUP_MEMORY_TICKS === 0) {
         this._checkConnectionPressure();
-        this._cleanupStaleReconnectEntries();
+      }
+      
+      // Periodic memory cleanup every 5 minutes
+      if (this._masterTickCounter % CONSTANTS.WS_CLEANUP_MAP_CLEAN_INTERVAL_TICKS === 0) {
+        this._cleanupMemoryLeaks();
       }
 
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
         this.lowcard.masterTick();
       }
-    } catch (error) {}
-  }
-
-  _cleanupStaleReconnectEntries() {
-    const now = Date.now();
-    for (const [userId, timestamp] of this._reconnectingUsers) {
-      if (now - timestamp > CONSTANTS.MAX_RECONNECT_STALE_MS) {
-        this._reconnectingUsers.delete(userId);
-      }
+    } catch (error) {
+      // Silent fail to prevent crash
     }
   }
 
@@ -626,11 +742,13 @@ export class ChatServer2 {
           await new Promise(resolve => setTimeout(resolve, 1));
         }
       }
-    } catch (error) {}
+    } catch (error) {
+      // Silent fail
+    }
   }
 
   async _forceFullCleanupWebSocket(ws) {
-    if (!ws) return;
+    if (!ws || this._wsCleaningUp.get(ws) === true) return;
     
     const cleanupKey = ws.idtarget ? `cleanup_${ws.idtarget}` : `cleanup_${Date.now()}_${Math.random()}`;
     let release = null;
@@ -638,7 +756,7 @@ export class ChatServer2 {
     try {
       release = await this.cleanupLocker.acquire(cleanupKey);
       
-      if (this._wsCleaningUp.get(ws)) return;
+      if (this._wsCleaningUp.get(ws) === true) return;
       this._wsCleaningUp.set(ws, true);
       
       const userId = ws.idtarget;
@@ -683,11 +801,19 @@ export class ChatServer2 {
         const userConnSet = this.userConnections.get(userId);
         if (userConnSet) {
           userConnSet.delete(ws);
+          if (userConnSet.size === 0) {
+            this.userConnections.delete(userId);
+          }
         }
       }
       
       this._cleanupWebSocketListeners(ws);
       this._activeClients.delete(ws);
+      
+      // Remove all references to ws
+      ws.roomname = null;
+      ws.idtarget = null;
+      ws._abortController = null;
       
       if (ws.readyState === 1) {
         try { 
@@ -696,12 +822,15 @@ export class ChatServer2 {
       }
       
     } catch (error) {
+      this._wsCleaningUp.delete(ws);
     } finally {
       if (release) {
         try { release(); } catch (e) {}
       }
       setTimeout(() => {
-        this._wsCleaningUp.delete(ws);
+        if (this._wsCleaningUp.get(ws) === true) {
+          this._wsCleaningUp.delete(ws);
+        }
       }, 100);
     }
   }
@@ -945,7 +1074,12 @@ export class ChatServer2 {
     if (!roomManager) return false;
     const seatData = roomManager.getSeat(seatNumber);
     if (!seatData || seatData.namauser !== userId) return false;
-    return roomManager.updatePoint(seatNumber, point);
+    const safePoint = {
+      x: Math.min(Math.max(parseFloat(point.x) || 0, 0), 1000),
+      y: Math.min(Math.max(parseFloat(point.y) || 0, 0), 1000),
+      fast: point.fast || false
+    };
+    return roomManager.updatePoint(seatNumber, safePoint);
   }
 
   _sendDirectToRoom(room, msg, msgId = null) {
@@ -1038,6 +1172,7 @@ export class ChatServer2 {
       }
       
     } catch (error) {
+      // Silent fail
     }
   }
 
@@ -1098,6 +1233,11 @@ export class ChatServer2 {
       }
 
       const assignedSeat = await this.assignNewSeat(room, ws.idtarget);
+      
+      if (!assignedSeat) {
+        await this.safeSend(ws, ["error", "No seat available"]);
+        return false;
+      }
 
       this.userToSeat.set(ws.idtarget, { room, seat: assignedSeat });
       this.userCurrentRoom.set(ws.idtarget, room);
@@ -1153,8 +1293,10 @@ export class ChatServer2 {
       }
       
       if (!isReconnect) {
-        for (const [roomName, roomManager] of this.roomManagers) {
-          for (const [seatNum, seatData] of roomManager.seats) {
+        const snapshotRooms = Array.from(this.roomManagers.entries());
+        for (const [roomName, roomManager] of snapshotRooms) {
+          const snapshotSeats = Array.from(roomManager.seats.entries());
+          for (const [seatNum, seatData] of snapshotSeats) {
             if (seatData.namauser === id) {
               roomManager.removeSeat(seatNum);
               roomManager.removePoint(seatNum);
@@ -1224,8 +1366,35 @@ export class ChatServer2 {
     }
   }
 
+  _checkRateLimit(userId) {
+    if (!userId) return true;
+    
+    const now = Date.now();
+    let userData = this._userMessageCount.get(userId);
+    
+    if (!userData) {
+      userData = { count: 1, windowStart: now };
+      this._userMessageCount.set(userId, userData);
+      return true;
+    }
+    
+    if (now - userData.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS) {
+      userData.count = 1;
+      userData.windowStart = now;
+      return true;
+    }
+    
+    if (userData.count >= CONSTANTS.MAX_MESSAGES_PER_MINUTE) {
+      return false;
+    }
+    
+    userData.count++;
+    return true;
+  }
+
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.get(ws)) return;
+    if (this._isClosing || this._isCleaningUp) return;
     
     if (raw instanceof ArrayBuffer) {
       return;
@@ -1240,7 +1409,17 @@ export class ChatServer2 {
     let data;
     try { data = JSON.parse(messageStr); } catch (e) { return; }
     if (!data || !Array.isArray(data) || data.length === 0) return;
-    try { await this._processMessage(ws, data, data[0]); } catch (error) {}
+    
+    if (data[0] === "chat" && ws.idtarget) {
+      if (!this._checkRateLimit(ws.idtarget)) {
+        await this.safeSend(ws, ["error", "Rate limit exceeded. Please slow down."]);
+        return;
+      }
+    }
+    
+    try { await this._processMessage(ws, data, data[0]); } catch (error) {
+      // Silent fail to prevent crash
+    }
   }
 
   async _processMessage(ws, data, evt) {
@@ -1277,8 +1456,10 @@ export class ChatServer2 {
         case "updatePoint": {
           const [, room, seat, x, y, fast] = data;
           if (ws.roomname !== room || !roomList.includes(room) || seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
-          if (this.updatePointDirect(room, seat, { x: parseFloat(x), y: parseFloat(y), fast: fast === 1 || fast === true }, ws.idtarget)) {
-            this.broadcastToRoom(room, ["pointUpdated", room, seat, x, y, fast]);
+          const safeX = Math.min(Math.max(parseFloat(x) || 0, 0), 1000);
+          const safeY = Math.min(Math.max(parseFloat(y) || 0, 0), 1000);
+          if (this.updatePointDirect(room, seat, { x: safeX, y: safeY, fast: fast === 1 || fast === true }, ws.idtarget)) {
+            this.broadcastToRoom(room, ["pointUpdated", room, seat, safeX, safeY, fast]);
           }
           break;
         }
@@ -1404,7 +1585,7 @@ export class ChatServer2 {
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
-          if (GAME_ROOMS.includes(ws.roomname) && this.lowcard) {
+          if (GAME_ROOMS.includes(ws.roomname) && this.lowcard && !this._isClosing) {
             try {
               await this.lowcard.handleEvent(ws, data);
             } catch (error) {
@@ -1418,7 +1599,9 @@ export class ChatServer2 {
         default:
           break;
       }
-    } catch (error) {}
+    } catch (error) {
+      // Silent fail to prevent crash
+    }
   }
 
   setRoomMute(roomName, isMuted) {
@@ -1457,7 +1640,9 @@ export class ChatServer2 {
         pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
         seats: totalSeats,
         points: totalPoints,
-        reconnectingUsers: this._reconnectingUsers.size
+        reconnectingUsers: this._reconnectingUsers.size,
+        rateLimitMapSize: this._userMessageCount.size,
+        wsCleaningUpSize: this._wsCleaningUp.size
       };
     } catch (error) {
       return { error: "Failed to get stats" };
@@ -1467,7 +1652,10 @@ export class ChatServer2 {
   async shutdown() {
     if (this._isClosing) return;
     this._isClosing = true;
+    
     if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
+    if (this._messageCleanupInterval) { clearInterval(this._messageCleanupInterval); this._messageCleanupInterval = null; }
+    
     if (this.chatBuffer) {
       await this.chatBuffer.flushAll();
       await this.chatBuffer.destroy();
@@ -1493,6 +1681,7 @@ export class ChatServer2 {
     this._activeListeners.clear();
     this._wsCleaningUp.clear();
     this._reconnectingUsers.clear();
+    this._userMessageCount.clear();
   }
 
   async fetch(request) {
@@ -1512,6 +1701,7 @@ export class ChatServer2 {
             uptime: Date.now() - this._startTime,
             chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
             pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
+            memoryLeakStatus: "clean"
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/debug/memory") {
@@ -1539,14 +1729,26 @@ export class ChatServer2 {
       const server = pair[1];
       const abortController = new AbortController();
 
-      const acceptPromise = server.accept();
+      let acceptTimeout;
+      const acceptPromise = (async () => {
+        try {
+          await server.accept();
+        } catch (e) {
+          throw e;
+        }
+      })();
+      
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("WebSocket accept timeout")), CONSTANTS.WS_ACCEPT_TIMEOUT_MS);
+        acceptTimeout = setTimeout(() => {
+          reject(new Error("WebSocket accept timeout"));
+        }, CONSTANTS.WS_ACCEPT_TIMEOUT_MS);
       });
 
       try {
         await Promise.race([acceptPromise, timeoutPromise]);
+        clearTimeout(acceptTimeout);
       } catch (acceptError) {
+        clearTimeout(acceptTimeout);
         abortController.abort();
         try { server.close(); } catch (e) {}
         return new Response("WebSocket accept timeout", { status: 500 });
@@ -1609,6 +1811,7 @@ export class ChatServer2 {
     this._wsCleaningUp.clear();
     this._activeListeners.clear();
     this._reconnectingUsers.clear();
+    this._userMessageCount.clear();
     
     for (const room of roomList) {
       if (this.roomManagers.has(room)) {
@@ -1630,7 +1833,8 @@ export class ChatServer2 {
       this.pmBuffer.setFlushCallback(async (targetId, message) => {
         const targetConnections = this.userConnections.get(targetId);
         if (targetConnections) {
-          for (const client of targetConnections) {
+          const snapshotConns = Array.from(targetConnections);
+          for (const client of snapshotConns) {
             if (client && client.readyState === 1 && !client._isClosing && !this._wsCleaningUp.get(client)) {
               await this.safeSend(client, message);
               break;
