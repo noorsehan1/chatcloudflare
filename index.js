@@ -24,7 +24,7 @@ const CONSTANTS = Object.freeze({
 
   MAX_GLOBAL_CONNECTIONS: 250,
   MAX_ACTIVE_CLIENTS_LIMIT: 250,
-  MAX_SEATS: 25,
+  MAX_SEATS: 35,
   MAX_NUMBER: 6,
 
   MAX_MESSAGE_SIZE: 5000,
@@ -480,7 +480,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - FULL FIXED
+// ChatServer2 (Durable Object) - FULL FIXED DENGAN PROTEKSI ASYNC
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -565,10 +565,22 @@ export class ChatServer2 {
         this._checkConnectionPressure();
       }
 
+      // ✅ FIX: Proteksi async untuk lowcard.masterTick()
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
-        this.lowcard.masterTick();
+        try {
+          const result = this.lowcard.masterTick();
+          if (result && typeof result.catch === 'function') {
+            result.catch(err => {
+              console.error(`lowcard.masterTick async error: ${err?.message || err}`);
+            });
+          }
+        } catch (syncError) {
+          console.error(`lowcard.masterTick sync error: ${syncError?.message || syncError}`);
+        }
       }
-    } catch (error) {}
+    } catch (error) {
+      console.error(`Master tick error: ${error?.message || error}`);
+    }
   }
 
   async _checkConnectionPressure() {
@@ -628,11 +640,9 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // FIXED: Memory leak & race condition
   async _forceFullCleanupWebSocket(ws) {
     if (!ws) return;
     
-    // Gunakan ID unik untuk WebSocket
     if (!ws._cleanupId) {
       ws._cleanupId = `ws_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
     }
@@ -686,7 +696,6 @@ export class ChatServer2 {
           }
         }
         
-        // FIX: Hapus data user dari Map untuk mencegah memory leak
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         this._userMessageCount.delete(userId);
@@ -714,7 +723,6 @@ export class ChatServer2 {
     }
   }
 
-  // FIXED: Atomic seat assignment dengan lock per room
   async assignNewSeat(room, userId) {
     const release = await this.seatLocker.acquire(`room_seat_assign_${room}`);
     try {
@@ -746,7 +754,6 @@ export class ChatServer2 {
     }
   }
 
-  // FIXED: Atomic room join dengan lock per room
   async _doJoinRoom(ws, room) {
     const release = await this.roomLocker.acquire(`room_join_full_${room}`);
     try {
@@ -795,7 +802,7 @@ export class ChatServer2 {
       await this._addUserConnection(ws.idtarget, ws);
 
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 1500));
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
@@ -828,7 +835,6 @@ export class ChatServer2 {
     }
   }
 
-  // FIXED: Atomic seat removal
   async safeRemoveSeat(room, seatNumber, userId) {
     const release = await this.seatLocker.acquire(`room_seat_remove_${room}_${seatNumber}`);
     try {
@@ -1000,7 +1006,7 @@ export class ChatServer2 {
     return roomManager.updatePoint(seatNumber, safePoint);
   }
 
-  // FIXED: No domino effect - kumpulkan failed clients
+  // ✅ FIX: Proteksi client.send() dengan try-catch yang lebih ketat
   _sendDirectToRoom(room, msg, msgId = null) {
     const clientSet = this.roomClients.get(room);
     if (!clientSet?.size) return 0;
@@ -1011,19 +1017,26 @@ export class ChatServer2 {
     
     const snapshot = Array.from(clientSet);
     for (const client of snapshot) {
-      if (!client || client.readyState !== 1 || client._isClosing || client.roomname !== room || this._wsCleaningUp.get(client._cleanupId)) {
+      if (!client || client.readyState !== 1 || client._isClosing || this._wsCleaningUp.get(client._cleanupId)) {
         continue;
       }
       try {
         client.send(messageStr);
         sentCount++;
       } catch (e) {
+        // ✅ Catat client yang gagal untuk dibersihkan
         failedClients.push(client);
       }
     }
     
-    for (const failedClient of failedClients) {
-      this._forceFullCleanupWebSocket(failedClient).catch(() => {});
+    // ✅ Bersihkan client yang gagal secara async (tidak blocking)
+    if (failedClients.length > 0) {
+      // Gunakan Promise.resolve().then() untuk async cleanup tanpa blocking
+      Promise.resolve().then(() => {
+        for (const failedClient of failedClients) {
+          this._forceFullCleanupWebSocket(failedClient).catch(() => {});
+        }
+      });
     }
     
     return sentCount;
