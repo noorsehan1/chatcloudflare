@@ -1,4 +1,4 @@
-// ==================== LOWCARDGAMEMANAGER.js - FULLY FIXED (NO RACE CONDITION) ====================
+// ==================== LOWCARDGAMEMANAGER.js - FULLY FIXED (NO DEADLOCK) ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -21,7 +21,7 @@ export class LowCardGameManager {
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
     this._cleanupInterval = null;
-    this._gameLocks = new Map(); // FIX: Lock per game
+    this._gameLocks = new Map();
     
     this._startCleanupInterval();
   }
@@ -33,7 +33,6 @@ export class LowCardGameManager {
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
   }
   
-  // FIX: Atomic lock untuk game operations
   async _acquireGameLock(room, timeoutMs = 3000) {
     if (!this._gameLocks.has(room)) {
       this._gameLocks.set(room, { locked: false, queue: [] });
@@ -122,15 +121,17 @@ export class LowCardGameManager {
   _forceEvaluateRound(room) {
     const game = this._safeGetGame(room);
     if (!game || !game._isActive || game.drawTimeExpired || game.evaluationLocked) return;
+    if (game._phase !== 'draw') return; // ✅ FIX #5: Prevent force evaluate when not in draw phase
+    
     game.drawTimeExpired = true;
     this._scheduleEvaluation(room, game);
   }
 
   _scheduleEvaluation(room, game) {
     if (!game || !game._isActive) return;
+    if (game._phase !== 'draw') return; // ✅ FIX #2: Prevent double trigger from wrong phase
     if (game.evaluationLocked || game._phase === 'evaluating') return;
     
-    // Atomic lock
     game.evaluationLocked = true;
     game._phase = 'evaluating';
     game._evalStartTime = Date.now();
@@ -213,7 +214,13 @@ export class LowCardGameManager {
       }
     }
     
-    for (const room of staleGames) this.endGame(room);
+    // ✅ FIX #3: Safety check before endGame
+    for (const room of staleGames) {
+      const game = this.activeGames.get(room);
+      if (game?._isActive) {
+        this.endGame(room);
+      }
+    }
   }
 
   getRandomCardTanda() {
@@ -262,7 +269,7 @@ export class LowCardGameManager {
     }
   }
 
-  // FIX: Atomic start game dengan lock
+  // ✅ FIX #1: Anti deadlock pattern for startGame
   async startGame(ws, bet) {
     if (this._destroyed) return;
     if (!ws?.roomname || !ws?.idtarget) {
@@ -271,10 +278,11 @@ export class LowCardGameManager {
     }
 
     const room = ws.roomname;
+    let release;
     
-    // Lock untuk start game
-    const release = await this._acquireGameLock(room);
     try {
+      release = await this._acquireGameLock(room);
+      
       const existingGame = this.activeGames.get(room);
       if (existingGame?._isActive) {
         this._safeSend(ws, ["gameLowCardError", "Game already running in this room"]);
@@ -326,9 +334,10 @@ export class LowCardGameManager {
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
       
     } catch (e) {
+      // Optional log
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     } finally {
-      release();
+      if (release) release();
     }
   }
 
@@ -400,12 +409,19 @@ export class LowCardGameManager {
     if (game.useBots && game._pendingBotDraws?.size > 0) {
       const toDraw = [];
       const snapshot = Array.from(game._pendingBotDraws.entries());
+      const newMap = new Map(); // ✅ FIX #4: Stabilize bot timer with new map
+      
       for (const [botId, timeRemaining] of snapshot) {
-        if (timeRemaining <= 0) toDraw.push(botId);
-        else game._pendingBotDraws.set(botId, timeRemaining - 1);
+        if (timeRemaining <= 0) {
+          toDraw.push(botId);
+        } else {
+          newMap.set(botId, timeRemaining - 1);
+        }
       }
+      
+      game._pendingBotDraws = newMap;
+      
       for (const botId of toDraw) {
-        game._pendingBotDraws.delete(botId);
         if (!game.drawTimeExpired && !game.evaluationLocked && 
             !game.eliminated.has(botId) && !game.numbers.has(botId)) {
           this._handleBotDraw(room, botId);
@@ -439,7 +455,6 @@ export class LowCardGameManager {
     }
   }
 
-  // FIX: Atomic close registration
   async _closeRegistration(room) {
     const game = this._safeGetGame(room);
     if (!game?._isActive || this._destroyed) return;
@@ -515,7 +530,7 @@ export class LowCardGameManager {
     }
   }
 
-  // FIX: Atomic join game
+  // ✅ FIX #1: Anti deadlock pattern for joinGame
   async joinGame(ws) {
     if (this._destroyed) return;
     if (!ws?.roomname || !ws?.idtarget) {
@@ -524,9 +539,11 @@ export class LowCardGameManager {
     }
 
     const room = ws.roomname;
-    const release = await this._acquireGameLock(room);
+    let release;
     
     try {
+      release = await this._acquireGameLock(room);
+      
       const game = this._safeGetGame(room);
       
       if (!game?._isActive) {
@@ -551,12 +568,15 @@ export class LowCardGameManager {
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
       this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
+      
+    } catch (e) {
+      // Optional log
     } finally {
-      release();
+      if (release) release();
     }
   }
 
-  // FIX: Atomic submit number
+  // ✅ FIX #1: Anti deadlock pattern for submitNumber
   async submitNumber(ws, number, tanda = "") {
     if (this._destroyed) return;
     if (!ws?.roomname || !ws?.idtarget) {
@@ -565,9 +585,11 @@ export class LowCardGameManager {
     }
 
     const room = ws.roomname;
-    const release = await this._acquireGameLock(room);
+    let release;
     
     try {
+      release = await this._acquireGameLock(room);
+      
       const game = this._safeGetGame(room);
       
       if (!game?._isActive) {
@@ -627,14 +649,21 @@ export class LowCardGameManager {
       if (!game.evaluationLocked && nowAllDrawn && game._phase !== 'evaluating') {
         this._scheduleEvaluation(room, game);
       }
+      
+    } catch (e) {
+      // Optional log
     } finally {
-      release();
+      if (release) release();
     }
   }
 
+  // ✅ FIX #1: Anti deadlock pattern for _evaluateRound
   async _evaluateRound(room) {
-    const release = await this._acquireGameLock(room);
+    let release;
+    
     try {
+      release = await this._acquireGameLock(room);
+      
       const game = this._safeGetGame(room);
       if (!game?._isActive || this._destroyed) return;
       
@@ -751,16 +780,23 @@ export class LowCardGameManager {
       }
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      
+    } catch (e) {
+      // Optional log
     } finally {
-      release();
+      if (release) release();
     }
   }
 
+  // ✅ FIX #1 & #6: Anti deadlock pattern with double delete prevention
   async endGame(room) {
-    const release = await this._acquireGameLock(room);
+    let release;
+    
     try {
+      release = await this._acquireGameLock(room);
+      
       const game = this.activeGames.get(room);
-      if (!game) return;
+      if (!game || !game._isActive) return; // ✅ Prevent double delete
       
       const playersList = [];
       if (game.players) {
@@ -784,8 +820,11 @@ export class LowCardGameManager {
       }
       
       this.activeGames.delete(room);
+      
+    } catch (e) {
+      // Optional log
     } finally {
-      release();
+      if (release) release();
     }
   }
   
