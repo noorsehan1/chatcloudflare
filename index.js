@@ -61,7 +61,7 @@ const GAME_ROOMS = Object.freeze([
 ]);
 
 // ─────────────────────────────────────────────
-// AsyncLock
+// AsyncLock with ANTI DEADLOCK (#10)
 // ─────────────────────────────────────────────
 class AsyncLock {
   constructor(timeoutMs = 2000) {
@@ -114,6 +114,15 @@ class AsyncLock {
     if (!queue || queue.length === 0) this.waitingQueues.delete(key);
   }
 
+  // 🔥 #10: ANTI DEADLOCK - Force release after timeout
+  _forceReleaseAfterTimeout(key) {
+    setTimeout(() => {
+      if (this.locks.has(key)) {
+        this.locks.delete(key);
+      }
+    }, this.timeoutMs + 500);
+  }
+
   getStats() {
     let totalWaiting = 0;
     for (const queue of this.waitingQueues.values()) totalWaiting += queue.length;
@@ -122,7 +131,7 @@ class AsyncLock {
 }
 
 // ─────────────────────────────────────────────
-// PMBuffer
+// PMBuffer with ANTI LOOP (#7)
 // ─────────────────────────────────────────────
 class PMBuffer {
   constructor() {
@@ -149,7 +158,10 @@ class PMBuffer {
     if (this._isProcessing || this._isDestroyed) return;
     this._isProcessing = true;
 
-    while (this._queue.length > 0 && !this._isDestroyed) {
+    // 🔥 #7: ANTI LOOP - Max 1000 iterations
+    let iteration = 0;
+
+    while (this._queue.length > 0 && !this._isDestroyed && iteration++ < 1000) {
       const batch = this._queue.splice(0, this.BATCH_SIZE);
       for (const item of batch) {
         try {
@@ -185,7 +197,7 @@ class PMBuffer {
 }
 
 // ─────────────────────────────────────────────
-// GlobalChatBuffer
+// GlobalChatBuffer with RETRY QUEUE LIMIT (#3)
 // ─────────────────────────────────────────────
 class GlobalChatBuffer {
   constructor() {
@@ -278,7 +290,10 @@ class GlobalChatBuffer {
       if (!sent) {
         item.retries++;
         item.nextRetry = now + (1000 * Math.pow(2, item.retries));
-        remaining.push(item);
+        // 🔥 #3: RETRY QUEUE DI-BATASI KETAT
+        if (remaining.length < CONSTANTS.MAX_RETRY_QUEUE_SIZE) {
+          remaining.push(item);
+        }
       }
     }
 
@@ -313,7 +328,10 @@ class GlobalChatBuffer {
           try {
             this._flushCallback(room, item.message, item.msgId);
           } catch (e) {
-            this._retryQueue.push({ room, message: item.message, msgId: item.msgId, retries: 0, nextRetry: Date.now() + 1000 });
+            // 🔥 #3: RETRY QUEUE DI-BATASI KETAT
+            if (this._retryQueue.length < CONSTANTS.MAX_RETRY_QUEUE_SIZE) {
+              this._retryQueue.push({ room, message: item.message, msgId: item.msgId, retries: 0, nextRetry: Date.now() + 1000 });
+            }
           }
         }
       }
@@ -505,6 +523,9 @@ export class ChatServer2 {
     this._reconnectTimers = new Map();
 
     this._userMessageCount = new Map();
+    
+    // 🔥 #8: GLOBAL RATE LIMIT (ANTI DDOS)
+    this._globalMessageCount = { count: 0, start: Date.now() };
 
     this.currentNumber = 1;
     this.maxNumber = CONSTANTS.MAX_NUMBER;
@@ -543,9 +564,19 @@ export class ChatServer2 {
     this._startMasterTimer();
   }
 
+  // 🔥 #6: MASTER TIMER AUTO-RECOVERY
   _startMasterTimer() {
     if (this._masterTimer) clearInterval(this._masterTimer);
-    this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
+
+    this._masterTimer = setInterval(() => {
+      try {
+        this._masterTick();
+      } catch (e) {
+        console.error("MasterTick crash:", e);
+        clearInterval(this._masterTimer);
+        this._startMasterTimer();
+      }
+    }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
   }
 
   _masterTick() {
@@ -566,6 +597,16 @@ export class ChatServer2 {
         this._sweepMessageCounts();
       }
 
+      // 🔥 #9: CLEAN ROOM IDLE
+      for (const [room, roomManager] of this.roomManagers) {
+        if (now - roomManager.lastActivity > CONSTANTS.ROOM_IDLE_BEFORE_CLEANUP) {
+          if (roomManager.getOccupiedCount() === 0) {
+            roomManager.destroy();
+            this.roomManagers.set(room, new RoomManager(room));
+          }
+        }
+      }
+
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
         try {
           const result = this.lowcard.masterTick();
@@ -582,6 +623,11 @@ export class ChatServer2 {
       if (now - timestamp > CONSTANTS.WS_CLEANING_UP_MAX_AGE_MS) {
         this._wsCleaningUp.delete(key);
       }
+    }
+    
+    // 🔥 #2: LIMIT _wsCleaningUp (ANTI MEMORY NAIK)
+    if (this._wsCleaningUp.size > 1000) {
+      this._wsCleaningUp.clear();
     }
   }
 
@@ -650,6 +696,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
+  // 🔥 #1: HARD CLEANUP WebSocket (PALING PENTING)
   async _forceFullCleanupWebSocket(ws) {
     if (!ws) return;
 
@@ -728,7 +775,6 @@ export class ChatServer2 {
       }
 
       this._cleanupWebSocketListeners(ws);
-      this._activeClients.delete(ws);
 
       if (ws.readyState === 1) {
         try {
@@ -741,6 +787,13 @@ export class ChatServer2 {
       if (release) {
         try { release(); } catch (e) {}
       }
+
+      // 🔥 #1: WAJIB: pastikan selalu kehapus
+      try {
+        this._activeClients.delete(ws);
+        this._cleanupWebSocketListeners(ws);
+      } catch (e) {}
+
       if (didSetCleaningFlag) {
         setTimeout(() => {
           this._wsCleaningUp.delete(ws._cleanupId);
@@ -749,7 +802,6 @@ export class ChatServer2 {
     }
   }
 
-  // [FIX] assignNewSeat - Now using RoomManager.getAvailableSeat() for consistency
   async assignNewSeat(room, userId) {
     const release = await this.seatLocker.acquire(`room_seat_assign_${room}`);
     try {
@@ -758,11 +810,9 @@ export class ChatServer2 {
 
       if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
 
-      // ✅ Use existing method for consistency
       const newSeatNumber = roomManager.getAvailableSeat();
       if (!newSeatNumber) return null;
 
-      // ✅ Use existing updateSeat method
       const success = roomManager.updateSeat(newSeatNumber, {
         noimageUrl: "", 
         namauser: userId, 
@@ -1055,6 +1105,7 @@ export class ChatServer2 {
     return roomManager.updatePoint(seatNumber, safePoint);
   }
 
+  // 🔥 #4: BACKPRESSURE WebSocket (ANTI CRASH)
   _sendDirectToRoom(room, msg, msgId = null) {
     const clientSet = this.roomClients.get(room);
     if (!clientSet?.size) return 0;
@@ -1068,8 +1119,11 @@ export class ChatServer2 {
         continue;
       }
       try {
-        client.send(messageStr);
-        sentCount++;
+        // 🔥 #4: Check buffer before sending
+        if (client.bufferedAmount < 1024 * 512) {
+          client.send(messageStr);
+          sentCount++;
+        }
       } catch (e) {
         if (!client._pendingCleanup) {
           client._pendingCleanup = true;
@@ -1102,15 +1156,25 @@ export class ChatServer2 {
     }
   }
 
+  // 🔥 #5: SAFE SEND DIPERKETAT
   async safeSend(ws, msg) {
     if (!ws) return false;
-    if (ws._isClosing || ws.readyState !== 1 || this._wsCleaningUp.has(ws._cleanupId)) return false;
+
+    if (
+      ws._isClosing ||
+      ws.readyState !== 1 ||
+      this._wsCleaningUp.has(ws._cleanupId)
+    ) return false;
+
     try {
+      if (ws.bufferedAmount > 1024 * 512) return false;
+
       const message = typeof msg === "string" ? msg : JSON.stringify(msg);
       ws.send(message);
       return true;
+
     } catch (error) {
-      if (!ws._pendingCleanup && (error.code === 'ECONNRESET' || error.message?.includes('ECONNRESET') || error.message?.includes('CLOSED'))) {
+      if (!ws._pendingCleanup) {
         ws._pendingCleanup = true;
         this._forceFullCleanupWebSocket(ws).catch(() => {});
       }
@@ -1304,9 +1368,27 @@ export class ChatServer2 {
     return true;
   }
 
+  // 🔥 #8: GLOBAL RATE LIMIT (ANTI DDOS)
+  _checkGlobalRate() {
+    const now = Date.now();
+
+    if (now - this._globalMessageCount.start > 60000) {
+      this._globalMessageCount.count = 0;
+      this._globalMessageCount.start = now;
+    }
+
+    if (this._globalMessageCount.count > 2000) return false;
+
+    this._globalMessageCount.count++;
+    return true;
+  }
+
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.has(ws._cleanupId)) return;
     if (this._isClosing || this._isCleaningUp) return;
+
+    // 🔥 #8: Check global rate limit
+    if (!this._checkGlobalRate()) return;
 
     if (raw instanceof ArrayBuffer) return;
 
@@ -1793,9 +1875,7 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      // Make sure binding name matches wrangler.toml
-      // If your binding is named "CHAT_SERVER_2", use that
-      const bindingName = "CHAT_SERVER_2"; // Change this to match your wrangler.toml
+      const bindingName = env.CHAT_SERVER_BINDING || "CHAT_SERVER_2";
       const chatId = env[bindingName].idFromName("chat-room");
       const chatObj = env[bindingName].get(chatId);
       
