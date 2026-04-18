@@ -1235,6 +1235,7 @@ async handleSetIdTarget2(ws, id, baru) {
     try {
       const isReconnect = (baru !== true);
 
+      // ========== SET GRACE TIME UNTUK RECONNECT ==========
       if (isReconnect) {
         this._reconnectingUsers.set(id, Date.now());
 
@@ -1251,6 +1252,7 @@ async handleSetIdTarget2(ws, id, baru) {
         this._reconnectTimers.set(id, newTimer);
       }
 
+      // ========== JOIN PERTAMA KALI: HAPUS SEMUA DATA LAMA ==========
       if (!isReconnect) {
         const snapshotRooms = Array.from(this.roomManagers.entries());
         for (const [roomName, roomManager] of snapshotRooms) {
@@ -1269,17 +1271,18 @@ async handleSetIdTarget2(ws, id, baru) {
         this.userCurrentRoom.delete(id);
       }
 
+      // ========== HAPUS KONEKSI LAMA (RECONNECT) ==========
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
         for (const oldWs of oldConnections) {
           if (oldWs !== ws) {
-            try {
-              await this.safeSend(oldWs, ["connectionReplaced", "Reconnecting..."]);
-              if (oldWs.readyState === 1) {
+            // TUTUP KONEKSI LAMA LANGSUNG (tanpa kirim event)
+            if (oldWs.readyState === 1) {
+              try {
                 oldWs.close(1000, "Reconnecting...");
-              }
-            } catch (e) {}
+              } catch (e) {}
+            }
 
             if (oldWs.roomname) {
               const clientSet = this.roomClients.get(oldWs.roomname);
@@ -1293,6 +1296,7 @@ async handleSetIdTarget2(ws, id, baru) {
         }
       }
 
+      // ========== TAMBAHKAN KONEKSI BARU ==========
       ws.idtarget = id;
       ws._isClosing = false;
       ws._pendingCleanup = false;
@@ -1300,9 +1304,10 @@ async handleSetIdTarget2(ws, id, baru) {
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
 
+      // ========== CEK APAKAH USER MASIH PUNYA KURSI (UNTUK RECONNECT) ==========
       const seatInfo = this.userToSeat.get(id);
 
-      // CASE 3: RECONNECT DENGAN DATA KURSI MASIH ADA
+      // CASE: RECONNECT DENGAN DATA KURSI MASIH ADA
       if (seatInfo && isReconnect) {
         const { room, seat } = seatInfo;
         const roomManager = this.roomManagers.get(room);
@@ -1311,6 +1316,7 @@ async handleSetIdTarget2(ws, id, baru) {
           const seatData = roomManager.getSeat(seat);
 
           if (seatData && seatData.namauser === id) {
+            // KEMBALIKAN DATA USER KE KURSI YANG SAMA
             ws.roomname = room;
             this._addToRoomClients(ws, room);
             await this.sendAllStateTo(ws, room, true);
@@ -1319,33 +1325,35 @@ async handleSetIdTarget2(ws, id, baru) {
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
             await this.safeSend(ws, ["reconnectSuccess", room, seat]);
 
+            // BATALKAN GRACE TIME
             const timer = this._reconnectTimers.get(id);
             if (timer !== undefined) {
               clearTimeout(timer);
               this._reconnectTimers.delete(id);
             }
             this._reconnectingUsers.delete(id);
-            return;  // ✅ LANGSUNG KELUAR, TIDAK KIRIM needJoinRoom
+            return;
           }
         }
       }
 
-      // CASE 2: RECONNECT TANPA DATA KURSI
-      if (baru === false) {  // ✅ Perbaiki: tambahkan kurung tutup )
+      // ========== KIRIM EVENT KE CLIENT ==========
+      // CASE: RECONNECT TANPA DATA KURSI
+      if (baru === false) {
         await this.safeSend(ws, ["needJoinRoom"]);
       }
       
-      // CASE 1: JOIN PERTAMA KALI
+      // CASE: JOIN PERTAMA KALI
       if (baru === true) {
         await this.safeSend(ws, ["joinroomawal"]);
       }
 
     } catch (error) {
-      await this.safeSend(ws, ["error", "Connection failed"]);
+      // TIDAK kirim error ke client (biar tidak crash)
     } finally {
       release();
     }
-  }
+}
 
 
   
