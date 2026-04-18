@@ -1271,13 +1271,12 @@ async handleSetIdTarget2(ws, id, baru) {
         this.userCurrentRoom.delete(id);
       }
 
-      // ========== HAPUS KONEKSI LAMA (RECONNECT) ==========
+      // ========== HAPUS KONEKSI LAMA ==========
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
         for (const oldWs of oldConnections) {
           if (oldWs !== ws) {
-            // TUTUP KONEKSI LAMA LANGSUNG (tanpa kirim event)
             if (oldWs.readyState === 1) {
               try {
                 oldWs.close(1000, "Reconnecting...");
@@ -1304,10 +1303,10 @@ async handleSetIdTarget2(ws, id, baru) {
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
 
-      // ========== CEK APAKAH USER MASIH PUNYA KURSI (UNTUK RECONNECT) ==========
+      // ========== CEK APAKAH USER MASIH PUNYA KURSI ==========
       const seatInfo = this.userToSeat.get(id);
 
-      // CASE: RECONNECT DENGAN DATA KURSI MASIH ADA
+      // CASE 1: RECONNECT DENGAN DATA KURSI MASIH ADA
       if (seatInfo && isReconnect) {
         const { room, seat } = seatInfo;
         const roomManager = this.roomManagers.get(room);
@@ -1316,7 +1315,6 @@ async handleSetIdTarget2(ws, id, baru) {
           const seatData = roomManager.getSeat(seat);
 
           if (seatData && seatData.namauser === id) {
-            // KEMBALIKAN DATA USER KE KURSI YANG SAMA
             ws.roomname = room;
             this._addToRoomClients(ws, room);
             await this.sendAllStateTo(ws, room, true);
@@ -1325,7 +1323,6 @@ async handleSetIdTarget2(ws, id, baru) {
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
             await this.safeSend(ws, ["reconnectSuccess", room, seat]);
 
-            // BATALKAN GRACE TIME
             const timer = this._reconnectTimers.get(id);
             if (timer !== undefined) {
               clearTimeout(timer);
@@ -1337,19 +1334,17 @@ async handleSetIdTarget2(ws, id, baru) {
         }
       }
 
-      // ========== KIRIM EVENT KE CLIENT ==========
-      // CASE: RECONNECT TANPA DATA KURSI
+      // CASE 2: KIRIM EVENT KE CLIENT
       if (baru === false) {
         await this.safeSend(ws, ["needJoinRoom"]);
       }
       
-      // CASE: JOIN PERTAMA KALI
       if (baru === true) {
         await this.safeSend(ws, ["joinroomawal"]);
       }
 
     } catch (error) {
-      // TIDAK kirim error ke client (biar tidak crash)
+      // Silent catch, no error sent to client
     } finally {
       release();
     }
