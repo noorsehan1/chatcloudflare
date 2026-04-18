@@ -1411,6 +1411,23 @@ export class ChatServer2 {
           if (seatData && seatData.namauser === id) {
             ws.roomname = room;
             this._addToRoomClients(ws, room);
+             // Dapatkan semua kursi yang terisi di room ini
+          const allKursiMeta = roomManager.getAllSeatsMeta();
+          const occupiedSeats = new Set();
+          
+          for (const seatNum of Object.keys(allKursiMeta)) {
+            occupiedSeats.add(parseInt(seatNum));
+          }
+          
+          // Tambahkan kursi user sendiri
+          occupiedSeats.add(seat);
+          
+          // Kirim removeKursi untuk semua kursi yang TIDAK terisi (1-35)
+          for (let clearSeat = 1; clearSeat <= CONSTANTS.MAX_SEATS; clearSeat++) {
+            if (!occupiedSeats.has(clearSeat)) {
+              await this.safeSend(ws, ["removeKursi", room, clearSeat]);
+            }
+          }
             await this.sendAllStateTo(ws, room, true);
             await this.safeSend(ws, ["numberKursiSaya", seat]);
             await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
