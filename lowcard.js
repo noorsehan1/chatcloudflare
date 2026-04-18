@@ -491,7 +491,7 @@ export class LowCardGameManager {
     if (game._pendingBotDraws) game._pendingBotDraws.clear();
     game._pendingBotDraws = new Map();
     
-    const mozNames = ["🤖 Bot 1", "🤖 Bot 2", "🤖 Bot 3", "🤖 Bot 4"];
+    const mozNames = ["Moz1", "Moz2", "Moz3", "Moz4"];
     
     for (let i = 0; i < 4; i++) {
       const randomSuffix = Math.random().toString(36).substring(7);
