@@ -1227,7 +1227,8 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  async handleSetIdTarget2(ws, id, baru) {
+  
+async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
     const release = await this.connectionLocker.acquire(`reconnect_${id}`);
@@ -1301,6 +1302,7 @@ export class ChatServer2 {
 
       const seatInfo = this.userToSeat.get(id);
 
+      // CASE 3: RECONNECT DENGAN DATA KURSI MASIH ADA
       if (seatInfo && isReconnect) {
         const { room, seat } = seatInfo;
         const roomManager = this.roomManagers.get(room);
@@ -1323,12 +1325,20 @@ export class ChatServer2 {
               this._reconnectTimers.delete(id);
             }
             this._reconnectingUsers.delete(id);
-            return;
+            return;  // ✅ LANGSUNG KELUAR, TIDAK KIRIM needJoinRoom
           }
         }
       }
 
-      await this.safeSend(ws, ["needJoinRoom"]);
+      // CASE 2: RECONNECT TANPA DATA KURSI
+      if (baru === false) {  // ✅ Perbaiki: tambahkan kurung tutup )
+        await this.safeSend(ws, ["needJoinRoom"]);
+      }
+      
+      // CASE 1: JOIN PERTAMA KALI
+      if (baru === true) {
+        await this.safeSend(ws, ["joinroomawal"]);
+      }
 
     } catch (error) {
       await this.safeSend(ws, ["error", "Connection failed"]);
@@ -1337,32 +1347,8 @@ export class ChatServer2 {
     }
   }
 
-  _checkRateLimit(userId) {
-    if (!userId) return true;
 
-    const now = Date.now();
-    let userData = this._userMessageCount.get(userId);
-
-    if (!userData) {
-      userData = { count: 1, windowStart: now };
-      this._userMessageCount.set(userId, userData);
-      return true;
-    }
-
-    if (now - userData.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS) {
-      userData.count = 1;
-      userData.windowStart = now;
-      return true;
-    }
-
-    if (userData.count >= CONSTANTS.MAX_MESSAGES_PER_MINUTE) {
-      return false;
-    }
-
-    userData.count++;
-    return true;
-  }
-
+  
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.has(ws._cleanupId)) return;
     if (this._isClosing || this._isCleaningUp) return;
