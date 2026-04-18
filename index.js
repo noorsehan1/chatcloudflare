@@ -1316,7 +1316,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-            async handleSetIdTarget2(ws, id, baru) {
+       async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
   const release = await this.connectionLocker.acquire(`reconnect_${id}`);
