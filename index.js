@@ -1316,7 +1316,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  async handleSetIdTarget2(ws, id, baru) {
+            async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
   const release = await this.connectionLocker.acquire(`reconnect_${id}`);
@@ -1411,7 +1411,7 @@ export class ChatServer2 {
           ws.roomname = room;
           this._addToRoomClients(ws, room);
           
-          // ========== KIRIM REMOVEKURSI UNTUK KURSI KOSONG (1-35) ==========
+          // ========== KIRIM REMOVEKURSI UNTUK KURSI KOSONG (TANPA AWAIT) ==========
           const allKursiMeta = roomManager.getAllSeatsMeta();
           const occupiedSeats = new Set();
           
@@ -1422,10 +1422,10 @@ export class ChatServer2 {
           // Tambahkan kursi user sendiri (JANGAN DIHAPUS)
           occupiedSeats.add(seat);
           
-          // Kirim removeKursi hanya untuk kursi yang TIDAK terisi
+          // Kirim removeKursi TANPA AWAIT - biarkan jalan di background
           for (let clearSeat = 1; clearSeat <= CONSTANTS.MAX_SEATS; clearSeat++) {
             if (!occupiedSeats.has(clearSeat)) {
-              await this.safeSend(ws, ["removeKursi", room, clearSeat]);
+              this.safeSend(ws, ["removeKursi", room, clearSeat]).catch(() => {});
             }
           }
           // ========== SELESAI ==========
@@ -1441,7 +1441,7 @@ export class ChatServer2 {
             this._reconnectTimers.delete(id);
           }
           this._reconnectingUsers.delete(id);
-          return; // <-- PENTING! Agar tidak lanjut ke needJoinRoom
+          return;
         }
       }
     }
