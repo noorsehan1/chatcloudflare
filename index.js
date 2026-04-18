@@ -1227,15 +1227,13 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  
-async handleSetIdTarget2(ws, id, baru) {
+  async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
     const release = await this.connectionLocker.acquire(`reconnect_${id}`);
     try {
       const isReconnect = (baru !== true);
 
-      // ========== SET GRACE TIME UNTUK RECONNECT ==========
       if (isReconnect) {
         this._reconnectingUsers.set(id, Date.now());
 
@@ -1252,7 +1250,6 @@ async handleSetIdTarget2(ws, id, baru) {
         this._reconnectTimers.set(id, newTimer);
       }
 
-      // ========== JOIN PERTAMA KALI: HAPUS SEMUA DATA LAMA ==========
       if (!isReconnect) {
         const snapshotRooms = Array.from(this.roomManagers.entries());
         for (const [roomName, roomManager] of snapshotRooms) {
@@ -1271,17 +1268,17 @@ async handleSetIdTarget2(ws, id, baru) {
         this.userCurrentRoom.delete(id);
       }
 
-      // ========== HAPUS KONEKSI LAMA ==========
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
         for (const oldWs of oldConnections) {
           if (oldWs !== ws) {
-            if (oldWs.readyState === 1) {
-              try {
+            try {
+              await this.safeSend(oldWs, ["connectionReplaced", "Reconnecting..."]);
+              if (oldWs.readyState === 1) {
                 oldWs.close(1000, "Reconnecting...");
-              } catch (e) {}
-            }
+              }
+            } catch (e) {}
 
             if (oldWs.roomname) {
               const clientSet = this.roomClients.get(oldWs.roomname);
@@ -1295,7 +1292,6 @@ async handleSetIdTarget2(ws, id, baru) {
         }
       }
 
-      // ========== TAMBAHKAN KONEKSI BARU ==========
       ws.idtarget = id;
       ws._isClosing = false;
       ws._pendingCleanup = false;
@@ -1303,10 +1299,8 @@ async handleSetIdTarget2(ws, id, baru) {
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
 
-      // ========== CEK APAKAH USER MASIH PUNYA KURSI ==========
       const seatInfo = this.userToSeat.get(id);
 
-      // CASE 1: RECONNECT DENGAN DATA KURSI MASIH ADA
       if (seatInfo && isReconnect) {
         const { room, seat } = seatInfo;
         const roomManager = this.roomManagers.get(room);
@@ -1344,13 +1338,38 @@ async handleSetIdTarget2(ws, id, baru) {
       }
 
     } catch (error) {
-      console.error(`[SETID] Error:`, error);
+      await this.safeSend(ws, ["error", "Connection failed"]);
     } finally {
       release();
     }
-}
+  }
 
-  
+  _checkRateLimit(userId) {
+    if (!userId) return true;
+
+    const now = Date.now();
+    let userData = this._userMessageCount.get(userId);
+
+    if (!userData) {
+      userData = { count: 1, windowStart: now };
+      this._userMessageCount.set(userId, userData);
+      return true;
+    }
+
+    if (now - userData.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS) {
+      userData.count = 1;
+      userData.windowStart = now;
+      return true;
+    }
+
+    if (userData.count >= CONSTANTS.MAX_MESSAGES_PER_MINUTE) {
+      return false;
+    }
+
+    userData.count++;
+    return true;
+  }
+
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing || this._wsCleaningUp.has(ws._cleanupId)) return;
     if (this._isClosing || this._isCleaningUp) return;
