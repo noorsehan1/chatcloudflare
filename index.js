@@ -1271,12 +1271,13 @@ async handleSetIdTarget2(ws, id, baru) {
         this.userCurrentRoom.delete(id);
       }
 
-      // ========== HAPUS KONEKSI LAMA ==========
+      // ========== HAPUS KONEKSI LAMA DENGAN DELAY ==========
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
         for (const oldWs of oldConnections) {
           if (oldWs !== ws) {
+            // TUTUP KONEKSI LAMA LANGSUNG
             if (oldWs.readyState === 1) {
               try {
                 oldWs.close(1000, "Reconnecting...");
@@ -1302,6 +1303,11 @@ async handleSetIdTarget2(ws, id, baru) {
       ws._connectionTime = Date.now();
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
+
+      // ========== TAMBAHKAN DELAY 2 DETIK SEBELUM CEK KURSI ==========
+      // Ini memberi waktu pada server untuk menyelesaikan cleanup
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      // ========== END DELAY ==========
 
       // ========== CEK APAKAH USER MASIH PUNYA KURSI ==========
       const seatInfo = this.userToSeat.get(id);
@@ -1334,7 +1340,7 @@ async handleSetIdTarget2(ws, id, baru) {
         }
       }
 
-      // CASE 2: KIRIM EVENT KE CLIENT
+      // ========== KIRIM EVENT KE CLIENT ==========
       if (baru === false) {
         await this.safeSend(ws, ["needJoinRoom"]);
       }
@@ -1344,7 +1350,7 @@ async handleSetIdTarget2(ws, id, baru) {
       }
 
     } catch (error) {
-      // Silent catch, no error sent to client
+      // Silent catch
     } finally {
       release();
     }
