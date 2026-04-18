@@ -1271,13 +1271,12 @@ async handleSetIdTarget2(ws, id, baru) {
         this.userCurrentRoom.delete(id);
       }
 
-      // ========== HAPUS KONEKSI LAMA DENGAN DELAY ==========
+      // ========== HAPUS KONEKSI LAMA ==========
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
         for (const oldWs of oldConnections) {
           if (oldWs !== ws) {
-            // TUTUP KONEKSI LAMA LANGSUNG
             if (oldWs.readyState === 1) {
               try {
                 oldWs.close(1000, "Reconnecting...");
@@ -1303,11 +1302,6 @@ async handleSetIdTarget2(ws, id, baru) {
       ws._connectionTime = Date.now();
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
-
-      // ========== TAMBAHKAN DELAY 2 DETIK SEBELUM CEK KURSI ==========
-      // Ini memberi waktu pada server untuk menyelesaikan cleanup
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      // ========== END DELAY ==========
 
       // ========== CEK APAKAH USER MASIH PUNYA KURSI ==========
       const seatInfo = this.userToSeat.get(id);
@@ -1350,12 +1344,11 @@ async handleSetIdTarget2(ws, id, baru) {
       }
 
     } catch (error) {
-      // Silent catch
+      console.error(`[SETID] Error:`, error);
     } finally {
       release();
     }
 }
-
 
   
   async handleMessage(ws, raw) {
