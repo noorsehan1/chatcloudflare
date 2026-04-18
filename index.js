@@ -1316,7 +1316,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-     async handleSetIdTarget2(ws, id, baru) {
+    async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
   const release = await this.connectionLocker.acquire(`reconnect_${id}`);
@@ -1411,29 +1411,21 @@ export class ChatServer2 {
           ws.roomname = room;
           this._addToRoomClients(ws, room);
           
-          // ========== KIRIM REMOVEKURSI UNTUK KURSI KOSONG ==========
-          // SEMUA DIBUNGKUS TRY-CATCH AGAR TIDAK GAGAL
-          try {
-            const allKursiMeta = roomManager.getAllSeatsMeta();
-            const occupiedSeats = new Set();
-            
-            for (const seatNum of Object.keys(allKursiMeta)) {
-              occupiedSeats.add(parseInt(seatNum));
-            }
-            
-            // Tambahkan kursi user sendiri (JANGAN DIHAPUS)
-            occupiedSeats.add(seat);
-            
-            // Kirim removeKursi TANPA AWAIT
-            for (let clearSeat = 1; clearSeat <= CONSTANTS.MAX_SEATS; clearSeat++) {
-              if (!occupiedSeats.has(clearSeat)) {
-                this.safeSend(ws, ["removeKursi", room, clearSeat]).catch(() => {});
-              }
-            }
-          } catch (removeError) {
-            // Abaikan error, lanjutkan reconnect
+          // ========== TAMBAHAN: KIRIM REMOVEKURSI UNTUK KURSI KOSONG 1-35 ==========
+          const allKursiMeta = roomManager.getAllSeatsMeta();
+          const occupiedSeats = new Set();
+          
+          for (const seatNum of Object.keys(allKursiMeta)) {
+            occupiedSeats.add(parseInt(seatNum));
           }
-          // ========== SELESAI ==========
+          occupiedSeats.add(seat);
+          
+          for (let clearSeat = 1; clearSeat <= CONSTANTS.MAX_SEATS; clearSeat++) {
+            if (!occupiedSeats.has(clearSeat)) {
+              this.safeSend(ws, ["removeKursi", room, clearSeat]).catch(() => {});
+            }
+          }
+          // ========== SELESAI TAMBAHAN ==========
           
           await this.sendAllStateTo(ws, room, true);
           await this.safeSend(ws, ["numberKursiSaya", seat]);
