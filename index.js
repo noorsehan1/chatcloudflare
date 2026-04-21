@@ -524,7 +524,7 @@ class RoomManager {
 // ─────────────────────────────────────────────
 // ChatServer2 - ZERO CRASH ZERO MEMORY LEAK PRODUCTION
 // ─────────────────────────────────────────────
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -1505,7 +1505,7 @@ export class ChatServer {
 export default {
   async fetch(req, env) {
     try {
-      const bindingName = "CHAT_SERVER";
+      const bindingName = "CHAT_SERVER_2";
       const chatId = env[bindingName].idFromName("chat-room");
       const chatObj = env[bindingName].get(chatId);
       return chatObj.fetch(req);
