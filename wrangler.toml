@@ -10,36 +10,4 @@ class_name = "ChatServer2"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer2"]name = "chatcloudnew"
-main = "index.js"
-compatibility_date = "2026-04-03"
-
-# Optimasi untuk 128MB Memory
-usage_model = "bundled"
-
-# Durable Object bindings
-[[durable_objects.bindings]]
-name = "CHAT_SERVER_2"
-class_name = "ChatServer2"
-
-# Migration untuk Durable Object
-[[migrations]]
-tag = "v1"
 new_classes = ["ChatServer2"]
-
-# Environment variables (opsional)
-# [vars]
-# ENVIRONMENT = "production"
-
-# Observability (opsional - untuk paid tier)
-# [observability]
-# enabled = true
-# head_sampling_rate = 0.1
-
-# Minify untuk production (opsional - akan memperkecil file)
-# [minify]
-# javascript = true
-
-# Logging (opsional)
-# [logging]
-# level = "info"
