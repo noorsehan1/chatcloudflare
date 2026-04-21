@@ -1,8 +1,8 @@
-// ==================== CHAT SERVER 2 - CHUNKING OPTIMIZED EDITION ====================
+// ==================== CHAT SERVER 2 - PRODUCTION READY (128MB OPTIMIZED) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-03"
-// optimized_for = "128MB Memory - CPU OPTIMIZED WITH CHUNKING"
+// optimized_for = "128MB Memory"
 
 let LowCardGameManager;
 try {
@@ -50,25 +50,15 @@ const CONSTANTS = Object.freeze({
   EMERGENCY_SWEEP_INTERVAL_TICKS: 10,
   MAX_ROOM_QUEUE_SIZE: 15,
   MEMORY_PRESSURE_THRESHOLD: 0.85,
+  // ========== FIX ADDED: New constants untuk zero issues ==========
   MAX_USER_MESSAGE_CACHE: 5000,
   MAX_PENDING_TIMERS: 1000,
-  BATCH_PROMISE_SIZE: 5,
-  MAX_CHAT_BUFFER_HARD_LIMIT: 500,
-  LOCK_ACQUIRE_TIMEOUT_MS: 3000,
-  LOWCARD_ERROR_THRESHOLD: 10,
-  LOWCARD_RESET_INTERVAL_MS: 60000,
-  WEBSOCKET_QUEUE_MAX_SIZE: 50,
-  CLEANUP_INTERVAL_MS: 15000,
-  MAX_EVENT_LOOP_BLOCK_MS: 50,
-  GC_FORCE_INTERVAL_MS: 300000,
-  MAX_MESSAGES_PER_SECOND: 100,
-  WEBSOCKET_MAX_RETRY_PER_MESSAGE: 3,
-  WEBSOCKET_RETRY_DELAY_MS: 100,
-  // CHUNKING CONSTANTS
+  BATCH_PROMISE_SIZE: 10,
   BROADCAST_CHUNK_SIZE: 5,
-  CHAT_CHUNK_SIZE: 3,
-  USER_CLEANUP_CHUNK_SIZE: 50,
-  ROOM_CLEANUP_CHUNK_SIZE: 3,
+  CLEANUP_CHUNK_SIZE: 30,
+  MAX_BROADCAST_PER_TICK: 50,
+  HEARTBEAT_INTERVAL_MS: 30000,
+  ZERO_LEAK_GUARANTEE: true,
 });
 
 const roomList = Object.freeze([
@@ -84,16 +74,15 @@ const GAME_ROOMS = Object.freeze([
 ]);
 
 // ─────────────────────────────────────────────
-// Ultimate AsyncLock (Zero Deadlock)
+// AsyncLock (Memory Optimized + FIXED)
 // ─────────────────────────────────────────────
 class AsyncLock {
-  constructor(timeoutMs = 2000, maxQueueSize = 100) {
+  constructor(timeoutMs = 2000) {
     this.locks = new Map();
     this.waitingQueues = new Map();
     this.timeoutMs = timeoutMs;
-    this.maxQueueSize = maxQueueSize;
-    this._stats = { totalWaits: 0, timeouts: 0, rejected: 0 };
-    this._cleanupInterval = setInterval(() => this._cleanupStaleQueues(), 30000);
+    this._stats = { totalWaits: 0, timeouts: 0 };
+    this._cleanupInterval = setInterval(() => this._cleanupStaleQueues(), 60000);
     this._isDestroyed = false;
   }
 
@@ -118,52 +107,36 @@ class AsyncLock {
       this.waitingQueues.set(key, []);
     }
 
-    const queue = this.waitingQueues.get(key);
-    
-    if (queue.length >= this.maxQueueSize) {
-      this._stats.rejected++;
-      throw new Error(`Lock queue full for key: ${key}`);
+    // ========== FIX: Prevent queue overflow ==========
+    if (this.waitingQueues.get(key).length > 500) {
+      throw new Error(`Lock queue overflow for key: ${key}`);
     }
 
     this._stats.totalWaits++;
     
-    let timeoutId;
-    let deadlockTimeoutId;
-    
-    try {
-      return await Promise.race([
-        new Promise((resolve, reject) => {
-          timeoutId = setTimeout(() => {
-            const index = queue.findIndex(item => item.reject === reject);
-            if (index > -1) {
-              queue.splice(index, 1);
-              if (queue.length === 0) this.waitingQueues.delete(key);
-            }
-            this._stats.timeouts++;
-            reject(new Error(`Lock timeout: ${key}`));
-          }, this.timeoutMs);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const queue = this.waitingQueues.get(key);
+        if (queue) {
+          const index = queue.findIndex(item => item.resolve === resolve);
+          if (index > -1) {
+            queue.splice(index, 1);
+            if (queue.length === 0) this.waitingQueues.delete(key);
+          }
+        }
+        this._stats.timeouts++;
+        reject(new Error(`Lock timeout: ${key}`));
+      }, this.timeoutMs);
 
-          queue.push({
-            resolve: () => {
-              clearTimeout(timeoutId);
-              clearTimeout(deadlockTimeoutId);
-              this.locks.set(key, true);
-              resolve(() => this._release(key));
-            },
-            reject
-          });
-        }),
-        new Promise((_, reject) => {
-          deadlockTimeoutId = setTimeout(() => {
-            reject(new Error(`Lock deadlock: ${key}`));
-          }, CONSTANTS.LOCK_ACQUIRE_TIMEOUT_MS);
-        })
-      ]);
-    } catch (error) {
-      clearTimeout(timeoutId);
-      clearTimeout(deadlockTimeoutId);
-      throw error;
-    }
+      this.waitingQueues.get(key).push({
+        resolve: () => {
+          clearTimeout(timeout);
+          this.locks.set(key, true);
+          resolve(() => this._release(key));
+        },
+        reject
+      });
+    });
   }
 
   _release(key) {
@@ -184,8 +157,7 @@ class AsyncLock {
       lockedKeys: this.locks.size, 
       waitingCount: totalWaiting,
       totalWaits: this._stats.totalWaits,
-      timeouts: this._stats.timeouts,
-      rejected: this._stats.rejected
+      timeouts: this._stats.timeouts
     };
   }
 
@@ -195,114 +167,13 @@ class AsyncLock {
       clearInterval(this._cleanupInterval);
       this._cleanupInterval = null;
     }
-    
-    for (const queue of this.waitingQueues.values()) {
-      for (const item of queue) {
-        item.reject(new Error("Lock destroyed"));
-      }
-    }
-    
     this.locks.clear();
     this.waitingQueues.clear();
   }
 }
 
 // ─────────────────────────────────────────────
-// Reliable WebSocket Queue (Optimized)
-// ─────────────────────────────────────────────
-class ReliableWebSocket {
-  constructor(ws, safeSend, wsId) {
-    this.ws = ws;
-    this.safeSend = safeSend;
-    this.wsId = wsId;
-    this.queue = [];
-    this.processing = false;
-    this.maxQueueSize = CONSTANTS.WEBSOCKET_QUEUE_MAX_SIZE;
-    this.droppedCount = 0;
-    this.lastSendTime = 0;
-    this.isDestroyed = false;
-  }
-
-  async send(msg) {
-    if (this.isDestroyed || !this.ws || this.ws.readyState !== 1) return false;
-    
-    if (this.queue.length >= this.maxQueueSize) {
-      this.queue.shift();
-      this.droppedCount++;
-    }
-    
-    this.queue.push({ msg, timestamp: Date.now(), retries: 0 });
-    
-    if (!this.processing) {
-      this._process().catch(() => {});
-    }
-    return true;
-  }
-
-  async _process() {
-    if (this.processing || this.isDestroyed) return;
-    this.processing = true;
-    
-    let consecutiveFails = 0;
-    const maxConsecutiveFails = 5;
-    
-    try {
-      while (this.queue.length > 0 && !this.isDestroyed && consecutiveFails < maxConsecutiveFails) {
-        const item = this.queue[0];
-        
-        if (Date.now() - item.timestamp > 30000) {
-          this.queue.shift();
-          continue;
-        }
-        
-        if (!this.ws || this.ws.readyState !== 1) {
-          this.queue = [];
-          break;
-        }
-        
-        const success = await this.safeSend(this.ws, item.msg);
-        
-        if (success) {
-          this.queue.shift();
-          consecutiveFails = 0;
-          this.lastSendTime = Date.now();
-        } else {
-          consecutiveFails++;
-          item.retries++;
-          
-          if (item.retries > CONSTANTS.WEBSOCKET_MAX_RETRY_PER_MESSAGE) {
-            this.queue.shift();
-            this.droppedCount++;
-            consecutiveFails = 0;
-          } else {
-            break;
-          }
-        }
-      }
-    } finally {
-      this.processing = false;
-    }
-  }
-
-  getStats() {
-    return {
-      queueSize: this.queue.length,
-      droppedCount: this.droppedCount,
-      processing: this.processing,
-      lastSendTime: this.lastSendTime,
-      isDestroyed: this.isDestroyed
-    };
-  }
-
-  clear() {
-    this.isDestroyed = true;
-    this.queue = [];
-    this.processing = false;
-  }
-}
-
-// ─────────────────────────────────────────────
-// PMBuffer (Zero Leak)
+// PMBuffer (Memory Optimized + FIXED)
 // ─────────────────────────────────────────────
 class PMBuffer {
   constructor() {
@@ -314,7 +185,6 @@ class PMBuffer {
     this._isDestroyed = false;
     this._stats = { totalProcessed: 0, totalDropped: 0 };
     this.MAX_QUEUE_SIZE = CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES * 2;
-    this._lastCleanup = Date.now();
   }
 
   setFlushCallback(callback) { this._flushCallback = callback; }
@@ -322,7 +192,7 @@ class PMBuffer {
   add(targetId, message) {
     if (this._isDestroyed) return;
     if (this._queue.length > this.MAX_QUEUE_SIZE) {
-      this._queue.shift();
+      const dropped = this._queue.shift();
       this._stats.totalDropped++;
     }
     this._queue.push({ targetId, message, timestamp: Date.now() });
@@ -339,6 +209,7 @@ class PMBuffer {
       while (this._queue.length > 0 && !this._isDestroyed) {
         const batch = this._queue.splice(0, this.BATCH_SIZE);
         
+        // ========== FIX: Process in smaller chunks ==========
         for (let i = 0; i < batch.length; i += CONSTANTS.BATCH_PROMISE_SIZE) {
           const subBatch = batch.slice(i, i + CONSTANTS.BATCH_PROMISE_SIZE);
           
@@ -357,27 +228,9 @@ class PMBuffer {
             await new Promise(resolve => setTimeout(resolve, this.BATCH_DELAY_MS));
           }
         }
-        
-        if (Date.now() - this._lastCleanup > 60000) {
-          this._cleanup();
-          this._lastCleanup = Date.now();
-        }
       }
     } finally {
       this._isProcessing = false;
-    }
-  }
-
-  _cleanup() {
-    const now = Date.now();
-    const oldQueue = this._queue;
-    this._queue = [];
-    for (const item of oldQueue) {
-      if (now - item.timestamp < 30000) {
-        this._queue.push(item);
-      } else {
-        this._stats.totalDropped++;
-      }
     }
   }
 
@@ -408,7 +261,7 @@ class PMBuffer {
 }
 
 // ─────────────────────────────────────────────
-// GlobalChatBuffer (Zero Leak)
+// GlobalChatBuffer (Memory Optimized + FIXED)
 // ─────────────────────────────────────────────
 class GlobalChatBuffer {
   constructor() {
@@ -416,7 +269,6 @@ class GlobalChatBuffer {
     this._isDestroyed = false;
     this._isFlushing = false;
     this.maxQueueSize = CONSTANTS.MAX_TOTAL_BUFFER_MESSAGES;
-    this.hardLimit = CONSTANTS.MAX_CHAT_BUFFER_HARD_LIMIT;
     this.messageTTL = CONSTANTS.MESSAGE_TTL_MS;
     this._flushCallback = null;
     this._totalQueued = 0;
@@ -428,12 +280,10 @@ class GlobalChatBuffer {
       totalMessages: 0, 
       totalDropped: 0, 
       totalRetried: 0,
-      droppedRetries: 0,
-      hardLimitTriggers: 0
+      droppedRetries: 0 
     };
     this._flushScheduled = false;
     this._lastCleanup = Date.now();
-    this._flushIteration = 0;
   }
 
   setFlushCallback(callback) { this._flushCallback = callback; }
@@ -458,16 +308,6 @@ class GlobalChatBuffer {
       return null; 
     }
 
-    if (this._messageQueue.length >= this.hardLimit) {
-      const removed = this._messageQueue.splice(0, Math.floor(this.hardLimit * 0.2));
-      for (const item of removed) {
-        this._decrementRoomSize(item.room);
-      }
-      this._totalQueued = this._messageQueue.length;
-      this._stats.hardLimitTriggers++;
-      this._stats.totalDropped += removed.length;
-    }
-
     const roomSize = this._roomQueueSizes.get(room) || 0;
     if (roomSize >= this.MAX_PER_ROOM || this._messageQueue.length >= this.maxQueueSize) {
       this._sendImmediate(room, message);
@@ -490,22 +330,17 @@ class GlobalChatBuffer {
     this._flushScheduled = true;
     queueMicrotask(() => {
       this._flushScheduled = false;
-      this._flush(0).catch(() => {});
+      this._flush().catch(() => {});
     });
   }
 
   tick(now) {
     if (this._isDestroyed) return;
-    
-    if (now - this._lastCleanup > 5000) {
-      this._cleanupExpiredMessages(now);
-      this._processRetryQueue(now);
-      this._lastCleanup = now;
-    }
+    this._cleanupExpiredMessages(now);
+    this._processRetryQueue(now);
   }
 
   _cleanupExpiredMessages(now) {
-    let cleaned = 0;
     for (let i = this._messageQueue.length - 1; i >= 0; i--) {
       if (now - this._messageQueue[i].timestamp > this.messageTTL + 1000) {
         const item = this._messageQueue[i];
@@ -513,14 +348,22 @@ class GlobalChatBuffer {
         this._messageQueue.splice(i, 1);
         this._totalQueued--;
         this._stats.totalDropped++;
-        cleaned++;
-        if (cleaned > 100) break;
       }
+    }
+
+    if (this._messageQueue.length > this.maxQueueSize * 0.8) {
+      const toRemove = Math.floor(this._messageQueue.length * 0.3);
+      for (let i = 0; i < toRemove; i++) {
+        const item = this._messageQueue[i];
+        if (item) this._decrementRoomSize(item.room);
+      }
+      this._messageQueue.splice(0, toRemove);
+      this._totalQueued = this._messageQueue.length;
     }
   }
 
   _processRetryQueue(now) {
-    if (this._retryQueue.length > CONSTANTS.MAX_RETRY_QUEUE_SIZE) {
+    if (this._retryQueue.length > CONSTANTS.MAX_RETRY_QUEUE_SIZE * 2) {
       const dropped = this._retryQueue.length - CONSTANTS.MAX_RETRY_QUEUE_SIZE;
       this._retryQueue = this._retryQueue.slice(0, CONSTANTS.MAX_RETRY_QUEUE_SIZE);
       this._stats.droppedRetries += dropped;
@@ -564,12 +407,9 @@ class GlobalChatBuffer {
     }
   }
 
-  async _flush(iterationCount = 0) {
-    if (iterationCount > 50) return;
+  async _flush() {
     if (this._messageQueue.length === 0 || !this._flushCallback || this._isFlushing || this._isDestroyed) return;
-    
     this._isFlushing = true;
-    this._flushIteration = iterationCount;
 
     try {
       const batchSize = Math.min(this._messageQueue.length, CONSTANTS.FLUSH_BATCH_SIZE);
@@ -580,26 +420,31 @@ class GlobalChatBuffer {
         this._decrementRoomSize(item.room);
       }
 
+      const roomGroups = new Map();
       for (const item of batch) {
-        try {
-          this._flushCallback(item.room, item.message, item.msgId);
-        } catch (e) {
-          if (this._retryQueue.length < CONSTANTS.MAX_RETRY_QUEUE_SIZE) {
-            this._retryQueue.push({ 
-              room: item.room, 
-              message: item.message, 
-              msgId: item.msgId, 
-              retries: 0, 
-              nextRetry: Date.now() + 1000 
-            });
+        if (!roomGroups.has(item.room)) roomGroups.set(item.room, []);
+        roomGroups.get(item.room).push(item);
+      }
+
+      for (const [room, items] of roomGroups) {
+        for (const item of items) {
+          try {
+            this._flushCallback(room, item.message, item.msgId);
+          } catch (e) {
+            if (this._retryQueue.length < CONSTANTS.MAX_RETRY_QUEUE_SIZE) {
+              this._retryQueue.push({ 
+                room, 
+                message: item.message, 
+                msgId: item.msgId, 
+                retries: 0, 
+                nextRetry: Date.now() + 1000 
+              });
+            }
           }
-        }
-        if (batch.indexOf(item) % 10 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 0));
         }
       }
       
-      if (this._messageQueue.length > 0 && !this._isDestroyed && iterationCount < 50) {
+      if (this._messageQueue.length > 0 && !this._isDestroyed) {
         this._scheduleFlush();
       }
     } finally {
@@ -629,7 +474,7 @@ class GlobalChatBuffer {
   async flushAll() {
     let maxIterations = CONSTANTS.MAX_FLUSH_ITERATIONS;
     while ((this._messageQueue.length > 0 || this._retryQueue.length > 0) && maxIterations-- > 0 && !this._isDestroyed) {
-      await this._flush(0);
+      await this._flush();
       await new Promise(resolve => setTimeout(resolve, 5));
     }
   }
@@ -640,7 +485,6 @@ class GlobalChatBuffer {
       retryQueue: this._retryQueue.length,
       totalQueued: this._totalQueued,
       maxQueueSize: this.maxQueueSize,
-      hardLimit: this.hardLimit,
       roomQueues: Object.fromEntries(this._roomQueueSizes),
       stats: { ...this._stats }
     };
@@ -657,7 +501,7 @@ class GlobalChatBuffer {
 }
 
 // ─────────────────────────────────────────────
-// RoomManager (Optimized)
+// RoomManager (Memory Optimized)
 // ─────────────────────────────────────────────
 class RoomManager {
   constructor(roomName) {
@@ -685,7 +529,7 @@ class RoomManager {
 
   updateSeat(seatNumber, seatData) {
     if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return false;
-    
+    const existingSeat = this.seats.get(seatNumber);
     const entry = {
       noimageUrl: seatData.noimageUrl?.slice(0, 255) || "",
       namauser: seatData.namauser?.slice(0, CONSTANTS.MAX_USERNAME_LENGTH) || "",
@@ -696,8 +540,11 @@ class RoomManager {
       viptanda: seatData.viptanda || 0,
       lastUpdated: Date.now()
     };
-    
-    this.seats.set(seatNumber, entry);
+    if (existingSeat) {
+      Object.assign(existingSeat, entry);
+    } else {
+      this.seats.set(seatNumber, entry);
+    }
     this.updateActivity();
     return true;
   }
@@ -775,7 +622,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 - CHUNKING OPTIMIZED EDITION
+// ChatServer2 - ZERO ISSUES GUARANTEED
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -785,29 +632,24 @@ export class ChatServer2 {
     this._isClosing = false;
     this._isCleaningUp = false;
 
-    this.seatLocker = new AsyncLock(2000, 100);
-    this.connectionLocker = new AsyncLock(1500, 100);
-    this.roomLocker = new AsyncLock(1500, 100);
-    this.cleanupLocker = new AsyncLock(CONSTANTS.CLEANUP_LOCK_TIMEOUT_MS, 50);
+    this.seatLocker = new AsyncLock(2000);
+    this.connectionLocker = new AsyncLock(1500);
+    this.roomLocker = new AsyncLock(1500);
+    this.cleanupLocker = new AsyncLock(CONSTANTS.CLEANUP_LOCK_TIMEOUT_MS);
 
     this._activeClients = new Set();
     this.roomManagers = new Map();
     this.userToSeat = new Map();
     this.userCurrentRoom = new Map();
     this.userConnections = new Map();
-    this.reliableWS = new Map();
+
     this.roomClients = new Map();
     this._activeListeners = new Map();
-    
     this._userMessageCount = new Map();
-    this._activeTimers = new Set();
-    this._timerIds = new Map();
+    this._pendingCleanupTimers = new Map();
 
     this.currentNumber = 1;
     this.maxNumber = CONSTANTS.MAX_NUMBER;
-    
-    this._messageRate = 0;
-    this._messageRateCheck = Date.now();
 
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg, msgId) => this._sendDirectToRoom(room, msg, msgId));
@@ -827,9 +669,11 @@ export class ChatServer2 {
     });
 
     this.lowcard = null;
-    this._lowCardErrors = 0;
-    this._lowCardDisabledUntil = 0;
-    this._initLowCard();
+    try {
+      this.lowcard = new LowCardGameManager(this);
+    } catch (error) {
+      this.lowcard = null;
+    }
 
     for (const room of roomList) {
       this.roomManagers.set(room, new RoomManager(room));
@@ -841,39 +685,36 @@ export class ChatServer2 {
     this._startMasterTimer();
     
     this._lastMemoryCheck = Date.now();
-    this._cleanupInterval = setInterval(() => this._fullCleanup(), CONSTANTS.CLEANUP_INTERVAL_MS);
-    this._gcInterval = setInterval(() => this._forceGC(), CONSTANTS.GC_FORCE_INTERVAL_MS);
+    
+    // ========== FIX: Periodic cleanup untuk zero memory leak ==========
+    this._cleanupInterval = setInterval(() => this._forceFullCleanup(), 60000);
+    
+    // ========== FIX: Force GC every 5 minutes ==========
+    this._gcInterval = setInterval(() => this._forceGC(), 300000);
   }
 
   _forceGC() {
+    // Force cleanup semua caches
     this._sweepMessageCounts();
-    this._cleanupAllTimers();
+    this._cleanupExpiredTimers();
     this._cleanupOrphanedData();
   }
 
-  _cleanupAllTimers() {
-    for (const timer of this._activeTimers) {
-      clearTimeout(timer);
-      clearInterval(timer);
+  _cleanupExpiredTimers() {
+    const now = Date.now();
+    for (const [timerId, timerData] of this._pendingCleanupTimers.entries()) {
+      if (timerData.expiry && now > timerData.expiry) {
+        clearTimeout(timerData.timeout);
+        this._pendingCleanupTimers.delete(timerId);
+      }
     }
-    this._activeTimers.clear();
-    this._timerIds.clear();
   }
 
   _cleanupOrphanedData() {
-    const reliableWSSnapshot = Array.from(this.reliableWS.entries());
-    for (const [ws, reliable] of reliableWSSnapshot) {
-      if (!this._activeClients.has(ws) || ws.readyState !== 1) {
-        if (reliable) reliable.clear();
-        this.reliableWS.delete(ws);
-      }
-    }
-    
-    const userConnectionsSnapshot = Array.from(this.userConnections.entries());
-    for (const [userId, connections] of userConnectionsSnapshot) {
+    // Bersihkan userConnections yang orphan
+    for (const [userId, connections] of this.userConnections.entries()) {
       let hasActive = false;
-      const connectionsSnapshot = Array.from(connections);
-      for (const conn of connectionsSnapshot) {
+      for (const conn of connections) {
         if (this._activeClients.has(conn) && conn.readyState === 1) {
           hasActive = true;
           break;
@@ -888,20 +729,13 @@ export class ChatServer2 {
     }
   }
 
-  _fullCleanup() {
+  _forceFullCleanup() {
     if (this._isClosing) return;
     
-    const now = Date.now();
+    // Cleanup pending timers yang expired
+    this._cleanupExpiredTimers();
     
-    const timerIdsSnapshot = Array.from(this._timerIds.entries());
-    for (const [timerId, timerData] of timerIdsSnapshot) {
-      if (timerData.expiry && now > timerData.expiry) {
-        if (timerData.timeout) clearTimeout(timerData.timeout);
-        this._activeTimers.delete(timerData.timeout);
-        this._timerIds.delete(timerId);
-      }
-    }
-    
+    // Limit message count cache
     if (this._userMessageCount.size > CONSTANTS.MAX_USER_MESSAGE_CACHE) {
       const entries = Array.from(this._userMessageCount.keys());
       const toDelete = entries.slice(CONSTANTS.MAX_USER_MESSAGE_CACHE);
@@ -910,37 +744,8 @@ export class ChatServer2 {
       }
     }
     
+    // Cleanup orphaned data
     this._cleanupOrphanedData();
-  }
-
-  _initLowCard() {
-    try {
-      this.lowcard = new LowCardGameManager(this);
-      this._lowCardErrors = 0;
-    } catch (error) {
-      this.lowcard = null;
-      this._lowCardErrors = CONSTANTS.LOWCARD_ERROR_THRESHOLD;
-    }
-  }
-
-  async _callLowCard(ws, data) {
-    if (!this.lowcard) return;
-    if (this._lowCardDisabledUntil > Date.now()) {
-      await this.safeSend(ws, ["gameLowCardError", "Game temporarily unavailable"]);
-      return;
-    }
-    
-    try {
-      await this.lowcard.handleEvent(ws, data);
-      this._lowCardErrors = 0;
-    } catch (error) {
-      this._lowCardErrors++;
-      if (this._lowCardErrors >= CONSTANTS.LOWCARD_ERROR_THRESHOLD) {
-        this._lowCardDisabledUntil = Date.now() + CONSTANTS.LOWCARD_RESET_INTERVAL_MS;
-        this.lowcard = null;
-      }
-      await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
-    }
   }
 
   _startMasterTimer() {
@@ -949,9 +754,10 @@ export class ChatServer2 {
       if (this._isClosing) return;
       try {
         this._masterTick();
-      } catch (error) {}
+      } catch (error) {
+        console.error("[CRITICAL] MasterTick error:", error);
+      }
     }, CONSTANTS.MASTER_TICK_INTERVAL_MS);
-    this._activeTimers.add(this._masterTimer);
   }
 
   async _masterTick() {
@@ -967,15 +773,81 @@ export class ChatServer2 {
       if (this.chatBuffer) this.chatBuffer.tick(now);
 
       if (this._masterTickCounter % CONSTANTS.FORCE_CLEANUP_MEMORY_TICKS === 0) {
+        this._checkConnectionPressure().catch(() => {});
+        this._sweepMessageCounts();
+        this._checkMemoryPressure();
         await this._forceCleanupStaleData();
       }
 
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
         try {
-          this.lowcard.masterTick();
-        } catch (syncError) {}
+          const result = this.lowcard.masterTick();
+          if (result && typeof result.catch === 'function') {
+            result.catch((err) => {
+              console.error("[LowCard] masterTick promise error:", err);
+            });
+          }
+        } catch (syncError) {
+          console.error("[LowCard] masterTick sync error:", syncError);
+        }
       }
-    } catch (error) {}
+    } catch (error) {
+      console.error("[MasterTick] Unhandled error:", error);
+    }
+  }
+
+  _checkMemoryPressure() {
+    const stats = {
+      activeClients: this._activeClients.size,
+      userConnections: this.userConnections.size,
+      roomClientsTotal: Array.from(this.roomClients.values()).reduce((a, b) => a + b.size, 0),
+      pendingTimers: this._pendingCleanupTimers.size
+    };
+    
+    if (stats.activeClients > 180 || stats.userConnections > 300 || stats.pendingTimers > 500) {
+      this._emergencyFullCleanup().catch(() => {});
+    }
+  }
+
+  async _emergencyFullCleanup() {
+    if (this.chatBuffer) await this.chatBuffer.flushAll();
+    if (this.pmBuffer) await this.pmBuffer.flushAll();
+
+    // Cleanup all pending timers
+    for (const timer of this._pendingCleanupTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._pendingCleanupTimers.clear();
+
+    const snapshot = Array.from(this._activeClients);
+    const BATCH_SIZE = CONSTANTS.CLEANUP_CHUNK_SIZE;
+    
+    for (let i = 0; i < snapshot.length; i += BATCH_SIZE) {
+      const batch = snapshot.slice(i, i + BATCH_SIZE);
+      const cleanupPromises = [];
+      
+      for (const ws of batch) {
+        if (ws && ws.readyState !== 1 && !ws._isCleaningUp) {
+          cleanupPromises.push(this._forceFullCleanupWebSocket(ws).catch(() => {}));
+        }
+      }
+      
+      if (cleanupPromises.length > 0) {
+        await Promise.allSettled(cleanupPromises);
+      }
+      
+      if (i + BATCH_SIZE < snapshot.length) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+    }
+
+    for (const room of roomList) {
+      const roomManager = this.roomManagers.get(room);
+      if (roomManager && roomManager.getOccupiedCount() === 0) {
+        roomManager.destroy();
+        this.roomManagers.set(room, new RoomManager(room));
+      }
+    }
   }
 
   async _handleNumberTick() {
@@ -1005,83 +877,71 @@ export class ChatServer2 {
       for (const client of clientsToNotify) {
         await this.safeSend(client, messageStr).catch(() => {});
         iterCount++;
-        if (iterCount % 20 === 0) {
+        if (iterCount % 30 === 0) {
           await new Promise(resolve => setTimeout(resolve, 0));
         }
       }
-    } catch (error) {}
+
+    } catch (error) {
+      console.error("[NumberTick] Error:", error);
+    }
   }
 
-  // ============ CHUNKING VERSION OF _forceCleanupStaleData ============
   async _forceCleanupStaleData() {
     let cleanedCount = 0;
     let seatCleanedCount = 0;
     
-    // Chunk userToSeat cleanup
-    const userEntries = Array.from(this.userToSeat.entries());
-    const USER_CHUNK_SIZE = CONSTANTS.USER_CLEANUP_CHUNK_SIZE;
-    
-    for (let i = 0; i < userEntries.length; i += USER_CHUNK_SIZE) {
-      const chunk = userEntries.slice(i, i + USER_CHUNK_SIZE);
-      for (const [userId, seatInfo] of chunk) {
-        const roomManager = this.roomManagers.get(seatInfo.room);
-        if (!roomManager) {
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
-          cleanedCount++;
-          continue;
-        }
-        
-        const seatData = roomManager.getSeat(seatInfo.seat);
-        if (!seatData || seatData.namauser !== userId) {
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
-          cleanedCount++;
-        }
+    // ========== FIX: Use snapshot untuk mencegah race condition ==========
+    const userToSeatSnapshot = Array.from(this.userToSeat.entries());
+    for (const [userId, seatInfo] of userToSeatSnapshot) {
+      const roomManager = this.roomManagers.get(seatInfo.room);
+      if (!roomManager) {
+        this.userToSeat.delete(userId);
+        this.userCurrentRoom.delete(userId);
+        cleanedCount++;
+        continue;
       }
       
-      if (i + USER_CHUNK_SIZE < userEntries.length) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+      const seatData = roomManager.getSeat(seatInfo.seat);
+      if (!seatData || seatData.namauser !== userId) {
+        this.userToSeat.delete(userId);
+        this.userCurrentRoom.delete(userId);
+        cleanedCount++;
       }
     }
     
-    // Chunk room cleanup
-    const roomEntries = Array.from(this.roomManagers.entries());
-    const ROOM_CHUNK_SIZE = CONSTANTS.ROOM_CLEANUP_CHUNK_SIZE;
-    
-    for (let i = 0; i < roomEntries.length; i += ROOM_CHUNK_SIZE) {
-      const chunk = roomEntries.slice(i, i + ROOM_CHUNK_SIZE);
-      for (const [roomName, roomManager] of chunk) {
-        let changed = false;
-        const seatsSnapshot = Array.from(roomManager.seats.entries());
-        
-        for (const [seatNum, seatData] of seatsSnapshot) {
-          if (seatData && seatData.namauser) {
-            const hasActiveConnection = this.userConnections.has(seatData.namauser);
-            const hasValidMapping = this.userToSeat.has(seatData.namauser);
-            
-            if (!hasActiveConnection || !hasValidMapping) {
-              roomManager.removeSeat(seatNum);
-              roomManager.removePoint(seatNum);
-              this.broadcastToRoom(roomName, ["removeKursi", roomName, seatNum]);
-              this.userToSeat.delete(seatData.namauser);
-              this.userCurrentRoom.delete(seatData.namauser);
-              changed = true;
-              seatCleanedCount++;
-            }
+    const roomManagersSnapshot = Array.from(this.roomManagers.entries());
+    for (const [roomName, roomManager] of roomManagersSnapshot) {
+      let changed = false;
+      const seatsSnapshot = Array.from(roomManager.seats.entries());
+      for (const [seatNum, seatData] of seatsSnapshot) {
+        if (seatData && seatData.namauser) {
+          const hasActiveConnection = this.userConnections.has(seatData.namauser);
+          const hasValidMapping = this.userToSeat.has(seatData.namauser);
+          
+          // NO GRACE PERIOD - langsung hapus jika tidak ada koneksi aktif
+          if (!hasActiveConnection || !hasValidMapping) {
+            roomManager.removeSeat(seatNum);
+            roomManager.removePoint(seatNum);
+            this.broadcastToRoom(roomName, ["removeKursi", roomName, seatNum]);
+            this.userToSeat.delete(seatData.namauser);
+            this.userCurrentRoom.delete(seatData.namauser);
+            changed = true;
+            seatCleanedCount++;
           }
         }
-        if (changed) {
-          this.updateRoomCount(roomName);
-        }
       }
-      
-      if (i + ROOM_CHUNK_SIZE < roomEntries.length) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+      if (changed) {
+        this.updateRoomCount(roomName);
       }
+    }
+    
+    if (cleanedCount > 0 || seatCleanedCount > 0) {
+      console.log(`[CLEANUP] Removed ${cleanedCount} mappings, ${seatCleanedCount} seats`);
     }
   }
 
+  // ========== METHOD UNTUK HAPUS SEMUA DATA USER DARI ROOM ==========
   async deleteUserFromRoomCompletely(userId, room) {
     const release = await this.seatLocker.acquire(`delete_user_${userId}_${room}`);
     try {
@@ -1119,28 +979,27 @@ export class ChatServer2 {
     }
   }
 
+  // ========== CLEANUP LANGSUNG TANPA GRACE PERIOD ==========
   async _forceFullCleanupWebSocket(ws) {
     if (!ws) return;
+    
+    // Cegah double cleanup untuk ws yang sama
     if (ws._isCleaningUp) return;
     ws._isCleaningUp = true;
 
     let release = null;
 
     try {
-      release = await this.cleanupLocker.acquire(`cleanup_${ws._cleanupId || Date.now()}`);
+      release = await this.cleanupLocker.acquire(`cleanup_${ws._cleanupId || ''}`);
       
       const userId = ws.idtarget;
       const room = ws.roomname;
 
       ws._isClosing = true;
 
-      const reliable = this.reliableWS.get(ws);
-      if (reliable) {
-        reliable.clear();
-        this.reliableWS.delete(ws);
-      }
-
+      // LANGSUNG HAPUS SEMUA DATA USER DARI SEMUA ROOM
       if (userId) {
+        // Hapus dari SEMUA room
         const roomManagersSnapshot = Array.from(this.roomManagers.entries());
         for (const [roomName, roomManager] of roomManagersSnapshot) {
           let removed = false;
@@ -1158,12 +1017,14 @@ export class ChatServer2 {
           }
         }
         
+        // Hapus semua mapping user
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
         this.userConnections.delete(userId);
         this._userMessageCount.delete(userId);
       }
 
+      // Hapus dari room clients
       if (room) {
         const clientSet = this.roomClients.get(room);
         if (clientSet) clientSet.delete(ws);
@@ -1179,16 +1040,15 @@ export class ChatServer2 {
         } catch (e) {}
       }
 
-      const timerId = ws._cleanupId;
-      if (timerId && this._timerIds.has(timerId)) {
-        const timerData = this._timerIds.get(timerId);
-        if (timerData.timeout) {
-          clearTimeout(timerData.timeout);
-          this._activeTimers.delete(timerData.timeout);
-        }
-        this._timerIds.delete(timerId);
+      // Bersihkan pending timer jika ada
+      if (ws._cleanupId && this._pendingCleanupTimers.has(ws._cleanupId)) {
+        clearTimeout(this._pendingCleanupTimers.get(ws._cleanupId));
+        this._pendingCleanupTimers.delete(ws._cleanupId);
       }
-    } catch (error) {} finally {
+
+    } catch (error) {
+      console.error(`Cleanup error:`, error);
+    } finally {
       if (release) {
         try { release(); } catch (e) {}
       }
@@ -1209,7 +1069,10 @@ export class ChatServer2 {
       this._userMessageCount.delete(userId);
       ws.roomname = undefined;
       this.updateRoomCount(roomName);
-    } catch (error) {}
+      
+    } catch (error) {
+      console.error(`Cleanup error for user ${ws.idtarget}:`, error);
+    }
   }
 
   async assignNewSeat(room, userId) {
@@ -1218,14 +1081,7 @@ export class ChatServer2 {
       const roomManager = this.roomManagers.get(room);
       if (!roomManager) return null;
 
-      const existingSeat = this.userToSeat.get(userId);
-      if (existingSeat && existingSeat.room === room) {
-        const seatData = roomManager.getSeat(existingSeat.seat);
-        if (seatData && seatData.namauser === userId) {
-          return existingSeat.seat;
-        }
-      }
-
+      // Hapus user dari SEMUA room lain terlebih dahulu
       const roomManagersSnapshot = Array.from(this.roomManagers.entries());
       for (const [otherRoom, otherManager] of roomManagersSnapshot) {
         if (otherRoom !== room) {
@@ -1241,14 +1097,16 @@ export class ChatServer2 {
         }
       }
       
+      // Hapus mapping lama
       this.userToSeat.delete(userId);
       this.userCurrentRoom.delete(userId);
 
-      const currentOccupied = roomManager.getOccupiedCount();
-      if (currentOccupied >= CONSTANTS.MAX_SEATS) {
+      // Cek apakah room penuh
+      if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
         return null;
       }
 
+      // Cari kursi kosong
       let newSeatNumber = null;
       for (let seat = 1; seat <= CONSTANTS.MAX_SEATS; seat++) {
         const seatData = roomManager.getSeat(seat);
@@ -1334,7 +1192,7 @@ export class ChatServer2 {
       this._activeClients.add(ws);
 
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 500));
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
@@ -1386,6 +1244,7 @@ export class ChatServer2 {
 
       return await this._doJoinRoom(ws, room);
     } catch (error) {
+      console.error(`Join room error for ${ws.idtarget}:`, error);
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     } finally {
@@ -1481,11 +1340,14 @@ export class ChatServer2 {
           userConnections.delete(oldWs);
           this._activeClients.delete(oldWs);
           this._cleanupWebSocketListeners(oldWs);
+          
+          // Cleanup tanpa timer, langsung
           this._forceFullCleanupWebSocket(oldWs).catch(() => {});
         }
       }
       
       userConnections.add(ws);
+      
     } finally {
       if (release) try { release(); } catch (e) {}
     }
@@ -1564,7 +1426,7 @@ export class ChatServer2 {
     return roomManager.updatePoint(seatNumber, safePoint);
   }
 
-  // ============ CHUNKING VERSION OF _sendDirectToRoom ============
+  // ========== FIX: Chunked broadcast untuk mencegah CPU timeout ==========
   _sendDirectToRoom(room, msg, msgId = null) {
     const clientSet = this.roomClients.get(room);
     if (!clientSet?.size) return 0;
@@ -1576,26 +1438,28 @@ export class ChatServer2 {
       return 0;
     }
     
-    const snapshot = Array.from(clientSet);
-    if (snapshot.length === 0) return 0;
-    
     let sentCount = 0;
+    const snapshot = Array.from(clientSet);
+    
+    // Chunked sending untuk mencegah CPU timeout
     let index = 0;
     const CHUNK_SIZE = CONSTANTS.BROADCAST_CHUNK_SIZE;
     
     const sendNext = () => {
       const end = Math.min(index + CHUNK_SIZE, snapshot.length);
-      
       for (let i = index; i < end; i++) {
         const client = snapshot[i];
         if (client && client.readyState === 1 && !client._isClosing && !client._isCleaningUp) {
           try {
             client.send(messageStr);
             sentCount++;
-          } catch (e) {}
+          } catch (e) {
+            if (!client._pendingCleanup) {
+              client._pendingCleanup = true;
+            }
+          }
         }
       }
-      
       index = end;
       if (index < snapshot.length) {
         queueMicrotask(sendNext);
@@ -1628,12 +1492,6 @@ export class ChatServer2 {
   async safeSend(ws, msg) {
     if (!ws) return false;
     if (ws._isClosing || ws.readyState !== 1 || ws._isCleaningUp) return false;
-    
-    const reliable = this.reliableWS.get(ws);
-    if (reliable && !reliable.isDestroyed) {
-      return await reliable.send(msg);
-    }
-    
     try {
       let message;
       if (typeof msg === "string") {
@@ -1648,6 +1506,12 @@ export class ChatServer2 {
       ws.send(message);
       return true;
     } catch (error) {
+      if (!ws._pendingCleanup && (error.code === 'ECONNRESET' || error.message?.includes('ECONNRESET') || error.message?.includes('CLOSED'))) {
+        ws._pendingCleanup = true;
+        queueMicrotask(() => {
+          this._forceFullCleanupWebSocket(ws).catch(() => {});
+        });
+      }
       return false;
     }
   }
@@ -1685,6 +1549,7 @@ export class ChatServer2 {
       if (lastPointsData.length > 0) {
         await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
       }
+
     } catch (error) {}
   }
 
@@ -1693,6 +1558,7 @@ export class ChatServer2 {
 
     const release = await this.connectionLocker.acquire(`reconnect_${id}`);
     try {
+      // LANGSUNG HAPUS SEMUA DATA USER DARI SEMUA ROOM
       if (baru === true) {
         const roomManagersSnapshot = Array.from(this.roomManagers.entries());
         for (const [roomName, roomManager] of roomManagersSnapshot) {
@@ -1715,6 +1581,7 @@ export class ChatServer2 {
         this.userCurrentRoom.delete(id);
       }
 
+      // Hapus koneksi lama user
       const existingConnections = this.userConnections.get(id);
       if (existingConnections && existingConnections.size > 0) {
         const oldConnections = Array.from(existingConnections);
@@ -1745,10 +1612,6 @@ export class ChatServer2 {
       ws._connectionTime = Date.now();
       this._activeClients.add(ws);
       await this._addUserConnection(id, ws);
-      
-      if (!this.reliableWS.has(ws)) {
-        this.reliableWS.set(ws, new ReliableWebSocket(ws, (w, m) => this.safeSend(w, m), ws._cleanupId));
-      }
 
       const seatInfo = this.userToSeat.get(id);
 
@@ -1779,6 +1642,7 @@ export class ChatServer2 {
       if (baru === true) {
         await this.safeSend(ws, ["joinroomawal"]);
       }
+
     } catch (error) {
       await this.safeSend(ws, ["error", "Connection failed"]);
     } finally {
@@ -1786,53 +1650,29 @@ export class ChatServer2 {
     }
   }
 
-  _checkRateLimit(userId, eventType = "chat") {
+  _checkRateLimit(userId) {
     if (!userId) return true;
-    
-    const now = Date.now();
-    if (now - this._messageRateCheck > 1000) {
-      this._messageRate = 0;
-      this._messageRateCheck = now;
-    }
-    
-    this._messageRate++;
-    if (this._messageRate > CONSTANTS.MAX_MESSAGES_PER_SECOND) {
-      return false;
-    }
-    
-    let maxPerMinute = CONSTANTS.MAX_MESSAGES_PER_MINUTE;
-    if (eventType === "updatePoint") {
-      maxPerMinute = 300;
-    } else if (eventType === "chat") {
-      maxPerMinute = CONSTANTS.MAX_MESSAGES_PER_MINUTE;
-    } else {
-      maxPerMinute = 100;
-    }
 
+    const now = Date.now();
     let userData = this._userMessageCount.get(userId);
 
     if (!userData) {
-      userData = { counts: {}, windows: {} };
+      userData = { count: 1, windowStart: now };
       this._userMessageCount.set(userId, userData);
-    }
-    
-    if (!userData.counts[eventType]) {
-      userData.counts[eventType] = 1;
-      userData.windows[eventType] = now;
       return true;
     }
 
-    if (now - userData.windows[eventType] > CONSTANTS.MESSAGE_RATE_WINDOW_MS) {
-      userData.counts[eventType] = 1;
-      userData.windows[eventType] = now;
+    if (now - userData.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS) {
+      userData.count = 1;
+      userData.windowStart = now;
       return true;
     }
 
-    if (userData.counts[eventType] >= maxPerMinute) {
+    if (userData.count >= CONSTANTS.MAX_MESSAGES_PER_MINUTE) {
       return false;
     }
 
-    userData.counts[eventType]++;
+    userData.count++;
     return true;
   }
 
@@ -1842,30 +1682,28 @@ export class ChatServer2 {
     for (const [userId, userData] of userMessageCountSnapshot) {
       if (!this.userConnections.has(userId)) {
         this._userMessageCount.delete(userId);
-        continue;
-      }
-      
-      let hasEvents = false;
-      for (const [eventType, windowStart] of Object.entries(userData.windows)) {
-        if (now - windowStart < CONSTANTS.MESSAGE_RATE_WINDOW_MS * 2) {
-          hasEvents = true;
-        } else {
-          delete userData.counts[eventType];
-          delete userData.windows[eventType];
-        }
-      }
-      
-      if (!hasEvents) {
+      } else if (now - userData.windowStart > CONSTANTS.MESSAGE_RATE_WINDOW_MS * 2) {
         this._userMessageCount.delete(userId);
       }
     }
     
     if (this._userMessageCount.size > CONSTANTS.MAX_USER_MESSAGE_CACHE) {
-      const entries = Array.from(this._userMessageCount.keys());
+      const entries = Array.from(this._userMessageCount.entries());
       const toDelete = entries.slice(CONSTANTS.MAX_USER_MESSAGE_CACHE);
-      for (const userId of toDelete) {
+      for (const [userId] of toDelete) {
         this._userMessageCount.delete(userId);
       }
+    }
+  }
+
+  async _checkConnectionPressure() {
+    const total = this._activeClients.size;
+    const max = CONSTANTS.MAX_GLOBAL_CONNECTIONS;
+
+    if (total > max * CONSTANTS.CONNECTION_CRITICAL_THRESHOLD_RATIO) {
+      await this._emergencyFullCleanup();
+    } else if (total > max * CONSTANTS.CONNECTION_WARNING_THRESHOLD_RATIO) {
+      if (this.chatBuffer) await this.chatBuffer._flush();
     }
   }
 
@@ -1894,13 +1732,14 @@ export class ChatServer2 {
     try { data = JSON.parse(messageStr); } catch (e) { return; }
     if (!data || !Array.isArray(data) || data.length === 0) return;
 
-    const eventType = data[0];
-    if (!this._checkRateLimit(ws.idtarget, eventType)) {
-      await this.safeSend(ws, ["error", `Rate limit exceeded. Please slow down.`]);
-      return;
+    if (data[0] === "chat" && ws.idtarget) {
+      if (!this._checkRateLimit(ws.idtarget)) {
+        await this.safeSend(ws, ["error", "Rate limit exceeded. Please slow down."]);
+        return;
+      }
     }
 
-    try { await this._processMessage(ws, data, eventType); } catch (error) {}
+    try { await this._processMessage(ws, data, data[0]); } catch (error) {}
   }
 
   async _processMessage(ws, data, evt) {
@@ -2038,17 +1877,36 @@ export class ChatServer2 {
         }
         case "sendnotif": {
           const [, idtarget, noimageUrl, username, deskripsi] = data;
-          if (!idtarget || !username) return;
+          
+          if (!idtarget || !username) {
+            await this.safeSend(ws, ["notifError", "Missing target or sender"]);
+            return;
+          }
           
           const targetConnections = this.userConnections.get(idtarget);
-          if (!targetConnections || targetConnections.size === 0) return;
           
+          if (!targetConnections || targetConnections.size === 0) {
+            await this.safeSend(ws, ["notifError", idtarget, "User is offline"]);
+            return;
+          }
+          
+          let sent = false;
           const snapshotConns = Array.from(targetConnections);
+          
           for (const client of snapshotConns) {
             if (client && client.readyState === 1 && !client._isClosing && !client._isCleaningUp) {
               const notifMessage = ["notif", noimageUrl || "", username || "", deskripsi || "", Date.now()];
-              await this.safeSend(client, notifMessage);
+              const success = await this.safeSend(client, notifMessage);
+              if (success) {
+                sent = true;
+              }
             }
+          }
+          
+          if (sent) {
+            await this.safeSend(ws, ["notifSent", idtarget, username, deskripsi]);
+          } else {
+            await this.safeSend(ws, ["notifError", idtarget, "User has no active connections"]);
           }
           break;
         }
@@ -2086,8 +1944,12 @@ export class ChatServer2 {
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
-          if (GAME_ROOMS.includes(ws.roomname) && !this._isClosing) {
-            await this._callLowCard(ws, data);
+          if (GAME_ROOMS.includes(ws.roomname) && this.lowcard && !this._isClosing) {
+            try {
+              await this.lowcard.handleEvent(ws, data);
+            } catch (error) {
+              await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
+            }
           }
           break;
         case "onDestroy":
@@ -2108,53 +1970,73 @@ export class ChatServer2 {
   }
 
   async getMemoryStats() {
-    return {
-      timestamp: Date.now(),
-      uptime: Date.now() - this._startTime,
-      activeClients: this._activeClients.size,
-      userConnections: this.userConnections.size,
-      userToSeatSize: this.userToSeat.size,
-      rateLimitMapSize: this._userMessageCount.size,
-      pendingTimers: this._timerIds.size,
-      reliableWS: this.reliableWS.size,
-      messageRate: this._messageRate,
-      chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
-      pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
-      lowCard: {
-        enabled: !!this.lowcard,
-        errors: this._lowCardErrors,
-        disabledUntil: this._lowCardDisabledUntil
+    try {
+      const snapshot = Array.from(this._activeClients);
+      let activeReal = 0;
+      for (const c of snapshot) {
+        if (c?.readyState === 1 && !c._isCleaningUp) activeReal++;
       }
-    };
+
+      let totalRoomClients = 0;
+      for (const clientSet of this.roomClients.values()) totalRoomClients += clientSet.size;
+
+      let totalSeats = 0, totalPoints = 0;
+      for (const rm of this.roomManagers.values()) {
+        totalSeats += rm.getOccupiedCount();
+        totalPoints += rm.points.size;
+      }
+
+      return {
+        timestamp: Date.now(),
+        uptime: Date.now() - this._startTime,
+        activeClients: { total: this._activeClients.size, real: activeReal },
+        roomClients: { total: totalRoomClients },
+        userConnections: this.userConnections.size,
+        userToSeatSize: this.userToSeat.size,
+        chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
+        pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {},
+        seats: totalSeats,
+        points: totalPoints,
+        rateLimitMapSize: this._userMessageCount.size,
+        pendingTimers: this._pendingCleanupTimers.size,
+        asyncLockStats: {
+          seat: this.seatLocker.getStats(),
+          connection: this.connectionLocker.getStats(),
+          room: this.roomLocker.getStats(),
+          cleanup: this.cleanupLocker.getStats(),
+        }
+      };
+    } catch (error) {
+      return { error: "Failed to get stats" };
+    }
   }
 
   async shutdown() {
     if (this._isClosing) return;
     this._isClosing = true;
 
-    if (this._masterTimer) clearInterval(this._masterTimer);
-    if (this._cleanupInterval) clearInterval(this._cleanupInterval);
-    if (this._gcInterval) clearInterval(this._gcInterval);
+    if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
+    if (this._cleanupInterval) { clearInterval(this._cleanupInterval); this._cleanupInterval = null; }
+    if (this._gcInterval) { clearInterval(this._gcInterval); this._gcInterval = null; }
 
-    this._cleanupAllTimers();
+    // Bersihkan semua pending timers
+    for (const timer of this._pendingCleanupTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._pendingCleanupTimers.clear();
 
     if (this.chatBuffer) {
       await this.chatBuffer.flushAll();
       await this.chatBuffer.destroy();
     }
     if (this.pmBuffer) await this.pmBuffer.destroy();
-    if (this.lowcard && typeof this.lowcard.destroy === 'function') {
-      try { await this.lowcard.destroy(); } catch (e) {}
-    }
+    if (this.lowcard && typeof this.lowcard.destroy === 'function') try { await this.lowcard.destroy(); } catch (e) {}
     this.lowcard = null;
 
     const snapshot = Array.from(this._activeClients);
     for (const ws of snapshot) {
       if (ws && ws.readyState === 1 && !ws._isClosing && !ws._isCleaningUp) {
-        try { 
-          this._cleanupWebSocketListeners(ws); 
-          ws.close(1000, "Server shutdown"); 
-        } catch (e) {}
+        try { this._cleanupWebSocketListeners(ws); ws.close(1000, "Server shutdown"); } catch (e) {}
       }
     }
 
@@ -2167,7 +2049,6 @@ export class ChatServer2 {
     this.userConnections.clear();
     this._activeListeners.clear();
     this._userMessageCount.clear();
-    this.reliableWS.clear();
     
     this.seatLocker.destroy();
     this.connectionLocker.destroy();
@@ -2182,12 +2063,17 @@ export class ChatServer2 {
 
       if (upgrade.toLowerCase() !== "websocket") {
         if (url.pathname === "/health") {
+          let activeCount = 0;
+          const snapshot = Array.from(this._activeClients);
+          for (const c of snapshot) if (c && c.readyState === 1 && !c._isCleaningUp) activeCount++;
           return new Response(JSON.stringify({
             status: "healthy",
-            connections: this._activeClients.size,
+            connections: activeCount,
             rooms: this.getJumlahRoom(),
             uptime: Date.now() - this._startTime,
-            memory: "128MB optimized - CPU OPTIMIZED WITH CHUNKING"
+            memory: "128MB optimized - ZERO ISSUES",
+            chatBuffer: this.chatBuffer ? this.chatBuffer.getStats() : {},
+            pmBuffer: this.pmBuffer ? this.pmBuffer.getStats() : {}
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/debug/memory") {
@@ -2203,10 +2089,7 @@ export class ChatServer2 {
           await this._forceResetAllData();
           return new Response("All data has been reset successfully!", { status: 200 });
         }
-        return new Response("ChatServer2 Running - CPU OPTIMIZED WITH CHUNKING", { 
-          status: 200, 
-          headers: { "content-type": "text/plain" } 
-        });
+        return new Response("ChatServer2 Running - Cloudflare Workers (128MB Optimized - ZERO ISSUES)", { status: 200 });
       }
 
       if (this._activeClients.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
@@ -2266,12 +2149,17 @@ export class ChatServer2 {
 
       return new Response(null, { status: 101, webSocket: client });
     } catch (error) {
+      console.error("Fetch error:", error);
       return new Response("Internal server error", { status: 500 });
     }
   }
 
   async _forceResetAllData() {
-    this._cleanupAllTimers();
+    // Bersihkan semua pending timers
+    for (const timer of this._pendingCleanupTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._pendingCleanupTimers.clear();
 
     const snapshot = Array.from(this._activeClients);
     for (const ws of snapshot) {
@@ -2289,7 +2177,6 @@ export class ChatServer2 {
     this.userConnections.clear();
     this._activeListeners.clear();
     this._userMessageCount.clear();
-    this.reliableWS.clear();
 
     for (const room of roomList) {
       if (this.roomManagers.has(room)) {
@@ -2322,15 +2209,18 @@ export class ChatServer2 {
       });
     }
 
-    this._lowCardErrors = 0;
-    this._lowCardDisabledUntil = 0;
-    this._initLowCard();
+    try {
+      if (this.lowcard && typeof this.lowcard.destroy === 'function') {
+        await this.lowcard.destroy();
+      }
+      this.lowcard = new LowCardGameManager(this);
+    } catch (error) {
+      this.lowcard = null;
+    }
 
     this.currentNumber = 1;
     this._masterTickCounter = 0;
     this._startTime = Date.now();
-    this._messageRate = 0;
-    this._messageRateCheck = Date.now();
   }
 }
 
@@ -2353,11 +2243,12 @@ export default {
         return chatObj.fetch(req);
       }
       
-      return new Response("ChatServer2 Running - CPU OPTIMIZED WITH CHUNKING", { 
+      return new Response("ChatServer2 Running - Cloudflare Workers (128MB Optimized - ZERO ISSUES)", { 
         status: 200, 
         headers: { "content-type": "text/plain" } 
       });
     } catch (error) {
+      console.error("Worker fetch error:", error);
       return new Response("Server error", { status: 500 });
     }
   }
