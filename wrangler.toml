@@ -2,10 +2,32 @@ name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-03"
 
+# Optimasi untuk 128MB Memory
+usage_model = "bundled"
+
+# Limit CPU (opsional, untuk paid tier)
+# [limits]
+# cpu_ms = 50
+
+# Durable Object bindings
 [[durable_objects.bindings]]
 name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
 
+# Migration untuk Durable Object
 [[migrations]]
 tag = "v1"
 new_classes = ["ChatServer2"]
+
+# Environment variables (opsional)
+# [vars]
+# ENVIRONMENT = "production"
+
+# Observability (opsional)
+# [observability]
+# enabled = true
+# head_sampling_rate = 0.1
+
+# Logging (opsional)
+# [logging]
+# level = "info"
