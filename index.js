@@ -668,13 +668,13 @@ export class ChatServer2 {
     } catch (e) {}
   }
 
-  // ========== CLEANUP USER COMPLETELY (HAPUS DARI SEMUA ROOM) ==========
+  // ========== CLEANUP USER COMPLETELY ==========
   async _cleanupUserCompletely(userId) {
     if (!userId) return;
     
     const release = await this.userLock.acquire();
     try {
-      // 🔥 HAPUS DARI SEMUA ROOM (bukan hanya satu room)
+      // Hapus dari SEMUA room
       for (const [room, roomManager] of this.roomManagers) {
         for (const [seat, seatData] of roomManager.seats) {
           if (seatData.namauser === userId) {
@@ -819,7 +819,7 @@ export class ChatServer2 {
     const roomManager = this.roomManagers.get(room);
     if (!roomManager || roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) return null;
 
-    // 🔥 CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
+    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
     for (const [seat, seatData] of roomManager.seats) {
       if (seatData.namauser === userId) {
         console.log(`[ASSIGN_SEAT] User ${userId} already has seat ${seat} in room ${room}`);
@@ -924,7 +924,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ========== HANDLE JOIN ROOM ==========
+  // ========== HANDLE JOIN ROOM (FIXED - HAPUS DATA DARI ROOM LAMA) ==========
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) {
       await this.safeSend(ws, ["error", "User ID not set"]);
@@ -938,12 +938,41 @@ export class ChatServer2 {
     const release = await this.roomLock.acquire();
     try {
       const oldRoom = ws.roomname;
+      
+      // 🔥 FIX: HAPUS DATA USER DARI ROOM LAMA JIKA PINDAH ROOM
       if (oldRoom && oldRoom !== room) {
+        console.log(`[JOIN_ROOM] Moving user ${ws.idtarget} from room ${oldRoom} to ${room}`);
+        
+        // Hapus dari roomClients lama
         const oldClientSet = this.roomClients.get(oldRoom);
         if (oldClientSet) oldClientSet.delete(ws);
+        
+        // Hapus kursi user dari room lama
+        const oldRoomManager = this.roomManagers.get(oldRoom);
+        if (oldRoomManager) {
+          let oldSeat = null;
+          for (const [seat, seatData] of oldRoomManager.seats) {
+            if (seatData.namauser === ws.idtarget) {
+              oldSeat = seat;
+              break;
+            }
+          }
+          
+          if (oldSeat) {
+            oldRoomManager.removeSeat(oldSeat);
+            this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+            this.updateRoomCount(oldRoom);
+            console.log(`[JOIN_ROOM] Removed seat ${oldSeat} from old room ${oldRoom}`);
+          }
+        }
+        
+        // Hapus dari userToSeat jika mapping ke room lama
+        const currentSeatInfo = this.userToSeat.get(ws.idtarget);
+        if (currentSeatInfo && currentSeatInfo.room === oldRoom) {
+          this.userToSeat.delete(ws.idtarget);
+          this.userCurrentRoom.delete(ws.idtarget);
+        }
       }
-      
-      // 🔥 JANGAN PANGGIL _cleanupUserCompletely DI SINI!
       
       const roomManager = this.roomManagers.get(room);
       if (!roomManager) return false;
@@ -1020,7 +1049,6 @@ export class ChatServer2 {
       if (baru === true) {
         console.log(`[SET_ID] New user ${id}, cleaning up all old data`);
         
-        // Cleanup total untuk user baru
         await this._cleanupUserCompletely(id);
         
         // Hapus dari roomClients
@@ -1044,7 +1072,6 @@ export class ChatServer2 {
           this.userConnections.delete(id);
         }
       } else {
-        // Reconnect - hanya hapus koneksi lama
         console.log(`[SET_ID] Reconnect user ${id}, preserving seat data`);
         const existingConns = this.userConnections.get(id);
         if (existingConns && existingConns.size > 0) {
@@ -1072,7 +1099,6 @@ export class ChatServer2 {
 
       const seatInfo = this.userToSeat.get(id);
 
-      // Reconnect ke kursi lama
       if (seatInfo && baru === false) {
         const { room, seat } = seatInfo;
         const roomManager = this.roomManagers.get(room);
@@ -1100,7 +1126,6 @@ export class ChatServer2 {
         this.userCurrentRoom.delete(id);
       }
 
-      // Kirim response
       if (baru === false) {
         await this.safeSend(ws, ["needJoinRoom"]);
       } else {
@@ -1150,15 +1175,12 @@ export class ChatServer2 {
         case "chat": {
           const [, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
           
-          // 🔥 CEK APAKAH ws.roomname VALID
           if (!ws.roomname) {
-            console.log(`[CHAT] ERROR: ws.roomname is undefined for user ${ws.idtarget}`);
             await this.safeSend(ws, ["chatError", "You are not in any room"]);
             return;
           }
           
           if (ws.roomname !== roomname) {
-            console.log(`[CHAT] Room mismatch: ws.roomname=${ws.roomname}, client.roomname=${roomname}`);
             await this.safeSend(ws, ["chatError", "You are not in this room"]);
             return;
           }
@@ -1170,7 +1192,6 @@ export class ChatServer2 {
           
           if (!roomList.includes(roomname)) return;
           
-          // 🔥 CEK APAKAH ROOM SEDANG MUTE
           const roomManager = this.roomManagers.get(roomname);
           if (roomManager && roomManager.getMute() === true) {
             await this.safeSend(ws, ["chatError", "Room is muted"]);
@@ -1201,11 +1222,17 @@ export class ChatServer2 {
           if (!roomManager) return;
           const seatData = roomManager.getSeat(seat);
           if (!seatData || seatData.namauser !== ws.idtarget) return;
+          
           roomManager.removeSeat(seat);
           this.broadcastToRoom(room, ["removeKursi", room, seat]);
           this.updateRoomCount(room);
           this.userToSeat.delete(ws.idtarget);
           this.userCurrentRoom.delete(ws.idtarget);
+          
+          const clientSet = this.roomClients.get(room);
+          if (clientSet) clientSet.delete(ws);
+          ws.roomname = undefined;
+          
           console.log(`[REMOVE_KURSI] User ${ws.idtarget} removed from seat ${seat} in room ${room}`);
           break;
         }
