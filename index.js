@@ -87,8 +87,8 @@ class SimpleLock {
         const index = this._waitQueue.findIndex(item => item.resolve === resolve);
         if (index !== -1) {
           this._waitQueue.splice(index, 1);
-          reject(new Error('Lock timeout'));
         }
+        reject(new Error('Lock timeout'));
       }, this._timeoutMs);
       
       this._waitQueue.push({
@@ -428,14 +428,14 @@ export class ChatServer2 {
     this._startTime = Date.now();
     this._isClosing = false;
 
-    // ========== LOCKS (dengan timeout) ==========
+    // ========== LOCKS ==========
     this.roomLock = new SimpleLock();
     this.connectionLock = new SimpleLock();
     this.userLock = new SimpleLock();
     
     // ========== MEMORY MANAGEMENT ==========
-    this._activeClients = new WeakSet(); // For GC tracking only
-    this._wsRawSet = new Set(); // FOR ITERATION AND SIZE CHECKING (CRITICAL FIX)
+    this._activeClients = new WeakSet();
+    this._wsRawSet = new Set();
     this._wsControllers = new WeakMap();
     
     // ========== CORE DATA STRUCTURES ==========
@@ -482,6 +482,8 @@ export class ChatServer2 {
     // ========== MASTER TIMER ==========
     this._masterTickCounter = 0;
     this._masterTimer = null;
+    this._masterTickRunning = false;
+    this._cleanupRunning = false;
     
     this._autoResetOnDeploy();
     this._startMasterTimer();
@@ -583,7 +585,7 @@ export class ChatServer2 {
     this._startTime = Date.now();
   }
 
-  // ========== CLEANUP WEBSOCKET - COMPLETE ==========
+  // ========== CLEANUP WEBSOCKET ==========
   async _cleanupWebSocket(ws) {
     if (!ws) return;
     if (ws._isClosing) return;
@@ -695,10 +697,13 @@ export class ChatServer2 {
 
   async _masterTick() {
     if (this._isClosing) return;
-    this._masterTickCounter++;
-    const now = Date.now();
-
+    if (this._masterTickRunning) return;
+    this._masterTickRunning = true;
+    
     try {
+      this._masterTickCounter++;
+      const now = Date.now();
+
       if (this._masterTickCounter % CONSTANTS.ORPHAN_CLEANUP_INTERVAL_TICKS === 0) {
         await this._cleanupOrphanedUsers();
       }
@@ -718,11 +723,12 @@ export class ChatServer2 {
       }
     } catch (error) {
       console.error(`[MASTER TICK ERROR] ${error.message}`);
+    } finally {
+      this._masterTickRunning = false;
     }
   }
 
   async _checkConnectionPressure() {
-    // ✅ FIXED: Use _wsRawSet for size checking
     const total = this._wsRawSet.size;
     const max = CONSTANTS.MAX_GLOBAL_CONNECTIONS;
 
@@ -737,7 +743,6 @@ export class ChatServer2 {
     if (this.chatBuffer) await this.chatBuffer.flushAll();
     if (this.pmBuffer) await this.pmBuffer.flushAll();
 
-    // ✅ FIXED: Use _wsRawSet for iteration
     const snapshot = Array.from(this._wsRawSet);
     for (const ws of snapshot) {
       if (ws && ws.readyState !== 1 && !ws._isClosing) {
@@ -754,7 +759,6 @@ export class ChatServer2 {
       }
 
       const message = JSON.stringify(["currentNumber", this.currentNumber]);
-      // ✅ FIXED: Use _wsRawSet for iteration
       const snapshot = Array.from(this._wsRawSet);
       
       for (const client of snapshot) {
@@ -924,7 +928,7 @@ export class ChatServer2 {
       userConns.add(ws);
 
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 1000));
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
@@ -954,7 +958,6 @@ export class ChatServer2 {
         for (const oldWs of existingConns) {
           if (oldWs !== ws && oldWs.readyState === 1) {
             try { 
-              await this.safeSend(oldWs, ["connectionReplaced", "New connection detected"]);
               oldWs.close(1000, "Replaced");
             } catch (e) {}
           }
@@ -990,7 +993,6 @@ export class ChatServer2 {
             await this.safeSend(ws, ["numberKursiSaya", seat]);
             await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-            await this.safeSend(ws, ["reconnectSuccess", room, seat]);
             return;
           }
         }
@@ -1002,7 +1004,6 @@ export class ChatServer2 {
         await this.safeSend(ws, ["joinroomawal"]);
       }
     } catch (error) {
-      await this.safeSend(ws, ["error", "Connection failed"]);
     } finally {
       release();
     }
@@ -1220,7 +1221,6 @@ export class ChatServer2 {
 
   async getMemoryStats() {
     try {
-      // ✅ FIXED: Use _wsRawSet for iteration and size
       let activeReal = 0;
       for (const ws of this._wsRawSet) {
         if (ws && ws.readyState === 1 && !ws._isClosing) activeReal++;
@@ -1301,7 +1301,6 @@ export class ChatServer2 {
 
       if (upgrade.toLowerCase() !== "websocket") {
         if (url.pathname === "/health") {
-          // ✅ FIXED: Use _wsRawSet for size
           let activeCount = 0;
           for (const ws of this._wsRawSet) {
             if (ws && ws.readyState === 1 && !ws._isClosing) activeCount++;
@@ -1337,7 +1336,6 @@ export class ChatServer2 {
         return new Response("ChatServer2 Running - Cloudflare Workers", { status: 200 });
       }
 
-      // ✅ FIXED: Use _wsRawSet for size checking
       if (this._wsRawSet.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
         return new Response("Server overloaded", { status: 503 });
       }
