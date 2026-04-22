@@ -1,12 +1,13 @@
-=// ==================== CHAT SERVER - FINAL PRODUCTION READY VERSION ====================
+// ==================== CHAT SERVER - FINAL PRODUCTION READY VERSION ====================
 // index.js - Untuk Cloudflare Workers Durable Objects (Free Tier 128MB)
 // 
 // PERBAIKAN LENGKAP:
-//   1. Hapus semua event "pointRemoved" dan "pointUpdated"
-//   2. Hapus method cleanupFromRoom (digabung ke leaveRoom)
-//   3. Perbaiki handleSetIdTarget2 - reconnect TIDAK hapus data kursi
-//   4. Perbaiki handleJoinRoom - atomic operation dengan lock
-//   5. WebSocket lama ditutup, data kursi TETAP ADA saat reconnect
+//   1. Hapus semua event "pointRemoved" (tidak digunakan)
+//   2. PERTAHANKAN event "pointUpdated" (digunakan)
+//   3. Hapus method cleanupFromRoom (digabung ke leaveRoom)
+//   4. Perbaiki handleSetIdTarget2 - reconnect TIDAK hapus data kursi
+//   5. Perbaiki handleJoinRoom - atomic operation dengan lock
+//   6. WebSocket lama ditutup, data kursi TETAP ADA saat reconnect
 
 let LowCardGameManager;
 try {
@@ -410,12 +411,13 @@ class GlobalChatBuffer {
 }
 
 // ─────────────────────────────────────────────
-// RoomManager - tanpa point
+// RoomManager - DENGAN POINT
 // ─────────────────────────────────────────────
 class RoomManager {
   constructor(roomName) {
     this.roomName = roomName;
     this.seats = new Map();
+    this.points = new Map(); // ✅ POINT TETAP ADA
     this.muteStatus = false;
     this.currentNumber = 1;
     this.lastActivity = Date.now();
@@ -473,6 +475,7 @@ class RoomManager {
   removeSeat(seatNumber) {
     if (this._isDestroyed) return false;
     const deleted = this.seats.delete(seatNumber);
+    if (deleted) this.points.delete(seatNumber); // ✅ HAPUS POINT JUGA
     if (deleted) this.updateActivity();
     return deleted;
   }
@@ -493,6 +496,32 @@ class RoomManager {
     return meta;
   }
 
+  // ✅ POINT METHODS - TETAP ADA
+  updatePoint(seatNumber, point) {
+    if (this._isDestroyed) return false;
+    if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return false;
+    this.points.set(seatNumber, { x: point.x, y: point.y, fast: point.fast || false, timestamp: Date.now() });
+    this.updateActivity();
+    return true;
+  }
+
+  getPoint(seatNumber) { return this.points.get(seatNumber) || null; }
+
+  getAllPoints() {
+    if (this._isDestroyed) return [];
+    const points = [];
+    for (const [seatNum, point] of this.points) {
+      points.push({ seat: seatNum, x: point.x, y: point.y, fast: point.fast ? 1 : 0 });
+    }
+    return points;
+  }
+
+  removePoint(seatNumber) {
+    if (this._isDestroyed) return false;
+    if (seatNumber < 1 || seatNumber > CONSTANTS.MAX_SEATS) return false;
+    return this.points.delete(seatNumber);
+  }
+
   setMute(isMuted) {
     if (this._isDestroyed) return false;
     this.muteStatus = isMuted === true || isMuted === "true" || isMuted === 1;
@@ -506,6 +535,7 @@ class RoomManager {
   destroy() {
     this._isDestroyed = true;
     this.seats.clear();
+    this.points.clear();
   }
 }
 
@@ -915,6 +945,7 @@ export class ChatServer2 {
       const seatData = roomManager.getSeat(seatNumber);
       if (seatData && seatData.namauser === userId) {
         roomManager.removeSeat(seatNumber);
+        roomManager.removePoint(seatNumber);
         this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
         this.updateRoomCount(room);
         return true;
@@ -952,12 +983,22 @@ export class ChatServer2 {
     if (!seatData || seatData.namauser !== userId) return false;
     const success = roomManager.removeSeat(seatNumber);
     if (success) {
+      roomManager.removePoint(seatNumber);
       this.broadcastToRoom(room, ["removeKursi", room, seatNumber]);
       this.updateRoomCount(room);
       this.userToSeat.delete(userId);
       this.userCurrentRoom.delete(userId);
     }
     return success;
+  }
+
+  // ✅ UPDATE POINT DIRECT - TETAP ADA
+  updatePointDirect(room, seatNumber, point, userId) {
+    const roomManager = this.roomManagers.get(room);
+    if (!roomManager || roomManager.isDestroyed()) return false;
+    const seatData = roomManager.getSeat(seatNumber);
+    if (!seatData || seatData.namauser !== userId) return false;
+    return roomManager.updatePoint(seatNumber, point);
   }
 
   async _addUserConnection(userId, ws) {
@@ -1140,6 +1181,7 @@ export class ChatServer2 {
       if (!roomManager || roomManager.isDestroyed()) return;
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
       const allKursiMeta = roomManager.getAllSeatsMeta();
+      const lastPointsData = roomManager.getAllPoints();
       const seatInfo = this.userToSeat.get(ws.idtarget);
       const selfSeat = seatInfo?.room === room ? seatInfo.seat : null;
       let filteredMeta = allKursiMeta;
@@ -1150,6 +1192,7 @@ export class ChatServer2 {
         }
       }
       if (Object.keys(filteredMeta).length > 0) await this.safeSend(ws, ["allUpdateKursiList", room, filteredMeta]);
+      if (lastPointsData.length > 0) await this.safeSend(ws, ["allPointsList", room, lastPointsData]);
     } catch (error) {}
   }
 
@@ -1236,7 +1279,7 @@ export class ChatServer2 {
       }
 
       // ========== NEW DEVICE (baru = true) ==========
-      // Hapus SEMUA data user (kursi, dll)
+      // Hapus SEMUA data user (kursi, point, dll)
       if (baru === true) {
         const seatInfo = this.userToSeat.get(id);
         if (seatInfo) {
@@ -1397,6 +1440,15 @@ export class ChatServer2 {
           const sanitizedMessage = message?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "";
           if (sanitizedMessage.includes('\0')) return;
           this.broadcastToRoom(roomname, ["chat", roomname, noImageURL, username, sanitizedMessage, usernameColor, chatTextColor]);
+          break;
+        }
+        // ✅ UPDATE POINT - TETAP ADA
+        case "updatePoint": {
+          const [, room, seat, x, y, fast] = data;
+          if (ws.roomname !== room || !roomList.includes(room) || seat < 1 || seat > CONSTANTS.MAX_SEATS) return;
+          if (this.updatePointDirect(room, seat, { x: parseFloat(x), y: parseFloat(y), fast: fast === 1 || fast === true }, ws.idtarget)) {
+            this.broadcastToRoom(room, ["pointUpdated", room, seat, x, y, fast]);
+          }
           break;
         }
         case "removeKursiAndPoint": {
@@ -1570,10 +1622,11 @@ export class ChatServer2 {
     let totalRoomClients = 0;
     for (const clientSet of this.roomClients.values()) totalRoomClients += clientSet.size;
 
-    let totalSeats = 0;
+    let totalSeats = 0, totalPoints = 0;
     for (const rm of this.roomManagers.values()) {
       if (rm && !rm.isDestroyed()) {
         totalSeats += rm.seats.size;
+        totalPoints += rm.points.size;
       }
     }
 
@@ -1589,6 +1642,7 @@ export class ChatServer2 {
       chatBuffer: this.chatBuffer.getStats(),
       pmBuffer: this.pmBuffer.getStats(),
       seats: totalSeats,
+      points: totalPoints,
       wsCleaningUpSize: this._wsCleaningUp.size,
       rejectNewConnections: this._rejectNewConnections
     };
