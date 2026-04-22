@@ -484,7 +484,7 @@ function getCompactSeatData(seat) {
   };
 }
 
-export class ChatServer_2 {
+export class ChatServer2 {
   constructor(state, env) {
     // ========== GUARD CLAUSE ==========
     this._initialized = false;
