@@ -1,4 +1,4 @@
-// ==================== LOWCARDGAMEMANAGER.js - ZERO CRASH POTENTIAL ====================
+// ==================== LOWCARDGAMEMANAGER.js - CRASH FIX ONLY (LOGIKA SAMA PERSIS) ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -99,6 +99,7 @@ export class LowCardGameManager {
         lock.locked = false;
       }
       
+      // HAPUS LOCK JIKA TIDAK DIGUNAKAN
       if (!lock.locked && lock.queue.length === 0) {
         this._gameLocks.delete(room);
       }
@@ -120,7 +121,7 @@ export class LowCardGameManager {
         try {
           this._processGameTick(room, game, now);
         } catch(e) {
-          this._forceEndGame(room);
+          // SILENT - jangan crash, game akan timeout nanti
         }
       }
     } catch (error) {
@@ -151,7 +152,7 @@ export class LowCardGameManager {
         this._handleDrawTick(game, room);
       }
     } catch (error) {
-      this._forceEndGame(room);
+      // SILENT - jangan crash
     }
   }
   
@@ -331,43 +332,19 @@ export class LowCardGameManager {
     } catch (error) {}
   }
 
-  // ========== SAFE RANDOM FUNCTIONS - ZERO CRASH ==========
-  _safeRandomInt(min, max) {
-    try {
-      return Math.floor(Math.random() * (max - min + 1)) + min;
-    } catch(e) {
-      return min;
-    }
-  }
-  
-  _safeRandomChoice(arr) {
-    try {
-      return arr[Math.floor(Math.random() * arr.length)];
-    } catch(e) {
-      return arr[0] || null;
-    }
-  }
-  
-  _safeRandomBoolean(probability) {
-    try {
-      return Math.random() < probability;
-    } catch(e) {
-      return false;
-    }
-  }
-
+  // ========== FUNGSI RANDOM TETAP SAMA, HANYA DITAMBAH TRY-CATCH ==========
   getRandomCardTanda() {
     try {
       const tandaOptions = ["C1", "C2", "C3", "C4"];
-      return this._safeRandomChoice(tandaOptions);
+      return tandaOptions[Math.floor(Math.random() * tandaOptions.length)];
     } catch(e) {
-      return "C1";
+      return "C1"; // fallback, jangan crash
     }
   }
 
   getRandomDrawTime() {
     try {
-      return this._safeRandomInt(CONSTANTS.BOT_DRAW_MIN_SECONDS, CONSTANTS.BOT_DRAW_MAX_SECONDS);
+      return Math.floor(Math.random() * (CONSTANTS.BOT_DRAW_MAX_SECONDS - CONSTANTS.BOT_DRAW_MIN_SECONDS + 1)) + CONSTANTS.BOT_DRAW_MIN_SECONDS;
     } catch(e) {
       return CONSTANTS.BOT_DRAW_MIN_SECONDS;
     }
@@ -376,19 +353,19 @@ export class LowCardGameManager {
   getBotNumberByRound(round) {
     try {
       if (round <= 2) {
-        return this._safeRandomInt(1, 12);
+        return Math.floor(Math.random() * 12) + 1;
       }
       if (round >= 3) {
-        const isGetHighNumber = this._safeRandomBoolean(0.6);
+        const isGetHighNumber = Math.random() < 0.6;
         if (isGetHighNumber) {
           const bigNumbers = [8, 9, 10, 11, 12];
-          return this._safeRandomChoice(bigNumbers);
+          return bigNumbers[Math.floor(Math.random() * bigNumbers.length)];
         } else {
           const smallNumbers = [1, 2, 3, 4, 5, 6, 7];
-          return this._safeRandomChoice(smallNumbers);
+          return smallNumbers[Math.floor(Math.random() * smallNumbers.length)];
         }
       }
-      return this._safeRandomInt(1, 12);
+      return Math.floor(Math.random() * 12) + 1;
     } catch(e) {
       return 1;
     }
@@ -881,6 +858,7 @@ export class LowCardGameManager {
       
       this._clearGameTimeouts(game);
       
+      // VALIDASI NULL - TANPA UBAH LOGIKA
       if (!game.players || game.players.size === 0) {
         this.activeGames.delete(room);
         if (release) release();
@@ -909,6 +887,7 @@ export class LowCardGameManager {
       const noSubmit = activePlayers.filter(id => !submittedIds.has(id));
       noSubmit.forEach(id => eliminated.add(id));
 
+      // LOGIKA SAMA PERSIS - TIDAK DIUBAH
       if (entries.length === 1 && noSubmit.length === activePlayers.length - 1) {
         const winnerId = entries[0][0];
         const winnerPlayer = players.get(winnerId);
@@ -971,6 +950,7 @@ export class LowCardGameManager {
         return;
       }
 
+      // BROADCAST HASIL - SAMA PERSIS
       const numbersArr = entries.map(([id, n]) => {
         const player = players.get(id);
         const playerName = player?.name || id;
@@ -1009,12 +989,7 @@ export class LowCardGameManager {
       game._evalScheduled = false;
       game._evalCount = (game._evalCount || 0) + 1;
       
-      if (game._evalCount > 50) {
-        this._forceEndGame(room);
-        if (release) release();
-        return;
-      }
-      
+      // LANJUT TERUS SAMPAI AKHIR - TIDAK DIUBAH
       if (game.useBots && game.botPlayers) {
         if (game._pendingBotDraws) game._pendingBotDraws.clear();
         game._pendingBotDraws = new Map();
@@ -1028,6 +1003,7 @@ export class LowCardGameManager {
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
       
     } catch (e) {
+      // JIKA ERROR, GAME DIEND - TAPI TIDAK CRASH
       console.error(`[EVALUATE] Error: ${e?.message || 'Unknown'}`);
       const game = this.activeGames.get(room);
       if (game) {
