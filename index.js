@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - WITH FORCE CLEANUP (NO LOGIC CHANGE) ====================
+// ==================== CHAT SERVER 2 - FINAL PRODUCTION READY ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -437,7 +437,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - WITH FORCE CLEANUP
+// ChatServer2 (Durable Object) - FINAL PRODUCTION
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -784,7 +784,7 @@ export class ChatServer2 {
       }
       
       if (cleaned > 0) {
-        console.log(`[FORCE CLEANUP] Removed ${cleaned} stale connections`);
+        console.log(`[FORCE CLEANUP] Removed ${cleaned} stale connections (2+ hours old)`);
       }
     } catch(e) {}
   }
@@ -817,7 +817,7 @@ export class ChatServer2 {
         await this._checkConnectionPressure();
       }
 
-      // FORCE CLEANUP WS YANG SUDAH LAMA TIDAK AKTIF (setiap 3600 tick = 1 jam)
+      // FORCE CLEANUP STALE CONNECTIONS EVERY 1 HOUR (3600 ticks)
       if (this._masterTickCounter % 3600 === 0) {
         await this._forceCleanupStaleConnections();
       }
@@ -1011,7 +1011,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ========== HANDLE JOIN ROOM - DIPERBAIKI ==========
+  // ========== HANDLE JOIN ROOM - FIXED RACE CONDITION ==========
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) {
       await this.safeSend(ws, ["error", "User ID not set"]);
@@ -1113,6 +1113,7 @@ export class ChatServer2 {
       }
       userConns.add(ws);
 
+      // FIX: Send other users' data FIRST (race condition fix)
       await this.sendAllStateTo(ws, room, true);
       
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
@@ -1120,6 +1121,22 @@ export class ChatServer2 {
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
+
+      // Broadcast to other users
+      const newSeatData = roomManager.getSeat(assignedSeat);
+      if (newSeatData) {
+        this.broadcastToRoom(room, ["kursiBatchUpdate", room, [[assignedSeat, {
+          noimageUrl: newSeatData.noimageUrl,
+          namauser: newSeatData.namauser,
+          color: newSeatData.color,
+          itembawah: newSeatData.itembawah,
+          itematas: newSeatData.itematas,
+          vip: newSeatData.vip,
+          viptanda: newSeatData.viptanda
+        }]]]);
+      }
+      
+      this.broadcastToRoom(room, ["roomUserCount", room, roomManager.getOccupiedCount()]);
 
       const point = roomManager.getPoint(assignedSeat);
       if (point) {
@@ -1136,7 +1153,7 @@ export class ChatServer2 {
     }
   }
 
-  // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
+  // ========== HANDLE SET ID TARGET 2 - FIXED ==========
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
@@ -1149,15 +1166,25 @@ export class ChatServer2 {
     }
     
     try {
+      if (ws.readyState !== 1) {
+        console.log(`[SET_ID] WebSocket already closed for ${id}, skipping`);
+        if (release) release();
+        return;
+      }
+      
       if (baru === true) {
         console.log(`[SET_ID] New user ${id}, cleaning up all old data`);
         
-        await this._cleanupUserCompletely(id);
+        const cleanupPromise = this._cleanupUserCompletely(id);
+        const timeoutPromise = new Promise(resolve => setTimeout(resolve, 2000));
+        await Promise.race([cleanupPromise, timeoutPromise]);
         
         for (const [room, clientSet] of this.roomClients) {
-          for (const client of clientSet) {
-            if (client && client.idtarget === id && client !== ws) {
-              clientSet.delete(client);
+          if (clientSet) {
+            for (const client of clientSet) {
+              if (client && client.idtarget === id && client !== ws) {
+                clientSet.delete(client);
+              }
             }
           }
         }
@@ -1186,6 +1213,12 @@ export class ChatServer2 {
         }
       }
 
+      if (ws.readyState !== 1) {
+        console.log(`[SET_ID] WebSocket closed during cleanup for ${id}`);
+        if (release) release();
+        return;
+      }
+
       ws.idtarget = id;
       ws._isClosing = false;
 
@@ -1210,12 +1243,15 @@ export class ChatServer2 {
             const clientSet = this.roomClients.get(room);
             if (clientSet) clientSet.add(ws);
             
+            // Send all state on reconnect
             await this.sendAllStateTo(ws, room, true);
             
             await this.safeSend(ws, ["numberKursiSaya", seat]);
             await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
             await this.safeSend(ws, ["reconnectSuccess", room, seat]);
+            
+            this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, id]);
             
             const point = roomManager.getPoint(seat);
             if (point) {
@@ -1236,7 +1272,9 @@ export class ChatServer2 {
       }
     } catch (error) {
       console.error(`[SET_ID_TARGET] Error:`, error);
-      await this.safeSend(ws, ["error", "Connection failed"]);
+      if (ws && ws.readyState === 1) {
+        await this.safeSend(ws, ["error", "Connection failed"]);
+      }
     } finally {
       if (release) release();
     }
