@@ -1,4 +1,4 @@
-// ==================== LOWCARDGAMEMANAGER.js - FULL FIXED (PLAYER TIDAK DRAW & BOT) ====================
+// ==================== LOWCARDGAMEMANAGER.js - FULL FIXED (PLAYER TIDAK DRAW & GAME BISA START ULANG) ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -425,7 +425,7 @@ export class LowCardGameManager {
                          (Date.now() - existingGame.drawStartTime) > 60000);
         
         if (isStuck) {
-          console.log(`[GAME] Force cleaning stuck game in ${room}, players: ${hasRealPlayers}, age: ${gameAge}ms, phase: ${existingGame._phase}`);
+          console.log(`[GAME] Force cleaning stuck game in ${room}`);
           this._clearGameTimeouts(existingGame);
           this.activeGames.delete(room);
           this._releaseGameLock(room);
@@ -899,7 +899,6 @@ export class LowCardGameManager {
       if (entries.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "No players submitted numbers, game ended"]);
         
-        // CLEANUP TOTAL
         if (game.players) game.players.clear();
         if (game.botPlayers) game.botPlayers.clear();
         if (game.numbers) game.numbers.clear();
@@ -910,14 +909,7 @@ export class LowCardGameManager {
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         
-        // HAPUS LOCK
         if (this._gameLocks.has(room)) {
-          const lock = this._gameLocks.get(room);
-          if (lock) {
-            for (const waiter of lock.queue) {
-              try { waiter.reject(new Error("Game ended")); } catch(e) {}
-            }
-          }
           this._gameLocks.delete(room);
         }
         
@@ -933,13 +925,12 @@ export class LowCardGameManager {
       const noSubmit = activePlayers.filter(id => !submittedIds.has(id));
       noSubmit.forEach(id => eliminated.add(id));
 
-      // ========== FIX 2: SEMUA PLAYER ELIMINATED (TIDAK ADA YANG DRAW) ==========
+      // ========== FIX 2: SEMUA PLAYER ELIMINATED ==========
       const remainingAfterNoSubmit = Array.from(players.keys()).filter(id => !eliminated.has(id));
       
       if (remainingAfterNoSubmit.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "All players eliminated, game ended"]);
         
-        // CLEANUP TOTAL
         if (game.players) game.players.clear();
         if (game.botPlayers) game.botPlayers.clear();
         if (game.numbers) game.numbers.clear();
@@ -950,14 +941,7 @@ export class LowCardGameManager {
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         
-        // HAPUS LOCK
         if (this._gameLocks.has(room)) {
-          const lock = this._gameLocks.get(room);
-          if (lock) {
-            for (const waiter of lock.queue) {
-              try { waiter.reject(new Error("Game ended")); } catch(e) {}
-            }
-          }
           this._gameLocks.delete(room);
         }
         
@@ -975,7 +959,6 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         
-        // CLEANUP TOTAL
         if (game.players) game.players.clear();
         if (game.botPlayers) game.botPlayers.clear();
         if (game.numbers) game.numbers.clear();
@@ -986,14 +969,7 @@ export class LowCardGameManager {
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         
-        // HAPUS LOCK
         if (this._gameLocks.has(room)) {
-          const lock = this._gameLocks.get(room);
-          if (lock) {
-            for (const waiter of lock.queue) {
-              try { waiter.reject(new Error("Game ended")); } catch(e) {}
-            }
-          }
           this._gameLocks.delete(room);
         }
         
@@ -1023,7 +999,6 @@ export class LowCardGameManager {
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         
-        // CLEANUP TOTAL
         if (game.players) game.players.clear();
         if (game.botPlayers) game.botPlayers.clear();
         if (game.numbers) game.numbers.clear();
@@ -1034,14 +1009,7 @@ export class LowCardGameManager {
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         
-        // HAPUS LOCK
         if (this._gameLocks.has(room)) {
-          const lock = this._gameLocks.get(room);
-          if (lock) {
-            for (const waiter of lock.queue) {
-              try { waiter.reject(new Error("Game ended")); } catch(e) {}
-            }
-          }
           this._gameLocks.delete(room);
         }
         
@@ -1175,12 +1143,6 @@ export class LowCardGameManager {
       this._stats.totalGamesEnded++;
       
       if (this._gameLocks.has(room)) {
-        const lock = this._gameLocks.get(room);
-        if (lock) {
-          for (const waiter of lock.queue) {
-            try { waiter.reject(new Error("Game ended")); } catch(e) {}
-          }
-        }
         this._gameLocks.delete(room);
       }
       
