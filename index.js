@@ -1137,6 +1137,7 @@ export class ChatServer2 {
   // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
   // ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (TANPA needJoinRoom) ==========
 // ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (RECONNECT TANPA joinroomawal) ==========
+// ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (DENGAN DELAY 1000ms PADA sendAllStateTo) ==========
 async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
@@ -1230,30 +1231,33 @@ async handleSetIdTarget2(ws, id, baru) {
           const clientSet = this.roomClients.get(room);
           if (clientSet) clientSet.add(ws);
           
-          // ========== KIRIM POINT USER SENDIRI TERLEBIH DAHULU ==========
+          // ========== KIRIM POINT USER SENDIRI (LANGSUNG, TANPA DELAY) ==========
           const selfPoint = roomManager.getPoint(seat);
           if (selfPoint) {
             await this.safeSend(ws, ["pointUpdated", room, seat, selfPoint.x, selfPoint.y, selfPoint.fast ? 1 : 0]);
           }
           
-          // ========== KIRIM SEMUA DATA USER LAIN ==========
-          await this.sendAllStateTo(ws, room, true);
-          
-          // ========== KIRIM DATA KURSI SENDIRI ==========
+          // ========== KIRIM DATA KURSI SENDIRI (LANGSUNG, TANPA DELAY) ==========
           await this.safeSend(ws, ["numberKursiSaya", seat]);
           await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-          await this.safeSend(ws, ["reconnectSuccess", room, seat]);
           
-          // ========== BROADCAST KE USER LAIN ==========
+          // ========== KIRIM KONFIRMASI RECONNECT (LANGSUNG, TANPA DELAY) ==========
+          
+          // ========== BROADCAST KE USER LAIN (LANGSUNG, TANPA DELAY) ==========
           this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, id]);
           
-          // ========== LANGSUNG RETURN, TIDAK KESINI LAGI ==========
+          // ========== DELAY 1000ms SEBELUM sendAllStateTo ==========
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          // ============================================================
+          
+          // ========== KIRIM SEMUA DATA USER LAIN ==========
+          await this.sendAllStateTo(ws, room, true);
+          
           if (release) release();
           return;
         }
       }
-      // JIKA SEAT TIDAK VALID, HAPUS DATA
       this.userToSeat.delete(id);
       this.userCurrentRoom.delete(id);
     }
@@ -1268,7 +1272,6 @@ async handleSetIdTarget2(ws, id, baru) {
   } catch (error) {
     console.error(`[SET_ID_TARGET] Error:`, error);
     if (ws && ws.readyState === 1) {
-      await this.safeSend(ws, ["error", "Connection failed"]);
     }
   } finally {
     if (release) release();
