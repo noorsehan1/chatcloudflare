@@ -988,7 +988,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ========== HANDLE JOIN ROOM - LOGIKA TETAP SAMA ==========
+  // ========== HANDLE JOIN ROOM - DIPERBAIKI (sendAllStateTo DI AWAL) ==========
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) {
       await this.safeSend(ws, ["error", "User ID not set"]);
@@ -1090,13 +1090,14 @@ export class ChatServer2 {
       }
       userConns.add(ws);
 
-      // LOGIKA SAMA PERSIS - URUTAN TIDAK DIUBAH
+      // ========== PERBAIKAN: sendAllStateTo DI AWAL ==========
+      await this.sendAllStateTo(ws, room, true);
+      
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
       await new Promise(resolve => setTimeout(resolve, 100));
       await this.safeSend(ws, ["numberKursiSaya", assignedSeat]);
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
-      await this.sendAllStateTo(ws, room);
 
       const point = roomManager.getPoint(assignedSeat);
       if (point) {
@@ -1113,7 +1114,7 @@ export class ChatServer2 {
     }
   }
 
-  // ========== HANDLE SET ID TARGET 2 - LOGIKA SAMA ==========
+  // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI (TAMBAH sendAllStateTo di RECONNECT) ==========
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
@@ -1187,7 +1188,9 @@ export class ChatServer2 {
             const clientSet = this.roomClients.get(room);
             if (clientSet) clientSet.add(ws);
             
+            // ========== PERBAIKAN: TAMBAH sendAllStateTo ==========
             await this.sendAllStateTo(ws, room, true);
+            
             await this.safeSend(ws, ["numberKursiSaya", seat]);
             await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
