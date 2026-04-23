@@ -1136,6 +1136,7 @@ export class ChatServer2 {
 
   // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
   // ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (TANPA needJoinRoom) ==========
+// ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (RECONNECT TANPA joinroomawal) ==========
 async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
@@ -1229,14 +1230,14 @@ async handleSetIdTarget2(ws, id, baru) {
           const clientSet = this.roomClients.get(room);
           if (clientSet) clientSet.add(ws);
           
-          // ========== KIRIM SEMUA DATA USER LAIN ==========
-          await this.sendAllStateTo(ws, room, true);
-          
-          // ========== KIRIM POINT USER SENDIRI ==========
+          // ========== KIRIM POINT USER SENDIRI TERLEBIH DAHULU ==========
           const selfPoint = roomManager.getPoint(seat);
           if (selfPoint) {
             await this.safeSend(ws, ["pointUpdated", room, seat, selfPoint.x, selfPoint.y, selfPoint.fast ? 1 : 0]);
           }
+          
+          // ========== KIRIM SEMUA DATA USER LAIN ==========
+          await this.sendAllStateTo(ws, room, true);
           
           // ========== KIRIM DATA KURSI SENDIRI ==========
           await this.safeSend(ws, ["numberKursiSaya", seat]);
@@ -1247,12 +1248,12 @@ async handleSetIdTarget2(ws, id, baru) {
           // ========== BROADCAST KE USER LAIN ==========
           this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, id]);
           
-          // ========== TIDAK ADA needJoinRoom! LANGSUNG SUKSES ==========
-          
+          // ========== LANGSUNG RETURN, TIDAK KESINI LAGI ==========
           if (release) release();
           return;
         }
       }
+      // JIKA SEAT TIDAK VALID, HAPUS DATA
       this.userToSeat.delete(id);
       this.userCurrentRoom.delete(id);
     }
