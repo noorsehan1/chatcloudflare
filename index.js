@@ -643,6 +643,7 @@ export class ChatServer2 {
       }
       
       this._wsRawSet.delete(ws);
+      this._activeClients.delete(ws);
       
       if (ws.readyState === 1) {
         try {
@@ -687,6 +688,7 @@ export class ChatServer2 {
       }
       
       this._wsRawSet.delete(ws);
+      this._activeClients.delete(ws);
       
       if (ws.readyState === 1) {
         try {
