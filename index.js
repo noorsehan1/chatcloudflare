@@ -1135,110 +1135,144 @@ export class ChatServer2 {
   }
 
   // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
-  async handleSetIdTarget2(ws, id, baru) {
-    if (!id || !ws) return;
+  // ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (TANPA needJoinRoom) ==========
+async handleSetIdTarget2(ws, id, baru) {
+  if (!id || !ws) return;
 
-    let release;
-    try {
-      release = await this.connectionLock.acquire();
-    } catch(e) {
-      await this.safeSend(ws, ["error", "Server busy"]);
+  let release;
+  try {
+    release = await this.connectionLock.acquire();
+  } catch(e) {
+    await this.safeSend(ws, ["error", "Server busy"]);
+    return;
+  }
+  
+  try {
+    // CEK APAKAH WEBSOCKET MASIH HIDUP
+    if (ws.readyState !== 1) {
+      console.log(`[SET_ID] WebSocket already closed for ${id}, skipping`);
+      if (release) release();
       return;
     }
     
-    try {
-      if (baru === true) {
-        console.log(`[SET_ID] New user ${id}, cleaning up all old data`);
-        
-        await this._cleanupUserCompletely(id);
-        
-        for (const [room, clientSet] of this.roomClients) {
+    if (baru === true) {
+      console.log(`[SET_ID] New user ${id}, cleaning up all old data`);
+      
+      const cleanupPromise = this._cleanupUserCompletely(id);
+      const timeoutPromise = new Promise(resolve => setTimeout(resolve, 2000));
+      await Promise.race([cleanupPromise, timeoutPromise]);
+      
+      for (const [room, clientSet] of this.roomClients) {
+        if (clientSet) {
           for (const client of clientSet) {
             if (client && client.idtarget === id && client !== ws) {
               clientSet.delete(client);
             }
           }
         }
-        
-        const existingConns = this.userConnections.get(id);
-        if (existingConns) {
-          for (const oldWs of existingConns) {
-            if (oldWs !== ws) {
-              try { oldWs.close(1000, "New connection"); } catch (e) {}
-            }
-            await this._cleanupWebSocketOnly(oldWs);
+      }
+      
+      const existingConns = this.userConnections.get(id);
+      if (existingConns) {
+        for (const oldWs of existingConns) {
+          if (oldWs !== ws) {
+            try { oldWs.close(1000, "New connection"); } catch (e) {}
           }
-          this.userConnections.delete(id);
+          await this._cleanupWebSocketOnly(oldWs);
         }
-      } else {
-        console.log(`[SET_ID] Reconnect user ${id}, preserving seat data`);
-        const existingConns = this.userConnections.get(id);
-        if (existingConns && existingConns.size > 0) {
-          for (const oldWs of existingConns) {
-            if (oldWs !== ws && oldWs.readyState === 1) {
-              try { oldWs.close(1000, "Replaced"); } catch (e) {}
-            }
-            await this._cleanupWebSocketOnly(oldWs);
+        this.userConnections.delete(id);
+      }
+    } else {
+      console.log(`[SET_ID] Reconnect user ${id}, preserving seat data`);
+      
+      const existingConns = this.userConnections.get(id);
+      if (existingConns && existingConns.size > 0) {
+        for (const oldWs of existingConns) {
+          if (oldWs !== ws && oldWs.readyState === 1) {
+            try { oldWs.close(1000, "Replaced"); } catch (e) {}
           }
-          existingConns.clear();
+          await this._cleanupWebSocketOnly(oldWs);
         }
+        existingConns.clear();
       }
-
-      ws.idtarget = id;
-      ws._isClosing = false;
-
-      let userConns = this.userConnections.get(id);
-      if (!userConns) {
-        userConns = new Set();
-        this.userConnections.set(id, userConns);
-      }
-      userConns.add(ws);
-      this._wsRawSet.add(ws);
-      this._activeClients.add(ws);
-
-      const seatInfo = this.userToSeat.get(id);
-
-      if (seatInfo && baru === false) {
-        const { room, seat } = seatInfo;
-        const roomManager = this.roomManagers.get(room);
-        if (roomManager) {
-          const seatData = roomManager.getSeat(seat);
-          if (seatData && seatData.namauser === id) {
-            ws.roomname = room;
-            const clientSet = this.roomClients.get(room);
-            if (clientSet) clientSet.add(ws);
-            
-            await this.sendAllStateTo(ws, room, true);
-            
-            await this.safeSend(ws, ["numberKursiSaya", seat]);
-            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
-            await this.safeSend(ws, ["reconnectSuccess", room, seat]);
-            
-            const point = roomManager.getPoint(seat);
-            if (point) {
-              await this.safeSend(ws, ["pointUpdated", room, seat, point.x, point.y, point.fast ? 1 : 0]);
-            }
-            if (release) release();
-            return;
-          }
-        }
-        this.userToSeat.delete(id);
-        this.userCurrentRoom.delete(id);
-      }
-
-      if (baru === false) {
-        await this.safeSend(ws, ["needJoinRoom"]);
-      } else {
-        await this.safeSend(ws, ["joinroomawal"]);
-      }
-    } catch (error) {
-      console.error(`[SET_ID_TARGET] Error:`, error);
-      await this.safeSend(ws, ["error", "Connection failed"]);
-    } finally {
-      if (release) release();
     }
+
+    if (ws.readyState !== 1) {
+      console.log(`[SET_ID] WebSocket closed during cleanup for ${id}`);
+      if (release) release();
+      return;
+    }
+
+    ws.idtarget = id;
+    ws._isClosing = false;
+
+    let userConns = this.userConnections.get(id);
+    if (!userConns) {
+      userConns = new Set();
+      this.userConnections.set(id, userConns);
+    }
+    userConns.add(ws);
+    this._wsRawSet.add(ws);
+    this._activeClients.add(ws);
+
+    const seatInfo = this.userToSeat.get(id);
+
+    if (seatInfo && baru === false) {
+      const { room, seat } = seatInfo;
+      const roomManager = this.roomManagers.get(room);
+      
+      if (roomManager) {
+        const seatData = roomManager.getSeat(seat);
+        if (seatData && seatData.namauser === id) {
+          ws.roomname = room;
+          
+          const clientSet = this.roomClients.get(room);
+          if (clientSet) clientSet.add(ws);
+          
+          // ========== KIRIM SEMUA DATA USER LAIN ==========
+          await this.sendAllStateTo(ws, room, true);
+          
+          // ========== KIRIM POINT USER SENDIRI ==========
+          const selfPoint = roomManager.getPoint(seat);
+          if (selfPoint) {
+            await this.safeSend(ws, ["pointUpdated", room, seat, selfPoint.x, selfPoint.y, selfPoint.fast ? 1 : 0]);
+          }
+          
+          // ========== KIRIM DATA KURSI SENDIRI ==========
+          await this.safeSend(ws, ["numberKursiSaya", seat]);
+          await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+          await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          await this.safeSend(ws, ["reconnectSuccess", room, seat]);
+          
+          // ========== BROADCAST KE USER LAIN ==========
+          this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, id]);
+          
+          // ========== TIDAK ADA needJoinRoom! LANGSUNG SUKSES ==========
+          
+          if (release) release();
+          return;
+        }
+      }
+      this.userToSeat.delete(id);
+      this.userCurrentRoom.delete(id);
+    }
+
+    // JIKA USER BARU ATAU TIDAK PUNYA SEAT
+    if (baru === false) {
+      await this.safeSend(ws, ["needJoinRoom"]);
+    } else {
+      await this.safeSend(ws, ["joinroomawal"]);
+    }
+    
+  } catch (error) {
+    console.error(`[SET_ID_TARGET] Error:`, error);
+    if (ws && ws.readyState === 1) {
+      await this.safeSend(ws, ["error", "Connection failed"]);
+    }
+  } finally {
+    if (release) release();
   }
+}
 
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._isClosing) return;
