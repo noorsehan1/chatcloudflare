@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - WITH PROTECTION ONLY (NO LOGIC CHANGE) ====================
+// ==================== CHAT SERVER 2 - WITH FORCE CLEANUP (NO LOGIC CHANGE) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -437,7 +437,7 @@ class RoomManager {
 }
 
 // ─────────────────────────────────────────────
-// ChatServer2 (Durable Object) - WITH PROTECTION ONLY
+// ChatServer2 (Durable Object) - WITH FORCE CLEANUP
 // ─────────────────────────────────────────────
 export class ChatServer2 {
   constructor(state, env) {
@@ -771,6 +771,24 @@ export class ChatServer2 {
     } catch(e) {}
   }
 
+  async _forceCleanupStaleConnections() {
+    try {
+      const now = Date.now();
+      let cleaned = 0;
+      
+      for (const ws of this._wsRawSet) {
+        if (ws && ws._connectionTime && (now - ws._connectionTime) > 7200000) {
+          await this._cleanupWebSocket(ws);
+          cleaned++;
+        }
+      }
+      
+      if (cleaned > 0) {
+        console.log(`[FORCE CLEANUP] Removed ${cleaned} stale connections`);
+      }
+    } catch(e) {}
+  }
+
   _startMasterTimer() {
     if (this._masterTimer) clearInterval(this._masterTimer);
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
@@ -797,6 +815,11 @@ export class ChatServer2 {
 
       if (this._masterTickCounter % CONSTANTS.FORCE_CLEANUP_MEMORY_TICKS === 0) {
         await this._checkConnectionPressure();
+      }
+
+      // FORCE CLEANUP WS YANG SUDAH LAMA TIDAK AKTIF (setiap 3600 tick = 1 jam)
+      if (this._masterTickCounter % 3600 === 0) {
+        await this._forceCleanupStaleConnections();
       }
 
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
@@ -988,7 +1011,7 @@ export class ChatServer2 {
     } catch (error) {}
   }
 
-  // ========== HANDLE JOIN ROOM - DIPERBAIKI (sendAllStateTo DI AWAL) ==========
+  // ========== HANDLE JOIN ROOM - DIPERBAIKI ==========
   async handleJoinRoom(ws, room) {
     if (!ws?.idtarget) {
       await this.safeSend(ws, ["error", "User ID not set"]);
@@ -1090,7 +1113,6 @@ export class ChatServer2 {
       }
       userConns.add(ws);
 
-      // ========== PERBAIKAN: sendAllStateTo DI AWAL ==========
       await this.sendAllStateTo(ws, room, true);
       
       await this.safeSend(ws, ["rooMasuk", assignedSeat, room]);
@@ -1114,7 +1136,7 @@ export class ChatServer2 {
     }
   }
 
-  // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI (TAMBAH sendAllStateTo di RECONNECT) ==========
+  // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
@@ -1188,7 +1210,6 @@ export class ChatServer2 {
             const clientSet = this.roomClients.get(room);
             if (clientSet) clientSet.add(ws);
             
-            // ========== PERBAIKAN: TAMBAH sendAllStateTo ==========
             await this.sendAllStateTo(ws, room, true);
             
             await this.safeSend(ws, ["numberKursiSaya", seat]);
@@ -1656,7 +1677,6 @@ export class ChatServer2 {
         return new Response("WebSocket creation failed", { status: 500 });
       }
 
-      // ========== TRY-CATCH UNTUK server.accept() - TAMBAHAN PROTECTION ==========
       try {
         server.accept();
       } catch (acceptError) {
