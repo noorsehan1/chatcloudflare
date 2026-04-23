@@ -1134,11 +1134,7 @@ export class ChatServer2 {
     }
   }
 
-  // ========== HANDLE SET ID TARGET 2 - DIPERBAIKI ==========
-  // ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (TANPA needJoinRoom) ==========
-// ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (RECONNECT TANPA joinroomawal) ==========
-// ========== HANDLE SET ID TARGET 2 - FULL LENGKAP (DENGAN DELAY 1000ms PADA sendAllStateTo) ==========
-// ========== HANDLE SET ID TARGET 2 - KIRIM SEMUA USER & POINT (DENGAN DELAY) ==========
+ // ========== HANDLE SET ID TARGET 2 - KIRIM SEMUA USER & POINT (DENGAN DELAY) ==========
 async handleSetIdTarget2(ws, id, baru) {
   if (!id || !ws) return;
 
@@ -1308,7 +1304,6 @@ async handleSetIdTarget2(ws, id, baru) {
   } finally {
     if (release) release();
   }
-}
 }
 
   async handleMessage(ws, raw) {
