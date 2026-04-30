@@ -1,4 +1,4 @@
-// ==================== LOWCARDGAMEMANAGER.js - TIMER BERDASARKAN TICK ====================
+// ==================== LOWCARDGAMEMANAGER.js - BOT BISA MAIN ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -13,6 +13,8 @@ const CONSTANTS = Object.freeze({
   LOCK_TIMEOUT_MS: 5000,
   MAX_GAME_AGE_MS: 6 * 60 * 60 * 1000,
   MAX_RETRY_ATTEMPTS: 3,
+  BOT_DRAW_MIN_SECONDS: 2,
+  BOT_DRAW_MAX_SECONDS: 10,
 });
 
 export class LowCardGameManager {
@@ -23,6 +25,7 @@ export class LowCardGameManager {
     this._destroyed = false;
     this._cleanupInterval = null;
     this._gameLocks = new Map();
+    this._masterTickCounter = 0;
     
     this._stats = {
       totalGamesStarted: 0,
@@ -89,6 +92,7 @@ export class LowCardGameManager {
 
   masterTick() {
     if (this._destroyed) return;
+    this._masterTickCounter++;
     
     const snapshot = Array.from(this.activeGames.entries());
     for (const [room, game] of snapshot) {
@@ -107,8 +111,6 @@ export class LowCardGameManager {
       this._handleRegistrationTick(game, room);
     } else if (game._phase === 'draw') {
       this._handleDrawTick(game, room);
-    } else if (game._phase === 'evaluating') {
-      // Evaluasi akan dihandle oleh timeout, bukan tick
     }
   }
   
@@ -122,13 +124,8 @@ export class LowCardGameManager {
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
     }
     
-    const timeLeft = game.registrationTimeLeft;
-    
-    // NOTIFIKASI HANYA 2x: 20 dan 5 (dari ChatServer)
-    // ChatServer akan broadcast sendiri, jadi LowCard tidak perlu broadcast
-    
     // Cek waktu habis
-    if (timeLeft === 0 && game.registrationOpen) {
+    if (game.registrationTimeLeft === 0 && game.registrationOpen) {
       this._closeRegistration(room);
     }
   }
@@ -136,12 +133,6 @@ export class LowCardGameManager {
   _handleDrawTick(game, room) {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
-    
-    // Set drawStartTime jika belum (hanya untuk tracking)
-    if (game.drawStartTime === null && game._phase === 'draw') {
-      game.drawStartTime = Date.now();
-      game._lastDrawTickCount = 0;
-    }
     
     // Kurangi timer setiap tick (3 detik)
     if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
@@ -151,50 +142,40 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI HANYA 2x: 20 dan 5 (dari ChatServer)
-    // ChatServer akan broadcast sendiri
-    
-    // Hitung tick untuk bot draw
-    const tickCount = this._masterTickCounter || 0;
-    
-    // BOT DRAW RANDOM PER TICK (setiap 3 detik)
-    if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
+    // ========== PERBAIKAN BOT DRAW ==========
+    // Bot draw RANDOM dalam 20 detik
+    if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
       
-      if (tickCount > (game._lastDrawTickCount || 0)) {
-        game._lastDrawTickCount = tickCount;
+      // Dapatkan semua bot yang belum draw
+      const activeBots = Array.from(game.botPlayers.keys())
+        .filter(botId => !game.eliminated.has(botId));
+      const alreadyDrawn = Array.from(game.numbers.keys())
+        .filter(id => game.botPlayers.has(id)).length;
+      const remainingBots = activeBots.length - alreadyDrawn;
+      
+      if (remainingBots > 0 && !game.evaluationLocked) {
         
-        const activeBots = Array.from(game.botPlayers.keys())
-          .filter(botId => !game.eliminated.has(botId));
-        const totalBots = activeBots.length;
-        const alreadyDrawn = Array.from(game.numbers.keys())
-          .filter(id => game.botPlayers.has(id)).length;
-        const remainingBots = totalBots - alreadyDrawn;
+        // Hitung berapa bot yang harus draw di tick ini
+        // Target: semua bot selesai dalam 20 detik (6-7 tick)
+        const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 3;
+        const ticksRemaining = Math.max(1, Math.ceil(timeLeft / 3));
+        const targetDrawnByNow = Math.min(activeBots.length, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 3)) * activeBots.length));
+        const needToDraw = Math.min(remainingBots, Math.max(1, targetDrawnByNow - alreadyDrawn));
         
-        if (remainingBots > 0) {
-          // Hitung berapa tick tersisa
-          const ticksRemaining = Math.max(1, Math.ceil(timeLeft / 3));
-          const botsToDrawThisTick = Math.max(1, Math.ceil(remainingBots / ticksRemaining));
-          
-          const pendingBotList = Array.from(game._pendingBotDraws.keys());
-          const shuffled = [...pendingBotList];
+        if (needToDraw > 0) {
+          // Pilih bot secara RANDOM untuk draw
+          const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
+          const shuffled = [...notDrawnBots];
           for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
           }
           
-          const toDrawThisTick = [];
-          for (let i = 0; i < Math.min(botsToDrawThisTick, shuffled.length); i++) {
-            toDrawThisTick.push(shuffled[i]);
-          }
+          const toDraw = shuffled.slice(0, needToDraw);
           
-          for (const botId of toDrawThisTick) {
-            game._pendingBotDraws.delete(botId);
-          }
-          
-          for (const botId of toDrawThisTick) {
+          for (const botId of toDraw) {
             if (!game.drawTimeExpired && !game.evaluationLocked && 
-                game.eliminated && !game.eliminated.has(botId) && 
-                game.numbers && !game.numbers.has(botId)) {
+                !game.numbers.has(botId)) {
               this._handleBotDraw(room, botId);
             }
           }
@@ -206,14 +187,13 @@ export class LowCardGameManager {
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
-      if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
-        const remainingBots = Array.from(game._pendingBotDraws.keys());
+      // Draw semua bot yang tersisa
+      if (game.useBots && game.botPlayers) {
+        const remainingBots = Array.from(game.botPlayers.keys())
+          .filter(botId => !game.eliminated.has(botId) && !game.numbers.has(botId));
         for (const botId of remainingBots) {
-          if (!game.numbers.has(botId)) {
-            this._handleBotDraw(room, botId);
-          }
+          this._handleBotDraw(room, botId);
         }
-        game._pendingBotDraws.clear();
       }
 
       const activePlayers = game.players ? 
@@ -437,13 +417,11 @@ export class LowCardGameManager {
         _createdAt: Date.now(),
         _isActive: true,
         _phase: 'registration',
-        _pendingBotDraws: new Map(),
         _hasBroadcastInitial: false,
         _evalTimeout: null,
         _evalStartTime: null,
         drawStartTime: null,
-        _evalScheduled: false,
-        _lastDrawTickCount: 0
+        _evalScheduled: false
       };
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -474,8 +452,6 @@ export class LowCardGameManager {
     if (game.useBots || (game.botPlayers && game.botPlayers.size > 0)) return;
     
     game.useBots = true;
-    if (game._pendingBotDraws) game._pendingBotDraws.clear();
-    game._pendingBotDraws = new Map();
     
     const mozNames = ["🤖 Bot 1", "🤖 Bot 2", "🤖 Bot 3", "🤖 Bot 4"];
     
@@ -489,7 +465,7 @@ export class LowCardGameManager {
       
       game.players.set(botId, { id: botId, name: botName });
       game.botPlayers.set(botId, botName);
-      game._pendingBotDraws.set(botId, true);
+      this._safeBroadcast(room, ["gameLowCardJoin", botName, game.betAmount]);
     }
   }
 
@@ -529,8 +505,7 @@ export class LowCardGameManager {
     game.drawTimeLeft = CONSTANTS.DRAW_TIME;
     game.drawTimeExpired = false;
     game._hasBroadcastInitial = false;
-    game.drawStartTime = null;
-    game._lastDrawTickCount = 0;
+    game.drawStartTime = Date.now();
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
@@ -545,25 +520,21 @@ export class LowCardGameManager {
     const game = this._safeGetGame(room);
     if (!game || !game._isActive || this._destroyed) return;
     
-    if (!game.eliminated || !game.numbers) return;
-    if (game.eliminated.has(botId) || game.numbers.has(botId)) return;
+    if (game.numbers.has(botId)) return;
     if (game.drawTimeExpired || game.evaluationLocked) return;
     
     const botNumber = this.getBotNumberByRound(game.round);
     const tanda = this.getRandomCardTanda();
     
-    if (!game.numbers) game.numbers = new Map();
-    if (!game.tanda) game.tanda = new Map();
-    
     game.numbers.set(botId, botNumber);
     game.tanda.set(botId, tanda);
     
-    const botPlayer = game.players ? game.players.get(botId) : null;
+    const botPlayer = game.players.get(botId);
     const botName = botPlayer?.name || botId;
     this._safeBroadcast(room, ["gameLowCardPlayerDraw", botName, botNumber, tanda]);
     
-    const activePlayers = game.players ? 
-      Array.from(game.players.keys()).filter(id => !game.eliminated.has(id)) : [];
+    const activePlayers = Array.from(game.players.keys())
+      .filter(id => !game.eliminated.has(id));
     const allDrawn = game.numbers.size === activePlayers.length;
     
     if (!game.evaluationLocked && allDrawn && game._phase !== 'evaluating') {
@@ -726,12 +697,6 @@ export class LowCardGameManager {
       
       if (entries.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "No players drew cards, game ended"]);
-        if (game.players) game.players.clear();
-        if (game.botPlayers) game.botPlayers.clear();
-        if (game.numbers) game.numbers.clear();
-        if (game.tanda) game.tanda.clear();
-        if (game.eliminated) game.eliminated.clear();
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         return;
@@ -745,14 +710,6 @@ export class LowCardGameManager {
         const totalCoin = betAmount * players.size;
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
-        
-        if (game.players) game.players.clear();
-        if (game.botPlayers) game.botPlayers.clear();
-        if (game.numbers) game.numbers.clear();
-        if (game.tanda) game.tanda.clear();
-        if (game.eliminated) game.eliminated.clear();
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
-        
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         return;
@@ -774,14 +731,6 @@ export class LowCardGameManager {
         game.winner = winnerId;
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
-        
-        if (game.players) game.players.clear();
-        if (game.botPlayers) game.botPlayers.clear();
-        if (game.numbers) game.numbers.clear();
-        if (game.tanda) game.tanda.clear();
-        if (game.eliminated) game.eliminated.clear();
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
-        
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         return;
@@ -807,14 +756,6 @@ export class LowCardGameManager {
         game.winner = winnerId;
         
         this._safeBroadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
-        
-        if (game.players) game.players.clear();
-        if (game.botPlayers) game.botPlayers.clear();
-        if (game.numbers) game.numbers.clear();
-        if (game.tanda) game.tanda.clear();
-        if (game.eliminated) game.eliminated.clear();
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
-        
         this.activeGames.delete(room);
         this._stats.totalGamesEnded++;
         return;
@@ -859,19 +800,8 @@ export class LowCardGameManager {
       game._phase = 'draw';
       game.drawTimeLeft = CONSTANTS.DRAW_TIME;
       game._hasBroadcastInitial = false;
-      game.drawStartTime = null;
+      game.drawStartTime = Date.now();
       game._evalScheduled = false;
-      game._lastDrawTickCount = 0;
-      
-      if (game.useBots && game.botPlayers) {
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
-        game._pendingBotDraws = new Map();
-        const activeBots = Array.from(game.botPlayers.keys())
-          .filter(botId => !game.eliminated.has(botId));
-        for (const botId of activeBots) {
-          game._pendingBotDraws.set(botId, true);
-        }
-      }
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
       
@@ -880,12 +810,6 @@ export class LowCardGameManager {
       const game = this.activeGames.get(room);
       if (game && game._isActive) {
         this._clearGameTimeouts(game);
-        if (game.players) game.players.clear();
-        if (game.botPlayers) game.botPlayers.clear();
-        if (game.numbers) game.numbers.clear();
-        if (game.tanda) game.tanda.clear();
-        if (game.eliminated) game.eliminated.clear();
-        if (game._pendingBotDraws) game._pendingBotDraws.clear();
         this.activeGames.delete(room);
       }
     } finally {
@@ -904,10 +828,6 @@ export class LowCardGameManager {
       
       this._clearGameTimeouts(game);
       
-      if (game._pendingBotDraws) {
-        game._pendingBotDraws.clear();
-      }
-      
       const playersList = [];
       if (game.players) {
         for (const player of game.players.values()) {
@@ -917,12 +837,11 @@ export class LowCardGameManager {
       
       game._isActive = false;
       
-      if (game.players) { game.players.clear(); game.players = null; }
-      if (game.botPlayers) { game.botPlayers.clear(); game.botPlayers = null; }
-      if (game.numbers) { game.numbers.clear(); game.numbers = null; }
-      if (game.tanda) { game.tanda.clear(); game.tanda = null; }
-      if (game.eliminated) { game.eliminated.clear(); game.eliminated = null; }
-      if (game._pendingBotDraws) { game._pendingBotDraws.clear(); game._pendingBotDraws = null; }
+      if (game.players) game.players.clear();
+      if (game.botPlayers) game.botPlayers.clear();
+      if (game.numbers) game.numbers.clear();
+      if (game.tanda) game.tanda.clear();
+      if (game.eliminated) game.eliminated.clear();
       
       if (playersList.length > 0) {
         this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
