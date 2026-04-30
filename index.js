@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - FINAL PRODUCTION READY ====================
+// ==================== CHAT SERVER 2 - FULL FIXED VERSION ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -49,9 +49,18 @@ const GAME_ROOMS = Object.freeze([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers","LOVE BIRDS"
 ]);
 
-// ─────────────────────────────────────────────
-// SimpleLock
-// ─────────────────────────────────────────────
+// ==================== HELPER: Lock dengan Timeout ====================
+async function acquireWithTimeout(lock, timeoutMs = CONSTANTS.LOCK_TIMEOUT_MS) {
+  try {
+    const release = await lock.acquire();
+    return release;
+  } catch (err) {
+    console.warn("Lock acquisition timeout:", err.message);
+    return null;
+  }
+}
+
+// ==================== SimpleLock ====================
 class SimpleLock {
   constructor(timeoutMs = CONSTANTS.LOCK_TIMEOUT_MS) {
     this._locked = false;
@@ -118,9 +127,7 @@ class SimpleLock {
   }
 }
 
-// ─────────────────────────────────────────────
-// PMBuffer
-// ─────────────────────────────────────────────
+// ==================== PMBuffer ====================
 class PMBuffer {
   constructor() {
     this._queue = [];
@@ -186,9 +193,7 @@ class PMBuffer {
   }
 }
 
-// ─────────────────────────────────────────────
-// GlobalChatBuffer
-// ─────────────────────────────────────────────
+// ==================== GlobalChatBuffer ====================
 class GlobalChatBuffer {
   constructor() {
     this._messageQueue = [];
@@ -218,7 +223,6 @@ class GlobalChatBuffer {
   _scheduleFlush() {
     if (this._flushScheduled || this._isDestroyed) return;
     this._flushScheduled = true;
-    // Langsung flush tanpa setImmediate
     this._flush();
     this._flushScheduled = false;
   }
@@ -266,9 +270,7 @@ class GlobalChatBuffer {
   }
 }
 
-// ─────────────────────────────────────────────
-// RoomManager
-// ─────────────────────────────────────────────
+// ==================== RoomManager ====================
 class RoomManager {
   constructor(roomName) {
     this.roomName = roomName;
@@ -382,9 +384,7 @@ class RoomManager {
   }
 }
 
-// ─────────────────────────────────────────────
-// ChatServer2 - FULLY FIXED
-// ─────────────────────────────────────────────
+// ==================== ChatServer2 - FULL FIXED VERSION ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -432,6 +432,7 @@ export class ChatServer2 {
     try {
       this.lowcard = new LowCardGameManager(this);
     } catch (error) {
+      console.error("Failed to initialize LowCardGameManager:", error);
       this.lowcard = null;
     }
 
@@ -455,15 +456,46 @@ export class ChatServer2 {
   async _runGarbageCollector() {
     if (this._isClosing || !this._alive) return;
     
-    const release = await this.userLock.acquire().catch(() => null);
+    let release = await acquireWithTimeout(this.userLock);
     if (!release) return;
-    
-    let lockReleased = false;
     
     try {
       const now = Date.now();
+      const seatsToRemove = [];
       
-      // Clean up stale connections
+      // PHASE 1: Kumpulkan seat yang akan dihapus
+      for (const [room, roomManager] of this.roomManagers) {
+        for (const [seat, seatData] of roomManager.seats) {
+          if (seatData && now - seatData.lastUpdated > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
+            const isOnline = this.userConnections.has(seatData.namauser);
+            if (!isOnline) {
+              seatsToRemove.push({ room, seat, userId: seatData.namauser });
+            }
+          }
+        }
+      }
+      
+      // PHASE 2: Hapus seat (tanpa return di tengah loop)
+      if (seatsToRemove.length > 0) {
+        for (const item of seatsToRemove) {
+          const roomManager = this.roomManagers.get(item.room);
+          if (roomManager) {
+            roomManager.removeSeat(item.seat);
+          }
+        }
+        
+        // Lepas lock sebelum broadcast
+        release();
+        release = null;
+        
+        for (const item of seatsToRemove) {
+          this.broadcastToRoom(item.room, ["removeKursi", item.room, item.seat]);
+          this.updateRoomCount(item.room);
+        }
+        return;
+      }
+      
+      // PHASE 3: Cleanup user connections
       for (const [userId, connections] of this.userConnections) {
         const validConns = [];
         for (const conn of connections) {
@@ -473,7 +505,6 @@ export class ChatServer2 {
         }
         
         if (validConns.length === 0) {
-          // Remove user data
           this.userConnections.delete(userId);
           this.userConnectionVersion.delete(userId);
           this.userLastSeen.delete(userId);
@@ -485,9 +516,12 @@ export class ChatServer2 {
               const seatData = roomManager.getSeat(seatInfo.seat);
               if (seatData && seatData.namauser === userId) {
                 roomManager.removeSeat(seatInfo.seat);
-                // Release lock before broadcast
-                release();
-                lockReleased = true;
+                
+                if (release) {
+                  release();
+                  release = null;
+                }
+                
                 this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
                 this.updateRoomCount(seatInfo.room);
                 return;
@@ -501,36 +535,10 @@ export class ChatServer2 {
         }
       }
       
-      // Clean up stale seats
-      for (const [room, roomManager] of this.roomManagers) {
-        const seatsToRemove = [];
-        for (const [seat, seatData] of roomManager.seats) {
-          if (seatData && now - seatData.lastUpdated > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
-            const isOnline = this.userConnections.has(seatData.namauser);
-            if (!isOnline) {
-              seatsToRemove.push(seat);
-            }
-          }
-        }
-        
-        if (seatsToRemove.length > 0 && !lockReleased) {
-          for (const seat of seatsToRemove) {
-            roomManager.removeSeat(seat);
-            // Release lock before broadcast
-            release();
-            lockReleased = true;
-            this.broadcastToRoom(room, ["removeKursi", room, seat]);
-            this.updateRoomCount(room);
-            return;
-          }
-        }
-      }
-      
     } catch (e) {
-      // Silently fail
-    }
-    finally {
-      if (!lockReleased) release();
+      console.error("GC error:", e);
+    } finally {
+      if (release) release();
     }
   }
 
@@ -538,11 +546,10 @@ export class ChatServer2 {
     if (!ws || ws._isClosing) return;
     ws._isClosing = true;
     
-    let release = null;
+    let release = await acquireWithTimeout(this.userLock);
+    if (!release) return;
+    
     try {
-      release = await this.userLock.acquire().catch(() => null);
-      if (!release) return;
-      
       const userId = ws.idtarget;
       const roomName = ws.roomname;
       
@@ -568,10 +575,10 @@ export class ChatServer2 {
                 const seatData = roomManager.getSeat(seatInfo.seat);
                 if (seatData && seatData.namauser === userId) {
                   roomManager.removeSeat(seatInfo.seat);
-                  // Release lock before broadcast
-                  const releaseCopy = release;
+                  
+                  release();
                   release = null;
-                  releaseCopy();
+                  
                   this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
                   this.updateRoomCount(seatInfo.room);
                   return;
@@ -596,9 +603,8 @@ export class ChatServer2 {
       ws._connectionVersion = undefined;
       
     } catch (e) {
-      // Silently fail
-    }
-    finally {
+      console.error("Cleanup error:", e);
+    } finally {
       if (release) release();
     }
   }
@@ -606,6 +612,9 @@ export class ChatServer2 {
   async _cleanupWebSocketOnly(ws) {
     if (!ws || ws._isClosing) return;
     ws._isClosing = true;
+    
+    let release = await acquireWithTimeout(this.userLock);
+    if (!release) return;
     
     try {
       const roomName = ws.roomname;
@@ -633,8 +642,13 @@ export class ChatServer2 {
                 const seatData = roomManager.getSeat(seatInfo.seat);
                 if (seatData && seatData.namauser === userId) {
                   roomManager.removeSeat(seatInfo.seat);
+                  
+                  release();
+                  release = null;
+                  
                   this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
                   this.updateRoomCount(seatInfo.room);
+                  return;
                 }
               }
             }
@@ -655,7 +669,9 @@ export class ChatServer2 {
       ws.idtarget = undefined;
       
     } catch (e) {
-      // Silently fail
+      console.error("Cleanup only error:", e);
+    } finally {
+      if (release) release();
     }
   }
 
@@ -684,9 +700,8 @@ export class ChatServer2 {
         try { this.lowcard.masterTick(); } catch(e) {}
       }
     } catch (error) {
-      // Silently fail
-    }
-    finally {
+      console.error("Master tick error:", error);
+    } finally {
       release();
     }
   }
@@ -708,7 +723,7 @@ export class ChatServer2 {
         }
       }
     } catch (error) {
-      // Silently fail
+      console.error("Number tick error:", error);
     }
   }
 
@@ -808,8 +823,11 @@ export class ChatServer2 {
     let userRelease = null;
     
     try {
-      roomRelease = await this.roomLock.acquire();
-      userRelease = await this.userLock.acquire();
+      roomRelease = await acquireWithTimeout(this.roomLock);
+      if (!roomRelease) throw new Error("Room lock timeout");
+      
+      userRelease = await acquireWithTimeout(this.userLock);
+      if (!userRelease) throw new Error("User lock timeout");
     } catch(e) {
       await this.safeSend(ws, ["error", "Server busy"]);
       if (roomRelease) roomRelease();
@@ -843,16 +861,17 @@ export class ChatServer2 {
           
           if (oldSeat) {
             oldRoomManager.removeSeat(oldSeat);
-            // Release locks before broadcast
-            userRelease();
-            userRelease = null;
-            roomRelease();
-            roomRelease = null;
+            
+            if (userRelease) { userRelease(); userRelease = null; }
+            if (roomRelease) { roomRelease(); roomRelease = null; }
+            
             this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
             this.updateRoomCount(oldRoom);
-            // Re-acquire locks
-            roomRelease = await this.roomLock.acquire();
-            userRelease = await this.userLock.acquire();
+            
+            roomRelease = await acquireWithTimeout(this.roomLock);
+            if (!roomRelease) throw new Error("Room lock timeout");
+            userRelease = await acquireWithTimeout(this.userLock);
+            if (!userRelease) throw new Error("User lock timeout");
           }
         }
         
@@ -882,16 +901,17 @@ export class ChatServer2 {
         const oldRoomManager = this.roomManagers.get(existingSeatInfo.room);
         if (oldRoomManager) {
           oldRoomManager.removeSeat(existingSeatInfo.seat);
-          // Release locks before broadcast
-          userRelease();
-          userRelease = null;
-          roomRelease();
-          roomRelease = null;
+          
+          if (userRelease) { userRelease(); userRelease = null; }
+          if (roomRelease) { roomRelease(); roomRelease = null; }
+          
           this.broadcastToRoom(existingSeatInfo.room, ["removeKursi", existingSeatInfo.room, existingSeatInfo.seat]);
           this.updateRoomCount(existingSeatInfo.room);
-          // Re-acquire locks
-          roomRelease = await this.roomLock.acquire();
-          userRelease = await this.userLock.acquire();
+          
+          roomRelease = await acquireWithTimeout(this.roomLock);
+          if (!roomRelease) throw new Error("Room lock timeout");
+          userRelease = await acquireWithTimeout(this.userLock);
+          if (!userRelease) throw new Error("User lock timeout");
         }
         this.userToSeat.delete(userId);
         this.userCurrentRoom.delete(userId);
@@ -926,11 +946,8 @@ export class ChatServer2 {
       await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
       await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
       
-      // Release locks before broadcast
-      userRelease();
-      userRelease = null;
-      roomRelease();
-      roomRelease = null;
+      if (userRelease) { userRelease(); userRelease = null; }
+      if (roomRelease) { roomRelease(); roomRelease = null; }
       
       this.broadcastToRoom(room, ["userOccupiedSeat", room, assignedSeat, userId]);
       
@@ -940,6 +957,7 @@ export class ChatServer2 {
       return true;
       
     } catch (error) {
+      console.error("Join room error:", error);
       await this.safeSend(ws, ["error", "Failed to join room"]);
       return false;
     } finally {
@@ -951,14 +969,13 @@ export class ChatServer2 {
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
-    let release = null;
+    let release = await acquireWithTimeout(this.userLock);
+    if (!release) {
+      await this.safeSend(ws, ["error", "Server busy"]);
+      return;
+    }
+    
     try {
-      release = await this.userLock.acquire();
-      if (!release) {
-        await this.safeSend(ws, ["error", "Server busy"]);
-        return;
-      }
-      
       if (ws.readyState !== 1) return;
       
       if (!id || id.length === 0 || id.length > CONSTANTS.MAX_USERNAME_LENGTH) {
@@ -1017,10 +1034,8 @@ export class ChatServer2 {
         userConns.add(ws);
         this._wsRawSet.add(ws);
         
-        // Release lock before broadcast
-        const releaseCopy = release;
+        release();
         release = null;
-        releaseCopy();
         
         for (const { room, seat } of roomsToUpdate) {
           this.broadcastToRoom(room, ["removeKursi", room, seat]);
@@ -1080,10 +1095,8 @@ export class ChatServer2 {
               }
               clientSet.add(ws);
               
-              // Release lock before broadcast
-              const releaseCopy = release;
+              release();
               release = null;
-              releaseCopy();
               
               const selfPoint = roomManager.getPoint(seat);
               if (selfPoint) {
@@ -1138,6 +1151,7 @@ export class ChatServer2 {
       }
       
     } catch (error) {
+      console.error("SetIdTarget2 error:", error);
       if (ws && ws.readyState === 1) {
         await this.safeSend(ws, ["error", "Connection failed"]);
       }
@@ -1165,6 +1179,7 @@ export class ChatServer2 {
       
       await this._processMessage(ws, data, data[0]);
     } catch (error) {
+      console.error("Message handling error:", error);
       try {
         await this.safeSend(ws, ["error", "Message processing failed"]);
       } catch (e) {}
@@ -1231,16 +1246,14 @@ export class ChatServer2 {
           this.broadcastToRoom(room, ["removeKursi", room, seat]);
           this.updateRoomCount(room);
           
-          let userRelease = null;
-          try {
-            userRelease = await this.userLock.acquire();
-            if (userRelease) {
+          let userRelease = await acquireWithTimeout(this.userLock);
+          if (userRelease) {
+            try {
               this.userToSeat.delete(ws.idtarget);
               this.userCurrentRoom.delete(ws.idtarget);
+            } finally {
+              userRelease();
             }
-          } catch(e) {}
-          finally {
-            if (userRelease) userRelease();
           }
           
           const clientSet = this.roomClients.get(room);
@@ -1370,6 +1383,7 @@ export class ChatServer2 {
             try {
               await this.lowcard.handleEvent(ws, data);
             } catch (error) {
+              console.error("Game error:", error);
               await this.safeSend(ws, ["gameLowCardError", "Game error, please try again"]);
             }
           }
@@ -1381,7 +1395,7 @@ export class ChatServer2 {
           break;
       }
     } catch (error) {
-      // Silently fail
+      console.error("Process message error:", error);
     }
   }
 
@@ -1440,7 +1454,10 @@ export class ChatServer2 {
             uptime: Date.now() - this._startTime
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
-        if (url.pathname === "/shutdown") { await this.shutdown(); return new Response("Shutting down...", { status: 200 }); }
+        if (url.pathname === "/shutdown") { 
+          await this.shutdown(); 
+          return new Response("Shutting down...", { status: 200 }); 
+        }
         if (url.pathname === "/reset") { 
           await this._forceResetAllData();
           return new Response("All data has been reset successfully!", { status: 200 }); 
@@ -1456,7 +1473,8 @@ export class ChatServer2 {
       const client = pair[0];
       const server = pair[1];
 
-      server.accept();
+      // ========== KRITICAL: PAKAI HIBERNATION API ==========
+      this.state.acceptWebSocket(server);
       
       const ws = server;
       ws.roomname = undefined;
@@ -1467,27 +1485,41 @@ export class ChatServer2 {
 
       this._wsRawSet.add(ws);
 
-      const messageHandler = async (ev) => { await this.handleMessage(ws, ev.data); };
-      const errorHandler = async () => { await this._cleanupWebSocket(ws); };
-      const closeHandler = async () => { await this._cleanupWebSocket(ws); };
-
-      ws.addEventListener("message", messageHandler);
-      ws.addEventListener("error", errorHandler);
-      ws.addEventListener("close", closeHandler);
+      // Simpan metadata di state untuk Hibernation API
+      this.state.setWebSocketData(ws, {
+        roomname: undefined,
+        idtarget: undefined,
+        connectionTime: Date.now(),
+        connectionVersion: Date.now()
+      });
 
       return new Response(null, { status: 101, webSocket: client });
       
     } catch (error) {
+      console.error("Fetch error:", error);
       return new Response("Internal server error", { status: 500 });
     }
   }
 
+  // ========== HIBERNATION API REQUIRED METHODS ==========
+  async webSocketMessage(ws, message) {
+    await this.handleMessage(ws, message);
+  }
+
+  async webSocketClose(ws, code, reason) {
+    await this._cleanupWebSocket(ws);
+  }
+
+  async webSocketError(ws, error) {
+    console.error("WebSocket error:", error);
+    await this._cleanupWebSocket(ws);
+  }
+
   async _forceResetAllData() {
-    let release = null;
+    let release = await acquireWithTimeout(this.userLock);
+    if (!release) return;
+    
     try {
-      release = await this.userLock.acquire();
-      if (!release) return;
-      
       const snapshot = Array.from(this._wsRawSet);
       for (const ws of snapshot) {
         if (ws && ws.readyState === 1 && !ws._isClosing) {
@@ -1538,6 +1570,7 @@ export class ChatServer2 {
         if (this.lowcard && typeof this.lowcard.destroy === 'function') await this.lowcard.destroy();
         this.lowcard = new LowCardGameManager(this);
       } catch (error) {
+        console.error("Failed to reinitialize LowCardGameManager:", error);
         this.lowcard = null;
       }
       
@@ -1545,15 +1578,15 @@ export class ChatServer2 {
       this._masterTickCounter = 0;
       this._startTime = Date.now();
       
+    } catch (error) {
+      console.error("Force reset error:", error);
     } finally {
       if (release) release();
     }
   }
 }
 
-// ─────────────────────────────────────────────
-// Worker Export
-// ─────────────────────────────────────────────
+// ==================== Worker Export ====================
 export default {
   async fetch(req, env) {
     try {
@@ -1562,6 +1595,7 @@ export default {
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       return chatObj.fetch(req);
     } catch (error) {
+      console.error("Worker fetch error:", error);
       return new Response("Server error", { status: 500 });
     }
   }
