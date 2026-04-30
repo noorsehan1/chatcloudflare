@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FIREBASE STYLE (ANTI CRASH) ====================
+// ==================== CHAT SERVER - FIREBASE STYLE (COMPATIBLE WITH GAME) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -154,7 +154,7 @@ class RoomManager {
 }
 
 // ==================== CHAT SERVER ====================
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -163,6 +163,7 @@ export class ChatServer {
     
     // Simple data structures
     this.users = new Map();      // username -> { ws, room, seat }
+    this.userConnections = new Map(); // FOR GAME COMPATIBILITY: username -> Set of connections
     this.rooms = new Map();      // roomName -> RoomManager
     this.connections = new Set(); // all WebSockets
     
@@ -205,8 +206,9 @@ export class ChatServer {
     try {
       const { LowCardGameManager } = await import("./lowcard.js");
       this.game = new LowCardGameManager(this);
+      console.log("LowCardGameManager loaded successfully");
     } catch(e) {
-      console.log("LowCardGameManager not available");
+      console.log("LowCardGameManager not available, using stub");
       this.game = new GameManagerStub();
     }
   }
@@ -252,7 +254,17 @@ export class ChatServer {
     }
     for (const name of deadUsers) {
       this.users.delete(name);
+      this.userConnections.delete(name);
     }
+  }
+  
+  // FOR GAME COMPATIBILITY - get user connections
+  getUserConnections(username) {
+    const user = this.users.get(username);
+    if (user && user.ws && user.ws.readyState === 1) {
+      return new Set([user.ws]);
+    }
+    return new Set();
   }
   
   // SAFE BROADCAST - copy connections before loop
@@ -276,7 +288,7 @@ export class ChatServer {
     }
   }
   
-  sendToUser(ws, msg) {
+  async safeSend(ws, msg) {
     if (!ws || ws.readyState !== 1 || ws._closing) return false;
     try {
       ws.send(JSON.stringify(msg));
@@ -286,13 +298,31 @@ export class ChatServer {
     }
   }
   
+  sendToUser(ws, msg) {
+    return this.safeSend(ws, msg);
+  }
+  
+  sendToUsername(username, msg) {
+    const user = this.users.get(username);
+    if (user && user.ws) return this.safeSend(user.ws, msg);
+    return false;
+  }
+  
   async handleConnect(ws) {
     if (!ws || this.isShuttingDown) return;
     
     ws.username = null;
     ws.room = null;
     ws.seat = null;
+    ws.idtarget = null;
     ws._closing = false;
+    
+    // FOR GAME COMPATIBILITY - alias roomname
+    Object.defineProperty(ws, 'roomname', {
+      get: () => ws.room,
+      set: (val) => { ws.room = val; }
+    });
+    
     this.connections.add(ws);
   }
   
@@ -301,7 +331,7 @@ export class ChatServer {
     if (!ws || ws._closing) return;
     
     if (!userId || userId.length > CONSTANTS.MAX_USERNAME_LENGTH) {
-      this.sendToUser(ws, ["error", "Invalid username"]);
+      this.safeSend(ws, ["error", "Invalid username"]);
       try { ws.close(); } catch(e) {}
       return;
     }
@@ -317,12 +347,14 @@ export class ChatServer {
     
     // Register user
     this.users.set(userId, { ws, room: null, seat: null, lastSeen: Date.now() });
+    this.userConnections.set(userId, new Set([ws]));
     ws.username = userId;
+    ws.idtarget = userId;
     
-    this.sendToUser(ws, ["loginOk", userId]);
+    this.safeSend(ws, ["loginOk", userId]);
     
     if (isNew) {
-      this.sendToUser(ws, ["joinroomawal"]);
+      this.safeSend(ws, ["joinroomawal"]);
     } else {
       // Try restore session
       let restored = false;
@@ -333,11 +365,11 @@ export class ChatServer {
           ws.seat = seat;
           this.users.set(userId, { ws, room: roomName, seat, lastSeen: Date.now() });
           
-          this.sendToUser(ws, ["reconnectSuccess", roomName, seat]);
-          this.sendToUser(ws, ["numberKursiSaya", seat]);
-          this.sendToUser(ws, ["currentNumber", this.currentNumber]);
-          this.sendToUser(ws, ["muteTypeResponse", room.getMute(), roomName]);
-          this.sendToUser(ws, ["roomUserCount", roomName, room.getCount()]);
+          this.safeSend(ws, ["reconnectSuccess", roomName, seat]);
+          this.safeSend(ws, ["numberKursiSaya", seat]);
+          this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          this.safeSend(ws, ["muteTypeResponse", room.getMute(), roomName]);
+          this.safeSend(ws, ["roomUserCount", roomName, room.getCount()]);
           
           await this.sendAllStateTo(ws, roomName);
           this.broadcastRoom(roomName, ["userReconnected", roomName, seat, userId]);
@@ -346,14 +378,14 @@ export class ChatServer {
         }
       }
       if (!restored) {
-        this.sendToUser(ws, ["needJoinRoom"]);
+        this.safeSend(ws, ["needJoinRoom"]);
       }
     }
   }
   
   async handleJoinRoom(ws, roomName) {
     if (!ws || ws._closing || !ws.username) {
-      this.sendToUser(ws, ["error", "Login first"]);
+      this.safeSend(ws, ["error", "Login first"]);
       return false;
     }
     
@@ -361,7 +393,7 @@ export class ChatServer {
     if (!room) return false;
     
     if (room.getCount() >= CONSTANTS.MAX_SEATS) {
-      this.sendToUser(ws, ["roomFull", roomName]);
+      this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
@@ -387,10 +419,10 @@ export class ChatServer {
     ws.seat = seat;
     this.users.set(ws.username, { ws, room: roomName, seat, lastSeen: Date.now() });
     
-    this.sendToUser(ws, ["rooMasuk", seat, roomName]);
-    this.sendToUser(ws, ["numberKursiSaya", seat]);
-    this.sendToUser(ws, ["muteTypeResponse", room.getMute(), roomName]);
-    this.sendToUser(ws, ["roomUserCount", roomName, room.getCount()]);
+    this.safeSend(ws, ["rooMasuk", seat, roomName]);
+    this.safeSend(ws, ["numberKursiSaya", seat]);
+    this.safeSend(ws, ["muteTypeResponse", room.getMute(), roomName]);
+    this.safeSend(ws, ["roomUserCount", roomName, room.getCount()]);
     
     this.broadcastRoom(roomName, ["userOccupiedSeat", roomName, seat, ws.username]);
     
@@ -406,19 +438,19 @@ export class ChatServer {
     const allSeats = room.getAllSeats();
     if (ws.seat) delete allSeats[ws.seat];
     if (Object.keys(allSeats).length) {
-      this.sendToUser(ws, ["allUpdateKursiList", roomName, allSeats]);
+      this.safeSend(ws, ["allUpdateKursiList", roomName, allSeats]);
     }
     
     // Send all points (except self)
     const allPoints = room.getAllPoints().filter(p => p.seat !== ws.seat);
     if (allPoints.length) {
-      this.sendToUser(ws, ["allPointsList", roomName, allPoints]);
+      this.safeSend(ws, ["allPointsList", roomName, allPoints]);
     }
     
     // Send self point
     const myPoint = room.getPoint(ws.seat);
     if (myPoint) {
-      this.sendToUser(ws, ["pointUpdated", roomName, ws.seat, myPoint.x, myPoint.y, myPoint.fast ? 1 : 0]);
+      this.safeSend(ws, ["pointUpdated", roomName, ws.seat, myPoint.x, myPoint.y, myPoint.fast ? 1 : 0]);
     }
   }
   
@@ -513,7 +545,7 @@ export class ChatServer {
           if (room) {
             const result = room.setMute(isMuted);
             this.broadcastRoom(roomName, ["muteStatusChanged", result, roomName]);
-            this.sendToUser(ws, ["muteTypeSet", !!isMuted, result, roomName]);
+            this.safeSend(ws, ["muteTypeSet", !!isMuted, result, roomName]);
           }
           break;
         }
@@ -521,7 +553,7 @@ export class ChatServer {
         case "getMuteType": {
           const roomName = args[0];
           const room = this.rooms.get(roomName);
-          this.sendToUser(ws, ["muteTypeResponse", room?.getMute() || false, roomName]);
+          this.safeSend(ws, ["muteTypeResponse", room?.getMute() || false, roomName]);
           break;
         }
         
@@ -530,26 +562,26 @@ export class ChatServer {
           for (const [name, room] of this.rooms) {
             counts[name] = room.getCount();
           }
-          this.sendToUser(ws, ["allRoomsUserCount", Object.entries(counts)]);
+          this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
           break;
         }
         
         case "getRoomUserCount": {
           const roomName = args[0];
           const room = this.rooms.get(roomName);
-          this.sendToUser(ws, ["roomUserCount", roomName, room?.getCount() || 0]);
+          this.safeSend(ws, ["roomUserCount", roomName, room?.getCount() || 0]);
           break;
         }
         
         case "getCurrentNumber":
-          this.sendToUser(ws, ["currentNumber", this.currentNumber]);
+          this.safeSend(ws, ["currentNumber", this.currentNumber]);
           break;
           
         case "isUserOnline": {
           const username = args[0];
           const user = this.users.get(username);
           const isOnline = user && user.ws && user.ws.readyState === 1;
-          this.sendToUser(ws, ["userOnlineStatus", username, isOnline, args[1] || ""]);
+          this.safeSend(ws, ["userOnlineStatus", username, isOnline, args[1] || ""]);
           break;
         }
         
@@ -578,7 +610,7 @@ export class ChatServer {
               users.push(name);
             }
           }
-          this.sendToUser(ws, ["allOnlineUsers", users]);
+          this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
         
@@ -586,7 +618,7 @@ export class ChatServer {
           const [targetId, img, username, desc] = args;
           const targetUser = this.users.get(targetId);
           if (targetUser && targetUser.ws && targetUser.ws.readyState === 1) {
-            this.sendToUser(targetUser.ws, ["notif", img, username, desc, Date.now()]);
+            this.safeSend(targetUser.ws, ["notif", img, username, desc, Date.now()]);
           }
           break;
         }
@@ -595,9 +627,9 @@ export class ChatServer {
           const [targetId, img, msg, sender] = args;
           const targetUser = this.users.get(targetId);
           if (targetUser && targetUser.ws && targetUser.ws.readyState === 1 && sender) {
-            this.sendToUser(targetUser.ws, ["private", targetId, img, msg, Date.now(), sender]);
+            this.safeSend(targetUser.ws, ["private", targetId, img, msg, Date.now(), sender]);
           }
-          this.sendToUser(ws, ["private", targetId, img, msg, Date.now(), sender]);
+          this.safeSend(ws, ["private", targetId, img, msg, Date.now(), sender]);
           break;
         }
         
@@ -606,12 +638,12 @@ export class ChatServer {
         case "gameLowCardNumber":
         case "gameLowCardEnd":
           if (GAME_ROOMS.has(ws.room) && this.game) {
-            try { await this.game.handleEvent(ws, data); } catch(e) {}
+            try { await this.game.handleEvent(ws, data); } catch(e) { console.error("Game error:", e); }
           }
           break;
           
         case "isInRoom":
-          this.sendToUser(ws, ["inRoomStatus", ws.room !== null]);
+          this.safeSend(ws, ["inRoomStatus", ws.room !== null]);
           break;
           
         case "onDestroy":
@@ -639,6 +671,7 @@ export class ChatServer {
           }
         }
         this.users.delete(ws.username);
+        this.userConnections.delete(ws.username);
       }
     }
     
@@ -675,6 +708,7 @@ export class ChatServer {
     
     this.connections.clear();
     this.users.clear();
+    this.userConnections.clear();
     this.rooms.clear();
   }
   
@@ -737,8 +771,8 @@ export class ChatServer {
 export default {
   async fetch(request, env) {
     try {
-      const id = env.CHAT_SERVER.idFromName("main");
-      const obj = env.CHAT_SERVER.get(id);
+      const id = env.CHAT_SERVER_2.idFromName("main");
+      const obj = env.CHAT_SERVER_2.get(id);
       return await obj.fetch(request);
     } catch(e) {
       console.error("Worker error:", e);
