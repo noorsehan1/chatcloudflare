@@ -1,4 +1,4 @@
-// ==================== FIREBASE STYLE CHAT SERVER - NO DELAY ====================
+// ==================== FIREBASE STYLE CHAT SERVER - FIXED ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -26,6 +26,18 @@ const GAME_ROOMS = new Set([
   "LowCard 1", "LowCard 2", "Noxxeliverothcifsa",
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRBS"
 ]);
+
+// Simple Game Manager Stub
+class GameManagerStub {
+  constructor() {}
+  masterTick() {}
+  async handleEvent(ws, data) {
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify(["gameLowCardError", "Game not available"])); } catch(e) {}
+    }
+  }
+  async destroy() {}
+}
 
 // ==================== ROOM MANAGER ====================
 class RoomManager {
@@ -168,15 +180,22 @@ export class ChatServer {
       this.rooms.set(name, new RoomManager(name));
     }
     
-    // Init game
-    try {
-      const { LowCardGameManager } = await import("./lowcard.js");
-      this.game = new LowCardGameManager(this);
-    } catch(e) {}
-    
     // Start timers
     this.timer = setInterval(() => this.tick(), CONSTANTS.TICK_INTERVAL_MS);
     this.cleaner = setInterval(() => this.cleanup(), CONSTANTS.CLEANUP_INTERVAL_MS);
+    
+    // Init game (async, but don't await)
+    this.initGame();
+  }
+  
+  async initGame() {
+    try {
+      const { LowCardGameManager } = await import("./lowcard.js");
+      this.game = new LowCardGameManager(this);
+    } catch(e) {
+      console.log("LowCardGameManager not available");
+      this.game = new GameManagerStub();
+    }
   }
   
   tick() {
@@ -200,7 +219,6 @@ export class ChatServer {
     }
     
     // Clean stale users
-    const now = Date.now();
     for (const [name, user] of this.users) {
       if (!user.ws || user.ws.readyState !== 1) {
         this.users.delete(name);
@@ -239,7 +257,7 @@ export class ChatServer {
     this.connections.add(ws);
   }
   
-  // ========== setIdTarget2 LOGIKA TIDAK DIUBAH ==========
+  // setIdTarget2 LOGIKA TIDAK DIUBAH
   async handleSetIdTarget2(ws, userId, isNew) {
     if (!userId || userId.length > CONSTANTS.MAX_USERNAME_LENGTH) {
       this.sendToUser(ws, ["error", "Invalid username"]);
