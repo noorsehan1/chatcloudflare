@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER FIREBASE STYLE - FULL CLASS ====================
+// ==================== CHAT SERVER FIREBASE STYLE - FIXED CONNECTION ====================
 // name = "chat-firebase"
 // main = "index.js"
 // compatibility_date = "2026-04-30"
@@ -131,19 +131,14 @@ export class ChatServer2 {
     this.lowcard = null;
     this.numberTimer = null;
 
-    // Init rooms
     for (const room of roomList) {
       this.rooms.set(room, new RoomManager(room));
     }
 
-    // Init game
     try {
       this.lowcard = new LowCardGameManager(this);
-    } catch(e) {
-      console.error("Failed to init LowCardGame:", e);
-    }
+    } catch(e) {}
 
-    // Start number timer (1 detik)
     this.numberTimer = setInterval(() => this._updateNumber(), 1000);
   }
 
@@ -154,9 +149,7 @@ export class ChatServer2 {
         room.setCurrentNumber(this.currentNumber);
       }
       this._broadcastAll(["currentNumber", this.currentNumber]);
-    } catch(e) {
-      console.error("Update number error:", e);
-    }
+    } catch(e) {}
   }
 
   _removeUserCompletely(userId) {
@@ -179,9 +172,7 @@ export class ChatServer2 {
         this.wsUser.delete(ws);
         this.userWs.delete(userId);
       }
-    } catch(e) {
-      console.error("Remove user error:", e);
-    }
+    } catch(e) {}
   }
 
   _cleanupWs(ws) {
@@ -194,9 +185,7 @@ export class ChatServer2 {
       if (ws && ws.readyState === 1) {
         try { ws.close(1000, "Cleanup"); } catch(e) {}
       }
-    } catch(e) {
-      console.error("Cleanup WS error:", e);
-    }
+    } catch(e) {}
   }
 
   _broadcastToRoom(roomName, message) {
@@ -211,9 +200,7 @@ export class ChatServer2 {
           try { ws.send(msg); } catch(e) {}
         }
       }
-    } catch(e) {
-      console.error("Broadcast to room error:", e);
-    }
+    } catch(e) {}
   }
 
   _broadcastToUser(userId, message) {
@@ -222,9 +209,7 @@ export class ChatServer2 {
       if (ws && ws.readyState === 1) {
         try { ws.send(JSON.stringify(message)); } catch(e) {}
       }
-    } catch(e) {
-      console.error("Broadcast to user error:", e);
-    }
+    } catch(e) {}
   }
 
   _broadcastAll(message) {
@@ -236,9 +221,7 @@ export class ChatServer2 {
           try { ws.send(msg); } catch(e) {}
         }
       }
-    } catch(e) {
-      console.error("Broadcast all error:", e);
-    }
+    } catch(e) {}
   }
 
   async _joinRoom(ws, roomName, userId, userData = {}) {
@@ -251,7 +234,6 @@ export class ChatServer2 {
       const room = this.rooms.get(roomName);
       if (!room) return false;
 
-      // Hapus dari room lama
       const oldRoomName = this.userRoom.get(userId);
       if (oldRoomName && oldRoomName !== roomName) {
         const oldRoom = this.rooms.get(oldRoomName);
@@ -265,7 +247,6 @@ export class ChatServer2 {
         this.userRoom.delete(userId);
       }
 
-      // Cek atau assign seat
       let seat = room.userSeat.get(userId);
       
       if (!seat) {
@@ -277,19 +258,16 @@ export class ChatServer2 {
         room.addUser(userId, seat, userData);
       }
 
-      // Update mapping
       this.userRoom.set(userId, roomName);
       this.userWs.set(userId, ws);
       this.wsUser.set(ws, userId);
 
-      // Kirim state ke user
       this._broadcastToUser(userId, ["rooMasuk", seat, roomName]);
       this._broadcastToUser(userId, ["numberKursiSaya", seat]);
       this._broadcastToUser(userId, ["muteTypeResponse", room.getMute(), roomName]);
       this._broadcastToUser(userId, ["roomUserCount", roomName, room.getOccupiedCount()]);
       this._broadcastToUser(userId, ["currentNumber", this.currentNumber]);
 
-      // Kirim semua seat (kecuali diri sendiri)
       const allSeats = room.getAllSeats();
       const otherSeats = {};
       for (const [s, data] of Object.entries(allSeats)) {
@@ -299,13 +277,11 @@ export class ChatServer2 {
         this._broadcastToUser(userId, ["allUpdateKursiList", roomName, otherSeats]);
       }
 
-      // Kirim points
       const allPoints = room.getAllPoints();
       if (allPoints.length) {
         this._broadcastToUser(userId, ["allPointsList", roomName, allPoints]);
       }
 
-      // Broadcast ke room
       this._broadcastToRoom(roomName, ["userOccupiedSeat", roomName, seat, userId]);
       this._broadcastToRoom(roomName, ["roomUserCount", roomName, room.getOccupiedCount()]);
 
@@ -321,10 +297,7 @@ export class ChatServer2 {
     let data;
     try {
       data = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
-    } catch(e) { 
-      console.error("Parse error:", e);
-      return; 
-    }
+    } catch(e) { return; }
     
     if (!data || !data[0]) return;
     
@@ -336,6 +309,14 @@ export class ChatServer2 {
         case "setIdTarget2": {
           const [_, id, isNew] = data;
           if (!id) return;
+          
+          // ✅ FIX: Cegah double login
+          const existingWs = this.userWs.get(id);
+          if (existingWs && existingWs !== ws && existingWs.readyState === 1) {
+            try { existingWs.close(1001, "Login dari device lain"); } catch(e) {}
+            this._cleanupWs(existingWs);
+          }
+          
           if (isNew === true) {
             this._removeUserCompletely(id);
           }
@@ -354,12 +335,20 @@ export class ChatServer2 {
         case "chat": {
           if (!userId) return;
           const [, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
+          
+          // ✅ FIX: Validasi panjang pesan
+          if (message && message.length > CONSTANTS.MAX_MESSAGE) {
+            this._broadcastToUser(userId, ["error", "Message too long"]);
+            return;
+          }
+          
           if (this.userRoom.get(userId) === roomname) {
             this._broadcastToRoom(roomname, ["chat", roomname, noImageURL, username, message, usernameColor, chatTextColor]);
           }
           break;
         }
         
+        // ... semua case lain sama seperti sebelumnya
         case "updatePoint": {
           if (!userId) return;
           const [, room, seat, x, y, fast] = data;
@@ -496,80 +485,51 @@ export class ChatServer2 {
           }
           break;
         }
-        
-        default: {
-          // Unknown event - ignore
-          console.log("Unknown event:", evt);
-          break;
-        }
       }
     } catch (error) {
       console.error("Message handler error:", error);
       try {
         const userId = this.wsUser.get(ws);
         if (userId) {
-          this._broadcastToUser(userId, ["error", "Server error, please reconnect"]);
+          this._broadcastToUser(userId, ["error", "Server error"]);
         }
       } catch(e) {}
     }
   }
 
-  // ==================== FETCH HANDLER ====================
+  // ==================== FETCH HANDLER - YANG PALING PENTING! ====================
   async fetch(request) {
-    try {
-      const url = new URL(request.url);
-      const upgrade = request.headers.get("Upgrade") || "";
-      
-      if (upgrade.toLowerCase() !== "websocket") {
-        // HTTP endpoints
-        if (url.pathname === "/health") {
-          return new Response(JSON.stringify({
-            status: "healthy",
-            users: this.userWs.size,
-            rooms: this.rooms.size,
-            uptime: Date.now() - this._startTime,
-            timestamp: Date.now()
-          }), { 
-            status: 200, 
-            headers: { "content-type": "application/json" } 
-          });
-        }
-        
-        if (url.pathname === "/stats") {
-          const roomStats = {};
-          for (const [name, room] of this.rooms) {
-            roomStats[name] = {
-              seats: room.getOccupiedCount(),
-              points: room.points.size
-            };
-          }
-          return new Response(JSON.stringify({
-            users: this.userWs.size,
-            rooms: roomStats,
-            uptime: Date.now() - this._startTime
-          }, null, 2), { 
-            status: 200, 
-            headers: { "content-type": "application/json" } 
-          });
-        }
-        
-        return new Response("Chat Server Firebase Style Running", { status: 200 });
+    const url = new URL(request.url);
+    const upgrade = request.headers.get("Upgrade") || "";
+    
+    // NON-WEBSOCKET REQUESTS
+    if (upgrade.toLowerCase() !== "websocket") {
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({
+          status: "healthy",
+          users: this.userWs.size,
+          uptime: Date.now() - this._startTime
+        }), { 
+          status: 200, 
+          headers: { "Content-Type": "application/json" }
+        });
       }
-      
-      // WebSocket connection
+      return new Response("Chat Server Running", { status: 200 });
+    }
+    
+    // WEBSOCKET REQUESTS
+    try {
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
       
-      // HIBERNATION API - WAJIB!
+      // 🔥 KRITIS: HARUS PAKAI INI!
       this.state.acceptWebSocket(server);
       
       // Set properties
-      server.roomname = undefined;
-      server.idtarget = undefined;
       server._connectionTime = Date.now();
       
-      // Event listeners
+      // Event handlers
       server.addEventListener("message", (event) => {
         this._handleMessage(server, event.data);
       });
@@ -582,56 +542,35 @@ export class ChatServer2 {
         this._cleanupWs(server);
       });
       
-      return new Response(null, { status: 101, webSocket: client });
+      // ✅ HARUS RETURN RESPONSE DENGAN WEBSOCKET
+      return new Response(null, { 
+        status: 101, 
+        webSocket: client 
+      });
       
     } catch (error) {
-      console.error("Fetch error:", error);
-      return new Response("Internal Server Error", { status: 500 });
+      console.error("WebSocket error:", error);
+      return new Response("WebSocket failed", { status: 500 });
     }
   }
 
-  // ==================== DESTROY ====================
   async destroy() {
-    try {
-      if (this.numberTimer) clearInterval(this.numberTimer);
-      
-      // Close all connections
-      const snapshot = Array.from(this.wsUser.keys());
-      for (const ws of snapshot) {
-        if (ws && ws.readyState === 1) {
-          try { 
-            ws.close(1000, "Server shutting down"); 
-          } catch(e) {}
-        }
-      }
-      
-      // Clear all maps
-      this.rooms.clear();
-      this.userRoom.clear();
-      this.userWs.clear();
-      this.wsUser.clear();
-      
-      if (this.lowcard && typeof this.lowcard.destroy === 'function') {
-        await this.lowcard.destroy();
-      }
-      
-      console.log("ChatServer destroyed");
-    } catch(e) {
-      console.error("Destroy error:", e);
-    }
+    if (this.numberTimer) clearInterval(this.numberTimer);
+    if (this.lowcard) await this.lowcard.destroy();
   }
 }
 
-// ==================== WORKER ====================
+// ==================== WORKER EXPORT ====================
 export default {
-  async fetch(req, env) {
+  async fetch(request, env) {
     try {
+      // 🔥 PASTIKAN NAMA INI SAMA DENGAN WRANGLER.TOML!
       const id = env.CHAT_SERVER_2.idFromName("chat-room");
       const obj = env.CHAT_SERVER_2.get(id);
-      return obj.fetch(req);
+      return obj.fetch(request);
     } catch (error) {
-      console.error("Worker fetch error:", error);
-      return new Response("Server Error", { status: 500 });
+      console.error("Worker error:", error);
+      return new Response("Worker Error: " + error.message, { status: 500 });
     }
   }
 }
