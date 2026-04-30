@@ -1,6 +1,6 @@
-// ==================== LOWCARDGAMEMANAGER.js ====================
+// ==================== LOWCARDGAMEMANAGER.js - ZERO CRASH (LOGIKA TETAP) ====================
 
-const CONSTANTS = {
+const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 6,
   CLEANUP_INTERVAL_MS: 600000,
@@ -15,7 +15,7 @@ const CONSTANTS = {
   LOCK_TIMEOUT_MS: 5000,
   MAX_GAME_AGE_MS: 6 * 60 * 60 * 1000,
   MAX_RETRY_ATTEMPTS: 3,
-};
+});
 
 export class LowCardGameManager {
   constructor(chatServer) {
@@ -742,6 +742,7 @@ export class LowCardGameManager {
       
       const entries = Array.from(numbers.entries());
       
+      // ========== TAMBAH: CEK TIDAK ADA YANG DRAW ==========
       if (entries.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "No players drew cards, game ended"]);
         if (game.players) game.players.clear();
@@ -755,6 +756,7 @@ export class LowCardGameManager {
         return;
       }
       
+      // ========== TAMBAH: CEK HANYA 1 YANG DRAW ==========
       const submittedPlayers = Array.from(numbers.keys());
       if (submittedPlayers.length === 1 && game.players.size > 1) {
         const winnerId = submittedPlayers[0];
@@ -776,6 +778,7 @@ export class LowCardGameManager {
         return;
       }
       
+      // ========== LOGIKA ASLI TETAP SAMA ==========
       const activePlayers = Array.from(players.keys()).filter(id => 
         eliminated && !eliminated.has(id)
       );
