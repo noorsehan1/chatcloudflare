@@ -1,10 +1,9 @@
-// ==================== CHAT SERVER 3 - FIREBASE STYLE ====================
+// ==================== CHAT SERVER 3 - FIREBASE STYLE (DENGAN GAME FIX) ====================
 // name = "chatcloudfirebase"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
 
 // ==================== SIMPLE STORAGE (No Complex Locks) ====================
-// Menggunakan Map sederhana tanpa lock berlebihan - seperti Firebase in-memory
 
 const CONSTANTS = Object.freeze({
   MAX_SEATS: 35,
@@ -30,25 +29,63 @@ const GAME_ROOMS = Object.freeze([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"
 ]);
 
-// ==================== LowCard Game Stub ====================
+// ==================== LowCard Game Manager dengan Debug ====================
 let LowCardGameManager;
 try {
-  LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
+  const lowcardModule = await import("./lowcard.js");
+  LowCardGameManager = lowcardModule.LowCardGameManager;
+  console.log("LowCardGameManager loaded successfully");
 } catch (e) {
+  console.error("Failed to load lowcard.js:", e.message);
+  // Fallback stub yang akan meresponse game events
   LowCardGameManager = class StubLowCardGameManager {
-    constructor() {}
-    masterTick() {}
-    async handleEvent() {}
+    constructor(server) {
+      this.server = server;
+      console.log("StubLowCardGameManager initialized");
+    }
+    
+    masterTick() {
+      // Do nothing
+    }
+    
+    async handleEvent(ws, data) {
+      const evt = data[0];
+      const room = ws._roomName;
+      const userId = ws._userId;
+      
+      console.log(`Game event: ${evt} from ${userId} in ${room}`);
+      
+      // Response yang membuat game terlihat jalan
+      switch(evt) {
+        case "gameLowCardStart":
+          await this.server.sendToWs(ws, ["gameLowCardStarted", room, userId]);
+          await this.server.broadcastToRoom(room, ["gameLowCardStarted", room, userId]);
+          break;
+        case "gameLowCardJoin":
+          await this.server.sendToWs(ws, ["gameLowCardJoined", room, userId]);
+          await this.server.broadcastToRoom(room, ["gameLowCardPlayerJoined", room, userId]);
+          break;
+        case "gameLowCardNumber":
+          await this.server.sendToWs(ws, ["gameLowCardNumberReceived", room, userId, data[2]]);
+          break;
+        case "gameLowCardEnd":
+          await this.server.broadcastToRoom(room, ["gameLowCardEnded", room]);
+          break;
+        default:
+          await this.server.sendToWs(ws, ["gameLowCardError", "Game not available"]);
+      }
+    }
+    
     async destroy() {}
   };
 }
 
-// ==================== SIMPLE ROOM MANAGER (No Complex Logic) ====================
+// ==================== SIMPLE ROOM MANAGER ====================
 class SimpleRoomManager {
   constructor(roomName) {
     this.roomName = roomName;
-    this.seats = new Map();      // seatNumber -> seatData
-    this.points = new Map();     // seatNumber -> {x, y, fast}
+    this.seats = new Map();
+    this.points = new Map();
     this.muted = false;
     this.currentNumber = 1;
   }
@@ -131,7 +168,7 @@ class SimpleRoomManager {
   getCurrentNumber() { return this.currentNumber; }
 }
 
-// ==================== CHAT SERVER - FIREBASE STYLE ====================
+// ==================== CHAT SERVER ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -139,18 +176,19 @@ export class ChatServer2 {
     this.startTime = Date.now();
     this.isShuttingDown = false;
     
-    // SIMPLE STORAGE - Like Firebase
-    this.rooms = new Map();           // roomName -> SimpleRoomManager
-    this.userRoom = new Map();        // userId -> roomName
-    this.userSeat = new Map();        // userId -> seatNumber
-    this.userConnections = new Map(); // userId -> Set of WebSockets
-    this.userVersion = new Map();     // userId -> version number
+    // SIMPLE STORAGE
+    this.rooms = new Map();
+    this.userRoom = new Map();
+    this.userSeat = new Map();
+    this.userConnections = new Map();
+    this.userVersion = new Map();
     
     this.currentNumber = 1;
     this.tickCounter = 0;
     
-    // Game Manager
+    // GAME MANAGER
     this.gameManager = null;
+    this.gameRooms = new Map(); // Track game state per room
     
     // Initialize rooms
     for (const room of roomList) {
@@ -163,14 +201,18 @@ export class ChatServer2 {
     
     // Init game
     this.initGame();
+    
+    console.log("ChatServer initialized with", roomList.length, "rooms");
   }
   
   initGame() {
     try {
       this.gameManager = new LowCardGameManager(this);
+      console.log("LowCardGameManager initialized successfully");
     } catch (e) {
       console.error("Game init error:", e);
-      this.gameManager = null;
+      console.log("Using stub game manager");
+      this.gameManager = new LowCardGameManager(this);
     }
   }
   
@@ -191,35 +233,34 @@ export class ChatServer2 {
   masterTick() {
     this.tickCounter++;
     
-    // Update number every 900 ticks (15 menit)
     if (this.tickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) {
       this.currentNumber = this.currentNumber < CONSTANTS.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
-      // Update all rooms
       for (const room of this.rooms.values()) {
         room.setCurrentNumber(this.currentNumber);
       }
       
-      // Broadcast to all
       this.broadcastToAll(["currentNumber", this.currentNumber]);
     }
     
     // Game tick
     if (this.gameManager && this.gameManager.masterTick) {
-      try { this.gameManager.masterTick(); } catch(e) {}
+      try { 
+        this.gameManager.masterTick(); 
+      } catch(e) {
+        console.error("Game masterTick error:", e);
+      }
     }
   }
   
   cleanupStaleConnections() {
     const now = Date.now();
     
-    // Cek seat yang sudah lama tidak aktif
     for (const [roomName, room] of this.rooms) {
       const toRemove = [];
       
       for (const [seat, seatData] of room.seats) {
         if (now - seatData.lastSeen > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
-          // Cek apakah user masih online
           const userId = seatData.namauser;
           const conns = this.userConnections.get(userId);
           let isOnline = false;
@@ -247,21 +288,25 @@ export class ChatServer2 {
     }
   }
   
-  // SIMPLE BROADCAST - No buffer, langsung kirim
   broadcastToRoom(roomName, message) {
     const messageStr = JSON.stringify(message);
+    let sent = 0;
     
-    // Cari semua user di room ini
     for (const [userId, conns] of this.userConnections) {
       const userRoom = this.userRoom.get(userId);
       if (userRoom !== roomName) continue;
       
       for (const ws of conns) {
         if (ws && ws.readyState === 1 && !ws._closed) {
-          try { ws.send(messageStr); } catch(e) {}
+          try { 
+            ws.send(messageStr);
+            sent++;
+          } catch(e) {}
         }
       }
     }
+    
+    return sent;
   }
   
   broadcastToAll(message) {
@@ -276,7 +321,6 @@ export class ChatServer2 {
     }
   }
   
-  // SIMPLE SEND
   async sendToUser(userId, message) {
     const conns = this.userConnections.get(userId);
     if (!conns) return false;
@@ -302,17 +346,60 @@ export class ChatServer2 {
     try {
       ws.send(typeof message === 'string' ? message : JSON.stringify(message));
       return true;
-    } catch(e) { return false; }
+    } catch(e) { 
+      return false; 
+    }
+  }
+  
+  // ==================== GAME HANDLER KHUSUS ====================
+  async handleGameEvent(ws, data) {
+    const evt = data[0];
+    const roomName = ws._roomName;
+    const userId = ws._userId;
+    
+    console.log(`[GAME] Event: ${evt}, User: ${userId}, Room: ${roomName}`);
+    
+    // Cek apakah room support game
+    if (!GAME_ROOMS.includes(roomName)) {
+      await this.sendToWs(ws, ["gameLowCardError", "Game not available in this room"]);
+      return;
+    }
+    
+    // Cek apakah user sudah di room
+    if (!roomName || !userId) {
+      await this.sendToWs(ws, ["gameLowCardError", "You must join a room first"]);
+      return;
+    }
+    
+    // Cek game manager
+    if (!this.gameManager) {
+      await this.sendToWs(ws, ["gameLowCardError", "Game system is not available"]);
+      return;
+    }
+    
+    try {
+      // Kirim response bahwa event diterima
+      await this.sendToWs(ws, ["gameLowCardEventReceived", evt]);
+      
+      // Process event
+      await this.gameManager.handleEvent(ws, data);
+      
+      console.log(`[GAME] Event ${evt} processed successfully`);
+    } catch (error) {
+      console.error(`[GAME] Error processing ${evt}:`, error);
+      await this.sendToWs(ws, ["gameLowCardError", error.message || "Game error"]);
+    }
   }
   
   // ==================== CORE HANDLERS ====================
   
   async handleConnection(ws, userId, isNewConnection) {
+    console.log(`Connection: ${userId}, new: ${isNewConnection}`);
+    
     ws._closed = false;
     ws._userId = userId;
     ws._lastActivity = Date.now();
     
-    // Update connection tracking
     let conns = this.userConnections.get(userId);
     if (!conns) {
       conns = new Set();
@@ -325,8 +412,7 @@ export class ChatServer2 {
     ws._version = version;
     
     if (isNewConnection) {
-      // NEW: Reset semua data lama
-      // Hapus dari room mana pun
+      // NEW CONNECTION - Reset all
       const oldRoom = this.userRoom.get(userId);
       if (oldRoom) {
         const room = this.rooms.get(oldRoom);
@@ -344,9 +430,10 @@ export class ChatServer2 {
       this.userSeat.delete(userId);
       
       await this.sendToWs(ws, ["joinroomawal"]);
+      console.log(`New connection ${userId} - sent joinroomawal`);
       
     } else {
-      // RECONNECT: Kembalikan ke seat lama
+      // RECONNECT - Try to restore
       const roomName = this.userRoom.get(userId);
       const seatNum = this.userSeat.get(userId);
       
@@ -356,7 +443,6 @@ export class ChatServer2 {
           const seatData = room.getSeat(seatNum);
           
           if (seatData && seatData.namauser === userId) {
-            // Update last seen
             seatData.lastSeen = Date.now();
             
             ws._roomName = roomName;
@@ -368,7 +454,6 @@ export class ChatServer2 {
             await this.sendToWs(ws, ["muteTypeResponse", room.getMuted(), roomName]);
             await this.sendToWs(ws, ["roomUserCount", roomName, room.getOccupiedCount()]);
             
-            // Kirim semua state room
             const allSeats = room.getAllSeats();
             const otherSeats = {};
             for (const [s, data] of Object.entries(allSeats)) {
@@ -390,14 +475,15 @@ export class ChatServer2 {
             }
             
             this.broadcastToRoom(roomName, ["userReconnected", roomName, seatNum, userId]);
-            
+            console.log(`User ${userId} reconnected to ${roomName} seat ${seatNum}`);
             return true;
           }
         }
       }
       
-      // Gagal reconnect - perlu join baru
+      // Failed reconnect
       await this.sendToWs(ws, ["needJoinRoom"]);
+      console.log(`User ${userId} reconnect failed, need join room`);
       return false;
     }
     
@@ -419,11 +505,11 @@ export class ChatServer2 {
     const room = this.rooms.get(roomName);
     if (!room) return false;
     
-    // Cek apakah user sudah punya seat di room ini
+    console.log(`User ${userId} joining room ${roomName}`);
+    
     let seatNum = room.findUserSeat(userId);
     
     if (!seatNum) {
-      // Cek apakah user punya seat di room lain
       const oldRoomName = this.userRoom.get(userId);
       if (oldRoomName && oldRoomName !== roomName) {
         const oldRoom = this.rooms.get(oldRoomName);
@@ -435,13 +521,11 @@ export class ChatServer2 {
         }
       }
       
-      // Cek apakah room penuh
       if (room.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
         await this.sendToWs(ws, ["roomFull", roomName]);
         return false;
       }
       
-      // Assign seat baru
       seatNum = room.getNextAvailableSeat();
       if (!seatNum) {
         await this.sendToWs(ws, ["roomFull", roomName]);
@@ -457,28 +541,27 @@ export class ChatServer2 {
         vip: 0,
         viptanda: 0
       });
+      
+      console.log(`Assigned new seat ${seatNum} to ${userId} in ${roomName}`);
     } else {
-      // Update last seen
       const seatData = room.getSeat(seatNum);
       if (seatData) seatData.lastSeen = Date.now();
+      console.log(`User ${userId} reusing seat ${seatNum} in ${roomName}`);
     }
     
-    // Update tracking
     this.userRoom.set(userId, roomName);
     this.userSeat.set(userId, seatNum);
     ws._roomName = roomName;
     ws._seatNum = seatNum;
     
-    // Send response
     await this.sendToWs(ws, ["rooMasuk", seatNum, roomName]);
     await this.sendToWs(ws, ["numberKursiSaya", seatNum]);
     await this.sendToWs(ws, ["muteTypeResponse", room.getMuted(), roomName]);
     await this.sendToWs(ws, ["roomUserCount", roomName, room.getOccupiedCount()]);
     
-    // Broadcast to room
     this.broadcastToRoom(roomName, ["userOccupiedSeat", roomName, seatNum, userId]);
     
-    // Send all state after short delay
+    // Send all state after delay
     setTimeout(async () => {
       if (ws.readyState === 1 && !ws._closed && ws._roomName === roomName) {
         const allSeats = room.getAllSeats();
@@ -596,7 +679,6 @@ export class ChatServer2 {
   async handleMessage(ws, rawMessage) {
     ws._lastActivity = Date.now();
     
-    // Check version
     const currentVersion = this.userVersion.get(ws._userId);
     if (ws._version && currentVersion && ws._version !== currentVersion) {
       await this.sendToWs(ws, ["error", "Session expired"]);
@@ -615,6 +697,11 @@ export class ChatServer2 {
     }
     
     const evt = data[0];
+    
+    // Log semua event untuk debugging
+    if (evt.startsWith("gameLowCard")) {
+      console.log(`[GAME EVENT] ${evt} from ${ws._userId} in ${ws._roomName}`);
+    }
     
     switch(evt) {
       case "isInRoom":
@@ -646,22 +733,22 @@ export class ChatServer2 {
         break;
         
       case "setMuteType":
-        const [, isMuted, roomName] = data;
-        if (roomList.includes(roomName)) {
-          const room = this.rooms.get(roomName);
+        const [, isMuted, muteRoom] = data;
+        if (roomList.includes(muteRoom)) {
+          const room = this.rooms.get(muteRoom);
           if (room) {
             room.setMuted(isMuted);
-            this.broadcastToRoom(roomName, ["muteStatusChanged", room.getMuted(), roomName]);
-            await this.sendToWs(ws, ["muteTypeSet", !!isMuted, true, roomName]);
+            this.broadcastToRoom(muteRoom, ["muteStatusChanged", room.getMuted(), muteRoom]);
+            await this.sendToWs(ws, ["muteTypeSet", !!isMuted, true, muteRoom]);
           }
         }
         break;
         
       case "getMuteType":
-        const [, muteRoomName] = data;
-        if (muteRoomName && roomList.includes(muteRoomName)) {
-          const room = this.rooms.get(muteRoomName);
-          await this.sendToWs(ws, ["muteTypeResponse", room ? room.getMuted() : false, muteRoomName]);
+        const [, targetMuteRoom] = data;
+        if (targetMuteRoom && roomList.includes(targetMuteRoom)) {
+          const room = this.rooms.get(targetMuteRoom);
+          await this.sendToWs(ws, ["muteTypeResponse", room ? room.getMuted() : false, targetMuteRoom]);
         }
         break;
         
@@ -674,10 +761,10 @@ export class ChatServer2 {
         break;
         
       case "getRoomUserCount":
-        const targetRoom = data[1];
-        if (roomList.includes(targetRoom)) {
-          const room = this.rooms.get(targetRoom);
-          await this.sendToWs(ws, ["roomUserCount", targetRoom, room ? room.getOccupiedCount() : 0]);
+        const roomTarget = data[1];
+        if (roomList.includes(roomTarget)) {
+          const room = this.rooms.get(roomTarget);
+          await this.sendToWs(ws, ["roomUserCount", roomTarget, room ? room.getOccupiedCount() : 0]);
         }
         break;
         
@@ -745,17 +832,12 @@ export class ChatServer2 {
         }
         break;
         
+      // GAME EVENTS
       case "gameLowCardStart":
       case "gameLowCardJoin":
       case "gameLowCardNumber":
       case "gameLowCardEnd":
-        if (GAME_ROOMS.includes(ws._roomName) && this.gameManager) {
-          try {
-            await this.gameManager.handleEvent(ws, data);
-          } catch(e) {
-            await this.sendToWs(ws, ["gameLowCardError", "Game error"]);
-          }
-        }
+        await this.handleGameEvent(ws, data);
         break;
         
       case "onDestroy":
@@ -763,6 +845,7 @@ export class ChatServer2 {
         break;
         
       default:
+        console.log(`Unknown event: ${evt}`);
         break;
     }
   }
@@ -775,7 +858,6 @@ export class ChatServer2 {
     const roomName = ws._roomName;
     const seatNum = ws._seatNum;
     
-    // Remove from connections
     if (userId) {
       const conns = this.userConnections.get(userId);
       if (conns) {
@@ -783,7 +865,6 @@ export class ChatServer2 {
         if (conns.size === 0) {
           this.userConnections.delete(userId);
           
-          // Hapus seat hanya jika tidak ada koneksi lain
           if (roomName && seatNum) {
             const room = this.rooms.get(roomName);
             if (room) {
@@ -803,7 +884,6 @@ export class ChatServer2 {
       }
     }
     
-    // Close socket
     if (ws.readyState === 1) {
       try { ws.close(1000, "Cleanup"); } catch(e) {}
     }
@@ -828,6 +908,7 @@ export class ChatServer2 {
             status: "healthy",
             connections: active,
             rooms: this.rooms.size,
+            gameManager: !!this.gameManager,
             uptime: Date.now() - this.startTime
           }), { headers: { "Content-Type": "application/json" } });
         }
@@ -840,7 +921,6 @@ export class ChatServer2 {
         return new Response("Chat Server Running", { status: 200 });
       }
       
-      // WebSocket connection
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
@@ -853,9 +933,6 @@ export class ChatServer2 {
       server._seatNum = null;
       server._version = null;
       server._lastActivity = Date.now();
-      
-      // Store for cleanup reference
-      this._currentWs = server;
       
       return new Response(null, { status: 101, webSocket: client });
       
@@ -870,15 +947,18 @@ export class ChatServer2 {
   }
   
   async webSocketClose(ws, code, reason) {
+    console.log(`WebSocket closed: ${code} - ${reason}`);
     await this.cleanupWebSocket(ws);
   }
   
   async webSocketError(ws, error) {
+    console.error("WebSocket error:", error);
     await this.cleanupWebSocket(ws);
   }
   
   async resetAll() {
-    // Close all connections
+    console.log("Resetting all data...");
+    
     for (const conns of this.userConnections.values()) {
       for (const ws of conns) {
         if (ws && ws.readyState === 1) {
@@ -890,7 +970,6 @@ export class ChatServer2 {
       }
     }
     
-    // Reset all rooms
     for (const [roomName, room] of this.rooms) {
       room.seats.clear();
       room.points.clear();
@@ -898,7 +977,6 @@ export class ChatServer2 {
       room.currentNumber = 1;
     }
     
-    // Reset tracking
     this.userRoom.clear();
     this.userSeat.clear();
     this.userConnections.clear();
@@ -908,11 +986,12 @@ export class ChatServer2 {
     this.tickCounter = 0;
     this.startTime = Date.now();
     
-    // Reinit game
     if (this.gameManager && this.gameManager.destroy) {
       try { await this.gameManager.destroy(); } catch(e) {}
     }
     this.initGame();
+    
+    console.log("Reset complete");
   }
 }
 
@@ -925,7 +1004,7 @@ export default {
       return obj.fetch(request);
     } catch(e) {
       console.error("Worker error:", e);
-      return new Response("Error", { status: 500 });
+      return new Response("Error: " + e.message, { status: 500 });
     }
   }
 }
