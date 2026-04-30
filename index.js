@@ -539,83 +539,100 @@ export class ChatServer2 {
   }
 
   // ========== FIXED CLEANUP - HAPUS SEMUA DATA ==========
-  async _cleanupWebSocket(ws) {
-    if (!ws || ws._isClosing) return;
-    ws._isClosing = true;
+ async _cleanupWebSocket(ws) {
+  if (!ws || ws._isClosing) return;
+  ws._isClosing = true;
+  
+  const release = await safeAcquire(this.userLock);
+  if (!release) return;
+  
+  try {
+    const userId = ws.idtarget;
+    const roomName = ws.roomname;
     
-    const release = await safeAcquire(this.userLock);
-    if (!release) return;
+    // 1. HAPUS dari roomClients
+    if (roomName) {
+      const clientSet = this.roomClients.get(roomName);
+      if (clientSet) clientSet.delete(ws);
+    }
     
-    try {
-      const userId = ws.idtarget;
-      const roomName = ws.roomname;
-      
-      if (roomName) {
-        const clientSet = this.roomClients.get(roomName);
-        if (clientSet) clientSet.delete(ws);
-      }
-      
-      if (userId) {
-        const userConns = this.userConnections.get(userId);
-        if (userConns) {
-          userConns.delete(ws);
+    // 2. HAPUS semua data user
+    if (userId) {
+      const userConns = this.userConnections.get(userId);
+      if (userConns) {
+        userConns.delete(ws);
+        
+        // Jika tidak ada koneksi lain, hapus SEMUA data
+        if (userConns.size === 0) {
+          // ✅ HAPUS SEMUA DATA USER
+          this.userConnections.delete(userId);
+          this.userConnectionVersion.delete(userId);
+          this.userLastSeen.delete(userId);
+          this.userToSeat.delete(userId);      // ← KURSI MAPPING
+          this.userCurrentRoom.delete(userId); // ← ROOM USER
           
-          if (userConns.size === 0) {
-            // ✅ HAPUS SEMUA DATA USER
-            this.userConnections.delete(userId);
-            this.userConnectionVersion.delete(userId);
-            this.userLastSeen.delete(userId);
-            this.userToSeat.delete(userId);
-            this.userCurrentRoom.delete(userId);
-            
-            const seatInfo = this.userToSeat.get(userId);
-            if (seatInfo) {
-              const roomManager = this.roomManagers.get(seatInfo.room);
-              if (roomManager) {
-                const seatData = roomManager.getSeat(seatInfo.seat);
-                if (seatData && seatData.namauser === userId) {
-                  roomManager.removeSeat(seatInfo.seat);
-                  release();
-                  this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                  this.updateRoomCount(seatInfo.room);
-                  return;
-                }
+          // ✅ HAPUS KURSI dari RoomManager
+          const seatInfo = this.userToSeat.get(userId);
+          if (seatInfo) {
+            const roomManager = this.roomManagers.get(seatInfo.room);
+            if (roomManager) {
+              const seatData = roomManager.getSeat(seatInfo.seat);
+              if (seatData && seatData.namauser === userId) {
+                roomManager.removeSeat(seatInfo.seat);  // ← HAPUS KURSI
+                
+                // Lepas lock sebelum broadcast
+                release();
+                
+                // ✅ BROADCAST ke semua user di room
+                this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+                this.updateRoomCount(seatInfo.room);
+                
+                // Bersihkan WebSocket
+                this._wsRawSet.delete(ws);
+                try { ws.close(1000, "Cleanup completed"); } catch(e) {}
+                
+                return;  // Selesai
               }
             }
           }
         }
       }
-      
-      this._wsRawSet.delete(ws);
-      
-      if (ws.readyState === 1) {
-        try { ws.close(1000, "Cleanup completed"); } catch(e) {}
-      }
-      
-      ws.roomname = undefined;
-      ws.idtarget = undefined;
-      ws._connectionVersion = undefined;
-      
-    } catch (e) {
-      console.error("Cleanup error:", e);
-      
-      // ✅ ERROR HANDLING - tetap bersihkan data
-      const userId = ws.idtarget;
-      if (userId) {
-        try {
-          this.userConnections.delete(userId);
-          this.userConnectionVersion.delete(userId);
-          this.userLastSeen.delete(userId);
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
-        } catch(e2) {}
-      }
-      this._wsRawSet.delete(ws);
-      
-    } finally {
-      if (release) release();
     }
+    
+    // 3. HAPUS WebSocket dari global set
+    this._wsRawSet.delete(ws);
+    
+    // 4. TUTUP WebSocket jika masih terbuka
+    if (ws.readyState === 1) {
+      try { ws.close(1000, "Cleanup completed"); } catch(e) {}
+    }
+    
+    // 5. RESET properties WebSocket
+    ws.roomname = undefined;
+    ws.idtarget = undefined;
+    ws._connectionVersion = undefined;
+    
+  } catch (e) {
+    console.error("Cleanup error:", e);
+    
+    // ✅ ERROR HANDLING - tetap bersihkan data
+    const userId = ws.idtarget;
+    if (userId) {
+      try {
+        this.userConnections.delete(userId);
+        this.userConnectionVersion.delete(userId);
+        this.userLastSeen.delete(userId);
+        this.userToSeat.delete(userId);
+        this.userCurrentRoom.delete(userId);
+      } catch(e2) {}
+    }
+    this._wsRawSet.delete(ws);
+    
+  } finally {
+    if (release) release();
   }
+}
+
 
   // ========== FIXED CLEANUP ONLY - HAPUS SEMUA DATA ==========
   async _cleanupWebSocketOnly(ws) {
