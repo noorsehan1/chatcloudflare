@@ -365,7 +365,7 @@ class RoomManager {
   }
 }
 
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -1444,8 +1444,8 @@ export class ChatServer {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER.get(chatId);
+      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER_2.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       return chatObj.fetch(req);
     } catch (error) {
