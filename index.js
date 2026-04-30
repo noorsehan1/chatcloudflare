@@ -15,9 +15,7 @@ const CONSTANTS = {
   MAX_NUMBER: 6,
   MAX_USERNAME: 30,
   MAX_MESSAGE: 5000,
-  MAX_GIFT_NAME: 30,
-  // HAPUS! STALE_TIMEOUT: 300000,  // ❌ TIDAK DIPAKAI
-  // HAPUS! GC_INTERVAL: 60000,     // ❌ TIDAK DIPAKAI
+  MAX_GIFT_NAME: 50,
 };
 
 const roomList = Object.freeze([
@@ -32,13 +30,12 @@ const GAME_ROOMS = Object.freeze([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"
 ]);
 
-// ==================== SIMPLE ROOM MANAGER ====================
 class RoomManager {
   constructor(roomName) {
     this.name = roomName;
-    this.seats = new Map();        // seat -> userData
-    this.userSeat = new Map();     // userId -> seat
-    this.points = new Map();       // seat -> point
+    this.seats = new Map();
+    this.userSeat = new Map();
+    this.points = new Map();
     this.mute = false;
     this.currentNumber = 1;
   }
@@ -98,7 +95,7 @@ class RoomManager {
 
   updatePoint(seat, x, y, fast) {
     if (this.seats.has(seat)) {
-      this.points.set(seat, { x, y, fast: fast ? 1 : 0 });
+      this.points.set(seat, { x, y, fast: fast ? 1 : 0, timestamp: Date.now() });
       return true;
     }
     return false;
@@ -112,36 +109,29 @@ class RoomManager {
   getMute() { return this.mute; }
   setCurrentNumber(num) { this.currentNumber = num; }
   getCurrentNumber() { return this.currentNumber; }
-  
-  // ❌ HAPUS cleanupStale() - TIDAK DIPERLUKAN!
 }
 
-// ==================== CHAT SERVER - FIREBASE STYLE ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.rooms = new Map();           // roomName -> RoomManager
-    this.userRoom = new Map();        // userId -> roomName
-    this.userWs = new Map();          // userId -> WebSocket
-    this.wsUser = new Map();          // WebSocket -> userId
+    this.rooms = new Map();
+    this.userRoom = new Map();
+    this.userWs = new Map();
+    this.wsUser = new Map();
     this.currentNumber = 1;
     this.lowcard = null;
     this.numberTimer = null;
-    // ❌ HAPUS gcTimer
 
-    // Init rooms
     for (const room of roomList) {
       this.rooms.set(room, new RoomManager(room));
     }
 
-    // Init game
     try {
       this.lowcard = new LowCardGameManager(this);
     } catch(e) {}
 
-    // Start timer ONLY untuk number tick
-    this.numberTimer = setInterval(() => this._updateNumber(), 1000);
+    this.numberTimer = setInterval(() => this._updateNumber(), 15 * 60 * 1000); // 15 MENIT
   }
 
   _updateNumber() {
@@ -152,9 +142,6 @@ export class ChatServer2 {
     this._broadcastAll(["currentNumber", this.currentNumber]);
   }
 
-  // ❌ HAPUS _gc() - TIDAK DIPERLUKAN!
-
-  // ==================== CORE - HAPUS USER ONLY WHEN WS CLOSES ====================
   _removeUserCompletely(userId) {
     const roomName = this.userRoom.get(userId);
     if (roomName) {
@@ -176,7 +163,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== CLEANUP WEB SOCKET (HANYA SAAT CLOSE/ERROR) ====================
   _cleanupWs(ws) {
     const userId = this.wsUser.get(ws);
     if (userId) {
@@ -188,7 +174,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== BROADCAST ====================
   _broadcastToRoom(roomName, message) {
     const room = this.rooms.get(roomName);
     if (!room) return;
@@ -217,7 +202,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== JOIN ROOM ====================
   async _joinRoom(ws, roomName, userId, userData = {}) {
     if (!roomList.includes(roomName)) {
       this._broadcastToUser(userId, ["error", "Invalid room"]);
@@ -227,7 +211,6 @@ export class ChatServer2 {
     const room = this.rooms.get(roomName);
     if (!room) return false;
 
-    // Hapus dari room lama dulu
     const oldRoomName = this.userRoom.get(userId);
     if (oldRoomName && oldRoomName !== roomName) {
       const oldRoom = this.rooms.get(oldRoomName);
@@ -241,7 +224,6 @@ export class ChatServer2 {
       this.userRoom.delete(userId);
     }
 
-    // Cek apakah user sudah punya seat di room ini
     let seat = room.userSeat.get(userId);
     
     if (!seat) {
@@ -253,19 +235,16 @@ export class ChatServer2 {
       room.addUser(userId, seat, userData);
     }
 
-    // Update mapping
     this.userRoom.set(userId, roomName);
     this.userWs.set(userId, ws);
     this.wsUser.set(ws, userId);
 
-    // Kirim state ke user
     this._broadcastToUser(userId, ["rooMasuk", seat, roomName]);
     this._broadcastToUser(userId, ["numberKursiSaya", seat]);
     this._broadcastToUser(userId, ["muteTypeResponse", room.getMute(), roomName]);
     this._broadcastToUser(userId, ["roomUserCount", roomName, room.getOccupiedCount()]);
     this._broadcastToUser(userId, ["currentNumber", this.currentNumber]);
 
-    // Kirim semua seat (kecuali diri sendiri)
     const allSeats = room.getAllSeats();
     const otherSeats = {};
     for (const [s, data] of Object.entries(allSeats)) {
@@ -275,20 +254,17 @@ export class ChatServer2 {
       this._broadcastToUser(userId, ["allUpdateKursiList", roomName, otherSeats]);
     }
 
-    // Kirim points
     const allPoints = room.getAllPoints();
     if (allPoints.length) {
       this._broadcastToUser(userId, ["allPointsList", roomName, allPoints]);
     }
 
-    // Broadcast ke room
     this._broadcastToRoom(roomName, ["userOccupiedSeat", roomName, seat, userId]);
     this._broadcastToRoom(roomName, ["roomUserCount", roomName, room.getOccupiedCount()]);
 
     return true;
   }
 
-  // ==================== HANDLE MESSAGE ====================
   async _handleMessage(ws, raw) {
     let data;
     try {
@@ -304,11 +280,9 @@ export class ChatServer2 {
       case "setIdTarget2":
         const [_, id, isNew] = data;
         if (!id) return;
-        
         if (isNew === true) {
           this._removeUserCompletely(id);
         }
-        
         this.userWs.set(id, ws);
         this.wsUser.set(ws, id);
         this._broadcastToUser(id, ["joinroomawal"]);
@@ -430,7 +404,6 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== WEB SOCKET EVENT HANDLER ====================
   async fetch(request) {
     const upgrade = request.headers.get("Upgrade") || "";
     
@@ -459,14 +432,12 @@ export class ChatServer2 {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // ==================== DESTROY ====================
   async destroy() {
     if (this.numberTimer) clearInterval(this.numberTimer);
     if (this.lowcard) await this.lowcard.destroy();
   }
 }
 
-// ==================== WORKER ====================
 export default {
   async fetch(req, env) {
     const id = env.CHAT_SERVER_2.idFromName("chat-room");
