@@ -126,6 +126,10 @@ export class LowCardGameManager {
     
     // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
+      // Jika hanya host sendiri, tambah 4 bot
+      if (game.players && game.players.size === 1) {
+        this._addFourMozBots(room);
+      }
       this._closeRegistration(room);
     }
   }
@@ -142,29 +146,27 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // ========== PERBAIKAN BOT DRAW ==========
-    // Bot draw RANDOM dalam 20 detik
-    if (game.useBots && game.botPlayers && game.botPlayers.size > 0) {
+    // ========== BOT DRAW LOGIC ==========
+    if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
       
-      // Dapatkan semua bot yang belum draw
+      // Dapatkan semua bot yang aktif dan belum draw
       const activeBots = Array.from(game.botPlayers.keys())
         .filter(botId => !game.eliminated.has(botId));
-      const alreadyDrawn = Array.from(game.numbers.keys())
-        .filter(id => game.botPlayers.has(id)).length;
-      const remainingBots = activeBots.length - alreadyDrawn;
+      const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
       
-      if (remainingBots > 0 && !game.evaluationLocked) {
-        
-        // Hitung berapa bot yang harus draw di tick ini
-        // Target: semua bot selesai dalam 20 detik (6-7 tick)
+      if (notDrawnBots.length > 0 && timeLeft > 0) {
+        // Hitung berapa bot yang harus draw di tick ini (proporsional)
         const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 3;
         const ticksRemaining = Math.max(1, Math.ceil(timeLeft / 3));
-        const targetDrawnByNow = Math.min(activeBots.length, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 3)) * activeBots.length));
-        const needToDraw = Math.min(remainingBots, Math.max(1, targetDrawnByNow - alreadyDrawn));
+        const totalBots = activeBots.length;
+        const alreadyDrawn = totalBots - notDrawnBots.length;
+        
+        // Target draw berdasarkan waktu
+        const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 3)) * totalBots));
+        const needToDraw = Math.min(notDrawnBots.length, Math.max(1, targetDrawn - alreadyDrawn));
         
         if (needToDraw > 0) {
-          // Pilih bot secara RANDOM untuk draw
-          const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
+          // Pilih bot secara RANDOM
           const shuffled = [...notDrawnBots];
           for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
@@ -174,24 +176,21 @@ export class LowCardGameManager {
           const toDraw = shuffled.slice(0, needToDraw);
           
           for (const botId of toDraw) {
-            if (!game.drawTimeExpired && !game.evaluationLocked && 
-                !game.numbers.has(botId)) {
-              this._handleBotDraw(room, botId);
-            }
+            this._handleBotDraw(room, botId);
           }
         }
       }
     }
     
-    // Cek waktu habis
+    // Cek waktu habis - draw semua bot yang tersisa
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
-      // Draw semua bot yang tersisa
+      // Draw semua bot yang belum draw
       if (game.useBots && game.botPlayers) {
-        const remainingBots = Array.from(game.botPlayers.keys())
+        const notDrawnBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated.has(botId) && !game.numbers.has(botId));
-        for (const botId of remainingBots) {
+        for (const botId of notDrawnBots) {
           this._handleBotDraw(room, botId);
         }
       }
@@ -459,9 +458,6 @@ export class LowCardGameManager {
       const randomSuffix = Math.random().toString(36).substring(7);
       const botId = `BOT_${room}_${i}_${Date.now()}_${randomSuffix}`;
       const botName = mozNames[i];
-      
-      if (!game.players) game.players = new Map();
-      if (!game.botPlayers) game.botPlayers = new Map();
       
       game.players.set(botId, { id: botId, name: botName });
       game.botPlayers.set(botId, botName);
