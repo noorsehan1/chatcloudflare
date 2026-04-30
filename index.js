@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER FIREBASE STYLE - COMPLETELY FIXED ====================
+// ==================== CHAT SERVER FIREBASE STYLE - FULL CLASS ====================
 // name = "chat-firebase"
 // main = "index.js"
 // compatibility_date = "2026-04-30"
@@ -21,7 +21,7 @@ const CONSTANTS = {
   MAX_USERNAME: 30,
   MAX_MESSAGE: 5000,
   MAX_GIFT_NAME: 30,
-  MAX_BROADCAST_SIZE: 1024 * 1024, // 1MB max broadcast
+  MAX_BROADCAST_SIZE: 1024 * 1024,
 };
 
 const roomList = Object.freeze([
@@ -132,8 +132,7 @@ export class ChatServer2 {
     this.lowcard = null;
     this.numberTimer = null;
     this.heartbeatInterval = null;
-    this._isDestroyed = false; // ✅ Flag untuk cegah race condition
-    this._messageListeners = new WeakMap(); // ✅ Track listeners
+    this._isDestroyed = false;
 
     for (const room of roomList) {
       this.rooms.set(room, new RoomManager(room));
@@ -143,7 +142,6 @@ export class ChatServer2 {
       this.lowcard = new LowCardGameManager(this);
     } catch(e) {}
 
-    // ✅ FIX: Timer dengan safety check
     this.numberTimer = setInterval(() => {
       if (!this._isDestroyed) this._updateNumber();
     }, 1000);
@@ -165,7 +163,6 @@ export class ChatServer2 {
 
   _checkDeadConnections() {
     try {
-      // ✅ FIX: Gunakan for-of langsung tanpa snapshot array besar
       for (const [ws, userId] of this.wsUser) {
         if (ws.readyState !== 1) {
           console.log(`Cleaning dead connection for user: ${userId}`);
@@ -206,7 +203,6 @@ export class ChatServer2 {
       }
       this.wsUser.delete(ws);
       
-      // ✅ FIX: Remove event listeners jika memungkinkan
       if (ws._messageHandler) {
         ws.removeEventListener("message", ws._messageHandler);
         ws._messageHandler = null;
@@ -231,7 +227,6 @@ export class ChatServer2 {
       const room = this.rooms.get(roomName);
       if (!room) return;
       
-      // ✅ FIX: Cek ukuran pesan sebelum broadcast
       let msg;
       try {
         msg = JSON.stringify(message);
@@ -244,7 +239,6 @@ export class ChatServer2 {
         return;
       }
       
-      // ✅ FIX: Broadcast tanpa snapshot array
       for (const [userId, ws] of this.userWs) {
         if (this.userRoom.get(userId) === roomName && ws && ws.readyState === 1) {
           try { ws.send(msg); } catch(e) {}
@@ -275,7 +269,6 @@ export class ChatServer2 {
 
   _broadcastAll(message) {
     try {
-      // ✅ FIX: Jangan broadcast pesan besar ke semua user
       let msg;
       try {
         msg = JSON.stringify(message);
@@ -288,7 +281,6 @@ export class ChatServer2 {
         return;
       }
       
-      // ✅ FIX: Broadcast tanpa snapshot array
       for (const [ws, userId] of this.wsUser) {
         if (ws && ws.readyState === 1) {
           try { ws.send(msg); } catch(e) {}
@@ -385,21 +377,79 @@ export class ChatServer2 {
           break;
           
         case "setIdTarget2": {
-          const [_, id, isNew] = data;
+          const [_, id, isNewLogin] = data;
           if (!id) return;
+          
+          console.log(`setIdTarget2: id=${id}, isNewLogin=${isNewLogin}`);
           
           const existingWs = this.userWs.get(id);
           if (existingWs && existingWs !== ws && existingWs.readyState === 1) {
-            try { existingWs.close(1001, "Login dari device lain"); } catch(e) {}
-            this._cleanupWs(existingWs);
+            console.log(`Closing existing connection for ${id}`);
+            try { existingWs.close(1000, "New connection replacing old one"); } catch(e) {}
+            this.wsUser.delete(existingWs);
           }
           
-          if (isNew === true) {
-            this._removeUserCompletely(id);
+          if (isNewLogin === true) {
+            // ===== NEW LOGIN =====
+            console.log(`NEW LOGIN: Removing all data for ${id}`);
+            
+            const oldRoomName = this.userRoom.get(id);
+            if (oldRoomName) {
+              const oldRoom = this.rooms.get(oldRoomName);
+              if (oldRoom) {
+                const oldSeat = oldRoom.removeUser(id);
+                if (oldSeat) {
+                  this._broadcastToRoom(oldRoomName, ["removeKursi", oldRoomName, oldSeat]);
+                  this._broadcastToRoom(oldRoomName, ["roomUserCount", oldRoomName, oldRoom.getOccupiedCount()]);
+                }
+              }
+              this.userRoom.delete(id);
+            }
+            
+            this.userWs.set(id, ws);
+            this.wsUser.set(ws, id);
+            
+            this._broadcastToUser(id, ["joinroomawal"]);
+            
+          } else {
+            // ===== RECONNECT =====
+            console.log(`RECONNECT: Preserving data for ${id}`);
+            
+            this.userWs.set(id, ws);
+            this.wsUser.set(ws, id);
+            
+            const roomName = this.userRoom.get(id);
+            if (roomName) {
+              const room = this.rooms.get(roomName);
+              if (room) {
+                const seat = room.userSeat.get(id);
+                if (seat) {
+                  console.log(`Reconnecting user ${id} to room ${roomName} seat ${seat}`);
+                  
+                  this._broadcastToUser(id, ["rooMasuk", seat, roomName]);
+                  this._broadcastToUser(id, ["numberKursiSaya", seat]);
+                  this._broadcastToUser(id, ["muteTypeResponse", room.getMute(), roomName]);
+                  this._broadcastToUser(id, ["roomUserCount", roomName, room.getOccupiedCount()]);
+                  this._broadcastToUser(id, ["currentNumber", this.currentNumber]);
+                  
+                  const allSeats = room.getAllSeats();
+                  this._broadcastToUser(id, ["allUpdateKursiList", roomName, allSeats]);
+                  
+                  const allPoints = room.getAllPoints();
+                  if (allPoints.length) {
+                    this._broadcastToUser(id, ["allPointsList", roomName, allPoints]);
+                  }
+                  
+                  this._broadcastToRoom(roomName, ["userReconnected", roomName, seat, id]);
+                  
+                  break;
+                }
+              }
+            }
+            
+            console.log(`Reconnect but user ${id} not in any room, sending joinroomawal`);
+            this._broadcastToUser(id, ["joinroomawal"]);
           }
-          this.userWs.set(id, ws);
-          this.wsUser.set(ws, id);
-          this._broadcastToUser(id, ["joinroomawal"]);
           break;
         }
         
@@ -546,6 +596,29 @@ export class ChatServer2 {
           break;
         }
         
+        case "isInRoom": {
+          if (userId) {
+            const roomName = this.userRoom.get(userId);
+            const isInRoom = roomName ? true : false;
+            this._broadcastToUser(userId, ["inRoomStatus", isInRoom]);
+          }
+          break;
+        }
+        
+        case "resetRoom": {
+          const [, roomName] = data;
+          const room = this.rooms.get(roomName);
+          if (room) {
+            for (const [userId, seat] of room.userSeat) {
+              this._broadcastToUser(userId, ["resetRoom", roomName]);
+              this.userRoom.delete(userId);
+            }
+            this.rooms.set(roomName, new RoomManager(roomName));
+            this._broadcastToRoom(roomName, ["resetRoom", roomName]);
+          }
+          break;
+        }
+        
         case "gameLowCardStart":
         case "gameLowCardJoin":
         case "gameLowCardNumber":
@@ -560,6 +633,10 @@ export class ChatServer2 {
           }
           break;
         }
+        
+        default:
+          console.log(`Unknown event: ${evt}`);
+          break;
       }
     } catch (error) {
       console.error("Message handler error:", error);
@@ -583,7 +660,9 @@ export class ChatServer2 {
           status: "healthy",
           users: this.userWs.size,
           uptime: Date.now() - this._startTime,
-          memory: process.memoryUsage ? process.memoryUsage() : null
+          rooms: Object.fromEntries(
+            Array.from(this.rooms.entries()).map(([name, room]) => [name, room.getOccupiedCount()])
+          )
         }), { 
           status: 200, 
           headers: { "Content-Type": "application/json" }
@@ -601,7 +680,6 @@ export class ChatServer2 {
       
       server._connectionTime = Date.now();
       
-      // ✅ FIX: Store handlers untuk cleanup
       const messageHandler = (event) => this._handleMessage(server, event.data);
       const closeHandler = () => this._cleanupWs(server);
       const errorHandler = () => this._cleanupWs(server);
@@ -626,7 +704,6 @@ export class ChatServer2 {
   }
 
   async destroy() {
-    // ✅ FIX: Set flag dan clear semua timer
     this._isDestroyed = true;
     
     if (this.numberTimer) {
@@ -638,7 +715,6 @@ export class ChatServer2 {
       this.heartbeatInterval = null;
     }
     
-    // ✅ FIX: Cleanup semua koneksi
     for (const [ws, userId] of this.wsUser) {
       this._cleanupWs(ws);
     }
