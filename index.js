@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER FIREBASE STYLE - FIXED CONNECTION ====================
+// ==================== CHAT SERVER FIREBASE STYLE - COMPLETELY FIXED ====================
 // name = "chat-firebase"
 // main = "index.js"
 // compatibility_date = "2026-04-30"
@@ -21,6 +21,7 @@ const CONSTANTS = {
   MAX_USERNAME: 30,
   MAX_MESSAGE: 5000,
   MAX_GIFT_NAME: 30,
+  MAX_BROADCAST_SIZE: 1024 * 1024, // 1MB max broadcast
 };
 
 const roomList = Object.freeze([
@@ -117,7 +118,7 @@ class RoomManager {
   getCurrentNumber() { return this.currentNumber; }
 }
 
-// ==================== CHAT SERVER ====================
+// ==================== DURABLE OBJECT ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -130,6 +131,9 @@ export class ChatServer2 {
     this.currentNumber = 1;
     this.lowcard = null;
     this.numberTimer = null;
+    this.heartbeatInterval = null;
+    this._isDestroyed = false; // ✅ Flag untuk cegah race condition
+    this._messageListeners = new WeakMap(); // ✅ Track listeners
 
     for (const room of roomList) {
       this.rooms.set(room, new RoomManager(room));
@@ -139,7 +143,14 @@ export class ChatServer2 {
       this.lowcard = new LowCardGameManager(this);
     } catch(e) {}
 
-    this.numberTimer = setInterval(() => this._updateNumber(), 1000);
+    // ✅ FIX: Timer dengan safety check
+    this.numberTimer = setInterval(() => {
+      if (!this._isDestroyed) this._updateNumber();
+    }, 1000);
+    
+    this.heartbeatInterval = setInterval(() => {
+      if (!this._isDestroyed) this._checkDeadConnections();
+    }, 30000);
   }
 
   _updateNumber() {
@@ -149,6 +160,18 @@ export class ChatServer2 {
         room.setCurrentNumber(this.currentNumber);
       }
       this._broadcastAll(["currentNumber", this.currentNumber]);
+    } catch(e) {}
+  }
+
+  _checkDeadConnections() {
+    try {
+      // ✅ FIX: Gunakan for-of langsung tanpa snapshot array besar
+      for (const [ws, userId] of this.wsUser) {
+        if (ws.readyState !== 1) {
+          console.log(`Cleaning dead connection for user: ${userId}`);
+          this._cleanupWs(ws);
+        }
+      }
     } catch(e) {}
   }
 
@@ -182,6 +205,21 @@ export class ChatServer2 {
         this._removeUserCompletely(userId);
       }
       this.wsUser.delete(ws);
+      
+      // ✅ FIX: Remove event listeners jika memungkinkan
+      if (ws._messageHandler) {
+        ws.removeEventListener("message", ws._messageHandler);
+        ws._messageHandler = null;
+      }
+      if (ws._closeHandler) {
+        ws.removeEventListener("close", ws._closeHandler);
+        ws._closeHandler = null;
+      }
+      if (ws._errorHandler) {
+        ws.removeEventListener("error", ws._errorHandler);
+        ws._errorHandler = null;
+      }
+      
       if (ws && ws.readyState === 1) {
         try { ws.close(1000, "Cleanup"); } catch(e) {}
       }
@@ -193,9 +231,21 @@ export class ChatServer2 {
       const room = this.rooms.get(roomName);
       if (!room) return;
       
-      const msg = JSON.stringify(message);
-      const snapshot = Array.from(this.userWs.entries());
-      for (const [userId, ws] of snapshot) {
+      // ✅ FIX: Cek ukuran pesan sebelum broadcast
+      let msg;
+      try {
+        msg = JSON.stringify(message);
+        if (msg.length > CONSTANTS.MAX_BROADCAST_SIZE) {
+          console.error(`Message too large: ${msg.length} bytes`);
+          return;
+        }
+      } catch(e) {
+        console.error("Failed to stringify message:", e);
+        return;
+      }
+      
+      // ✅ FIX: Broadcast tanpa snapshot array
+      for (const [userId, ws] of this.userWs) {
         if (this.userRoom.get(userId) === roomName && ws && ws.readyState === 1) {
           try { ws.send(msg); } catch(e) {}
         }
@@ -207,16 +257,39 @@ export class ChatServer2 {
     try {
       const ws = this.userWs.get(userId);
       if (ws && ws.readyState === 1) {
-        try { ws.send(JSON.stringify(message)); } catch(e) {}
+        let msg;
+        try {
+          msg = JSON.stringify(message);
+          if (msg.length > CONSTANTS.MAX_BROADCAST_SIZE) {
+            console.error(`Message too large for user ${userId}`);
+            return;
+          }
+        } catch(e) {
+          console.error("Failed to stringify message for user:", e);
+          return;
+        }
+        try { ws.send(msg); } catch(e) {}
       }
     } catch(e) {}
   }
 
   _broadcastAll(message) {
     try {
-      const msg = JSON.stringify(message);
-      const snapshot = Array.from(this.wsUser.keys());
-      for (const ws of snapshot) {
+      // ✅ FIX: Jangan broadcast pesan besar ke semua user
+      let msg;
+      try {
+        msg = JSON.stringify(message);
+        if (msg.length > CONSTANTS.MAX_BROADCAST_SIZE) {
+          console.error(`Broadcast message too large: ${msg.length} bytes`);
+          return;
+        }
+      } catch(e) {
+        console.error("Failed to stringify broadcast:", e);
+        return;
+      }
+      
+      // ✅ FIX: Broadcast tanpa snapshot array
+      for (const [ws, userId] of this.wsUser) {
         if (ws && ws.readyState === 1) {
           try { ws.send(msg); } catch(e) {}
         }
@@ -306,11 +379,15 @@ export class ChatServer2 {
       const userId = this.wsUser.get(ws);
       
       switch (evt) {
+        case "ping":
+        case "heartbeat":
+          this._broadcastToUser(userId, ["pong"]);
+          break;
+          
         case "setIdTarget2": {
           const [_, id, isNew] = data;
           if (!id) return;
           
-          // ✅ FIX: Cegah double login
           const existingWs = this.userWs.get(id);
           if (existingWs && existingWs !== ws && existingWs.readyState === 1) {
             try { existingWs.close(1001, "Login dari device lain"); } catch(e) {}
@@ -336,7 +413,6 @@ export class ChatServer2 {
           if (!userId) return;
           const [, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
           
-          // ✅ FIX: Validasi panjang pesan
           if (message && message.length > CONSTANTS.MAX_MESSAGE) {
             this._broadcastToUser(userId, ["error", "Message too long"]);
             return;
@@ -348,7 +424,6 @@ export class ChatServer2 {
           break;
         }
         
-        // ... semua case lain sama seperti sebelumnya
         case "updatePoint": {
           if (!userId) return;
           const [, room, seat, x, y, fast] = data;
@@ -497,18 +572,18 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== FETCH HANDLER - YANG PALING PENTING! ====================
+  // ==================== FETCH HANDLER ====================
   async fetch(request) {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade") || "";
     
-    // NON-WEBSOCKET REQUESTS
     if (upgrade.toLowerCase() !== "websocket") {
       if (url.pathname === "/health") {
         return new Response(JSON.stringify({
           status: "healthy",
           users: this.userWs.size,
-          uptime: Date.now() - this._startTime
+          uptime: Date.now() - this._startTime,
+          memory: process.memoryUsage ? process.memoryUsage() : null
         }), { 
           status: 200, 
           headers: { "Content-Type": "application/json" }
@@ -517,32 +592,28 @@ export class ChatServer2 {
       return new Response("Chat Server Running", { status: 200 });
     }
     
-    // WEBSOCKET REQUESTS
     try {
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
       
-      // 🔥 KRITIS: HARUS PAKAI INI!
       this.state.acceptWebSocket(server);
       
-      // Set properties
       server._connectionTime = Date.now();
       
-      // Event handlers
-      server.addEventListener("message", (event) => {
-        this._handleMessage(server, event.data);
-      });
+      // ✅ FIX: Store handlers untuk cleanup
+      const messageHandler = (event) => this._handleMessage(server, event.data);
+      const closeHandler = () => this._cleanupWs(server);
+      const errorHandler = () => this._cleanupWs(server);
       
-      server.addEventListener("close", () => {
-        this._cleanupWs(server);
-      });
+      server._messageHandler = messageHandler;
+      server._closeHandler = closeHandler;
+      server._errorHandler = errorHandler;
       
-      server.addEventListener("error", () => {
-        this._cleanupWs(server);
-      });
+      server.addEventListener("message", messageHandler);
+      server.addEventListener("close", closeHandler);
+      server.addEventListener("error", errorHandler);
       
-      // ✅ HARUS RETURN RESPONSE DENGAN WEBSOCKET
       return new Response(null, { 
         status: 101, 
         webSocket: client 
@@ -555,8 +626,27 @@ export class ChatServer2 {
   }
 
   async destroy() {
-    if (this.numberTimer) clearInterval(this.numberTimer);
-    if (this.lowcard) await this.lowcard.destroy();
+    // ✅ FIX: Set flag dan clear semua timer
+    this._isDestroyed = true;
+    
+    if (this.numberTimer) {
+      clearInterval(this.numberTimer);
+      this.numberTimer = null;
+    }
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    
+    // ✅ FIX: Cleanup semua koneksi
+    for (const [ws, userId] of this.wsUser) {
+      this._cleanupWs(ws);
+    }
+    
+    if (this.lowcard) {
+      await this.lowcard.destroy();
+      this.lowcard = null;
+    }
   }
 }
 
@@ -564,13 +654,12 @@ export class ChatServer2 {
 export default {
   async fetch(request, env) {
     try {
-      // 🔥 PASTIKAN NAMA INI SAMA DENGAN WRANGLER.TOML!
       const id = env.CHAT_SERVER_2.idFromName("chat-room");
-      const obj = env.CHAT_SERVER_2.get(id);
+      const obj = await env.CHAT_SERVER_2.get(id);
       return obj.fetch(request);
     } catch (error) {
-      console.error("Worker error:", error);
-      return new Response("Worker Error: " + error.message, { status: 500 });
+      console.error("Worker fetch error:", error);
+      return new Response("Server Error: " + error.message, { status: 500 });
     }
   }
 }
