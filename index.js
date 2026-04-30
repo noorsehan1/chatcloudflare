@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FINAL CLEAN ====================
+// ==================== CHAT SERVER - FINAL (1 TIMER ONLY) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -18,8 +18,8 @@ try {
 }
 
 const CONSTANTS = Object.freeze({
-  MASTER_TICK_INTERVAL_MS: 3000,
-  NUMBER_TICK_INTERVAL_TICKS: 300,
+  MASTER_TICK_INTERVAL_MS: 3000,        // 1 TIMER SAJA: 3 detik
+  NUMBER_TICK_COUNT: 300,               // 300 tick = 15 menit (300 * 3 detik = 900 detik = 15 menit)
   MAX_GLOBAL_CONNECTIONS: 500,
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
@@ -365,7 +365,7 @@ class RoomManager {
   }
 }
 
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -389,6 +389,7 @@ export class ChatServer2 {
 
     this.currentNumber = 1;
     this.maxNumber = CONSTANTS.MAX_NUMBER;
+    this._masterTickCounter = 0;
 
     this.chatBuffer = new GlobalChatBuffer();
     this.chatBuffer.setFlushCallback((room, msg) => this._sendDirectToRoom(room, msg));
@@ -421,7 +422,6 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
 
-    this._masterTickCounter = 0;
     this._masterTimer = null;
     this._startMasterTimer();
   }
@@ -430,8 +430,6 @@ export class ChatServer2 {
     if (!ws) return;
     if (ws._isCleaningUp) return;
     ws._isCleaningUp = true;
-    
-    console.log(`Force cleaning up: ${ws.idtarget}`);
     
     const release = await safeAcquire(this.userLock);
     
@@ -442,9 +440,7 @@ export class ChatServer2 {
       
       if (userId) {
         const seatInfo = this.userToSeat.get(userId);
-        if (seatInfo) {
-          seatNumber = seatInfo.seat;
-        }
+        if (seatInfo) seatNumber = seatInfo.seat;
       }
       
       if (roomName) {
@@ -458,8 +454,6 @@ export class ChatServer2 {
           userConns.delete(ws);
           
           if (userConns.size === 0) {
-            console.log(`No more connections for ${userId}, removing all data`);
-            
             this.userConnections.delete(userId);
             this.userConnectionVersion.delete(userId);
             this.userLastSeen.delete(userId);
@@ -470,8 +464,6 @@ export class ChatServer2 {
                 const seatData = roomManager.getSeat(seatNumber);
                 if (seatData && seatData.namauser === userId) {
                   roomManager.removeSeat(seatNumber);
-                  console.log(`Removed seat ${seatNumber} from room ${roomName}`);
-                  
                   if (release) {
                     this.broadcastToRoom(roomName, ["removeKursi", roomName, seatNumber]);
                     this.updateRoomCount(roomName);
@@ -497,8 +489,6 @@ export class ChatServer2 {
       ws._connectionVersion = undefined;
       ws._isClosing = true;
       
-      console.log(`Cleanup complete for ${userId}`);
-      
     } catch (e) {
       console.error("Force cleanup error:", e);
     } finally {
@@ -521,18 +511,58 @@ export class ChatServer2 {
     try {
       this._masterTickCounter++;
 
-      if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) {
+      // 1. NUMBER TICK (setiap 300 tick = 15 menit)
+      if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_COUNT === 0) {
         await this._handleNumberTick();
       }
 
+      // 2. GAME TICK (setiap tick)
       if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
         try { this.lowcard.masterTick(); } catch(e) {}
       }
+      
+      // 3. GAME TIME NOTIFICATION (dari tick)
+      await this._handleGameTimeTick();
+      
     } catch (error) {
       console.error("Master tick error:", error);
     } finally {
       release();
     }
+  }
+
+  async _handleGameTimeTick() {
+    try {
+      if (!this.lowcard || !this.lowcard.activeGames) return;
+      
+      for (const [room, game] of this.lowcard.activeGames) {
+        if (!game || !game._isActive) continue;
+        
+        let timeToSend = null;
+        
+        if (game._phase === 'registration') {
+          // Notifikasi di 20 dan 5
+          if (game.registrationTimeLeft === 20 || game.registrationTimeLeft === 5) {
+            timeToSend = game.registrationTimeLeft;
+          }
+          if (game.registrationTimeLeft === 0 && game.registrationOpen) {
+            this.broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+          }
+        } else if (game._phase === 'draw') {
+          // Notifikasi di 20 dan 5
+          if (game.drawTimeLeft === 20 || game.drawTimeLeft === 5) {
+            timeToSend = game.drawTimeLeft;
+          }
+          if (game.drawTimeLeft === 0 && !game.drawTimeExpired) {
+            this.broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+          }
+        }
+        
+        if (timeToSend !== null) {
+          this.broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeToSend}s`]);
+        }
+      }
+    } catch (e) {}
   }
 
   async _handleNumberTick() {
@@ -639,8 +669,6 @@ export class ChatServer2 {
   }
 
   async handleReconnect(ws, userId) {
-    console.log(`Handling reconnect for user: ${userId}`);
-    
     const release = await safeAcquire(this.userLock);
     if (!release) {
       await this.safeSend(ws, ["error", "Server busy, please retry"]);
@@ -722,13 +750,11 @@ export class ChatServer2 {
             
             this.broadcastToRoom(room, ["userReconnected", room, seat, userId]);
             
-            console.log(`User ${userId} reconnected to room ${room} seat ${seat}`);
             return true;
           }
         }
       }
       
-      console.log(`User ${userId} has no seat, need to join room`);
       await this.safeSend(ws, ["needJoinRoom"]);
       
       ws.idtarget = userId;
@@ -828,9 +854,7 @@ export class ChatServer2 {
       }
       
       const roomManager = this.roomManagers.get(room);
-      if (!roomManager) {
-        return false;
-      }
+      if (!roomManager) return false;
 
       let assignedSeat = null;
       for (const [seat, seatData] of roomManager.seats) {
@@ -1420,8 +1444,8 @@ export class ChatServer2 {
 export default {
   async fetch(req, env) {
     try {
-      const chatId = env.CHAT_SERVER_2.idFromName("chat-room");
-      const chatObj = env.CHAT_SERVER_2.get(chatId);
+      const chatId = env.CHAT_SERVER.idFromName("chat-room");
+      const chatObj = env.CHAT_SERVER.get(chatId);
       if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return chatObj.fetch(req);
       return chatObj.fetch(req);
     } catch (error) {
