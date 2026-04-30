@@ -1,15 +1,15 @@
-// ==================== LOWCARDGAMEMANAGER.js ====================
+// ==================== LOWCARDGAMEMANAGER.js - OPTIMIZED FOR 3s TICK ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 6,
-  CLEANUP_INTERVAL_MS: 600000,
-  REGISTRATION_TIME: 20,
-  DRAW_TIME: 20,
+  CLEANUP_INTERVAL_MS: 180000,        // 3 menit (dari 10 menit)
+  REGISTRATION_TIME: 20,               // 20 detik
+  DRAW_TIME: 20,                       // 20 detik
   BOT_DRAW_MIN_SECONDS: 2,
   BOT_DRAW_MAX_SECONDS: 10,
-  MASTER_TICK_INTERVAL_MS: 1000,
-  EVALUATION_DELAY_MS: 3000,
+  MASTER_TICK_INTERVAL_MS: 3000,       // 3 detik (sinkron dengan ChatServer)
+  EVALUATION_DELAY_MS: 3000,           // 3 detik
   MAX_EVALUATION_TIME_MS: 10000,
   MAX_DRAW_WAIT_MS: 30000,
   LOCK_TIMEOUT_MS: 5000,
@@ -352,7 +352,7 @@ export class LowCardGameManager {
         registrationTimeLeft: CONSTANTS.REGISTRATION_TIME,
         drawTimeLeft: CONSTANTS.DRAW_TIME,
         hostId: ws.idtarget,
-        hostName: ws.idtarget,
+        hostName: ws.username || ws.idtarget,
         useBots: false,
         evaluationLocked: false,
         drawTimeExpired: false,
@@ -364,10 +364,11 @@ export class LowCardGameManager {
         _evalTimeout: null,
         _evalStartTime: null,
         drawStartTime: null,
-        _evalScheduled: false
+        _evalScheduled: false,
+        _registrationStartTime: Date.now()
       };
 
-      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.idtarget });
+      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
       this.activeGames.set(room, game);
       this._stats.totalGamesStarted++;
       
@@ -393,10 +394,14 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
+    // Hitung sisa waktu REAL berdasarkan waktu mulai
+    const elapsed = (Date.now() - (game._registrationStartTime || Date.now())) / 1000;
+    const timeLeft = Math.max(0, Math.ceil(CONSTANTS.REGISTRATION_TIME - elapsed));
+    
     const timesToNotify = [20, 15, 10, 5, 0];
     
-    if (timesToNotify.includes(game.registrationTimeLeft)) {
-      if (game.registrationTimeLeft === 0) {
+    if (timesToNotify.includes(timeLeft)) {
+      if (timeLeft === 0) {
         this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
         if (game.players && game.players.size === 1) {
           this._addFourMozBots(room);
@@ -404,27 +409,31 @@ export class LowCardGameManager {
         this._closeRegistration(room);
         return;
       } else {
-        this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.registrationTimeLeft}s`]);
+        if (timeLeft !== game.registrationTimeLeft) {
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        }
       }
     }
     
-    if (game.registrationTimeLeft > 0) {
-      game.registrationTimeLeft--;
-    }
+    game.registrationTimeLeft = timeLeft;
   }
 
   _handleDrawTick(game, room) {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
-    const timesToNotify = [20, 15, 10, 5, 0];
+    // Hitung sisa waktu REAL untuk draw
+    const elapsed = (Date.now() - (game.drawStartTime || Date.now())) / 1000;
+    const timeLeft = Math.max(0, Math.ceil(CONSTANTS.DRAW_TIME - elapsed));
 
     if (game.drawStartTime === null && game._phase === 'draw') {
       game.drawStartTime = Date.now();
     }
 
-    if (timesToNotify.includes(game.drawTimeLeft)) {
-      if (game.drawTimeLeft === 0) {
+    const timesToNotify = [20, 15, 10, 5, 0];
+
+    if (timesToNotify.includes(timeLeft)) {
+      if (timeLeft === 0) {
         if (game.drawTimeExpired) return;
         
         this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
@@ -441,16 +450,14 @@ export class LowCardGameManager {
         this._scheduleEvaluation(room, game);
         return;
       } else {
-        if (game.drawTimeLeft !== CONSTANTS.DRAW_TIME || game._hasBroadcastInitial !== true) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${game.drawTimeLeft}s`]);
+        if (timeLeft !== game.drawTimeLeft || !game._hasBroadcastInitial) {
+          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
         }
         game._hasBroadcastInitial = true;
       }
     }
 
-    if (game.drawTimeLeft > 0) {
-      game.drawTimeLeft--;
-    }
+    game.drawTimeLeft = timeLeft;
 
     if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
       const toDraw = [];
@@ -624,8 +631,8 @@ export class LowCardGameManager {
         return;
       }
 
-      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.idtarget });
-      this._safeBroadcast(room, ["gameLowCardJoin", ws.idtarget, game.betAmount]);
+      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
+      this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
       
     } catch (e) {
       this._logError(`JoinGame error: ${e.message}`);
