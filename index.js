@@ -1,8 +1,22 @@
-// ==================== CHAT SERVER - SIMPLE & WORKING ====================
+// ==================== CHAT SERVER - FIREBASE SIMPLE STYLE ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
 
+// ==================== SIMPLE GAME IMPORT ====================
+let LowCardGameManager;
+try {
+  LowCardGameManager = (await import("./lowcard.js")).LowCardGameManager;
+} catch (e) {
+  LowCardGameManager = class Stub {
+    constructor() {}
+    masterTick() {}
+    async handleEvent() {}
+    async destroy() {}
+  };
+}
+
+// ==================== CONSTANTS ====================
 const CONSTANTS = {
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
@@ -12,7 +26,8 @@ const CONSTANTS = {
   MAX_GLOBAL_CONNECTIONS: 2000,
   TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL: 900,
-  CLEANUP_INTERVAL_MS: 60000
+  CLEANUP_INTERVAL_MS: 60000,
+  STALE_TIMEOUT_MS: 300000
 };
 
 const roomList = [
@@ -27,7 +42,7 @@ const GAME_ROOMS = new Set([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"
 ]);
 
-// ==================== ROOM MANAGER ====================
+// ==================== SIMPLE ROOM MANAGER ====================
 class RoomManager {
   constructor(name) {
     this.name = name;
@@ -44,9 +59,9 @@ class RoomManager {
     return null;
   }
 
-  addSeat(seat, username) {
+  addSeat(seat, userId) {
     this.seats.set(seat, {
-      namauser: username,
+      namauser: userId,
       noimageUrl: "",
       color: "",
       itembawah: 0,
@@ -116,9 +131,9 @@ class RoomManager {
     return this.seats.size;
   }
 
-  findSeatByUser(username) {
+  findSeatByUser(userId) {
     for (const [seat, data] of this.seats) {
-      if (data.namauser === username) return seat;
+      if (data.namauser === userId) return seat;
     }
     return null;
   }
@@ -141,7 +156,7 @@ class RoomManager {
   }
 }
 
-// ==================== CHAT SERVER ====================
+// ==================== FIREBASE STYLE CHAT SERVER ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -149,50 +164,36 @@ export class ChatServer2 {
     this.startTime = Date.now();
     this.isShuttingDown = false;
     
-    this.users = new Map();
-    this.rooms = new Map();
-    this.connections = new Set();
+    // Simple data structures
+    this.users = new Map();        // userId -> { ws, room, seat }
+    this.rooms = new Map();        // roomName -> RoomManager
+    this.connections = new Set();  // all WebSockets
     
     this.currentNumber = 1;
     this.tickCount = 0;
     
     this.timer = null;
     this.cleaner = null;
-    
     this.game = null;
     
+    // Initialize rooms
     for (const name of roomList) {
       this.rooms.set(name, new RoomManager(name));
     }
     
-    this.startTimers();
-    this.initGame();
-  }
-  
-  startTimers() {
-    if (this.timer) clearInterval(this.timer);
-    if (this.cleaner) clearInterval(this.cleaner);
+    // Start timers
+    this.timer = setInterval(() => this.tick(), CONSTANTS.TICK_INTERVAL_MS);
+    this.cleaner = setInterval(() => this.cleanup(), CONSTANTS.CLEANUP_INTERVAL_MS);
     
-    this.timer = setInterval(() => {
-      try { this.tick(); } catch(e) { console.error("Tick error:", e); }
-    }, CONSTANTS.TICK_INTERVAL_MS);
-    
-    this.cleaner = setInterval(() => {
-      try { this.cleanup(); } catch(e) { console.error("Cleanup error:", e); }
-    }, CONSTANTS.CLEANUP_INTERVAL_MS);
-  }
-  
-  async initGame() {
+    // Load game
     try {
-      const { LowCardGameManager } = await import("./lowcard.js");
       this.game = new LowCardGameManager(this);
-      console.log("✅ Game loaded");
     } catch(e) {
-      console.log("❌ Game not available:", e.message);
       this.game = null;
     }
   }
   
+  // ==================== TICK ====================
   tick() {
     if (this.isShuttingDown) return;
     
@@ -200,7 +201,7 @@ export class ChatServer2 {
     if (this.tickCount % CONSTANTS.NUMBER_TICK_INTERVAL === 0) {
       this.currentNumber = this.currentNumber < CONSTANTS.MAX_NUMBER ? this.currentNumber + 1 : 1;
       for (const room of this.rooms.values()) {
-        try { room.setNumber(this.currentNumber); } catch(e) {}
+        room.setNumber(this.currentNumber);
       }
       this.broadcastAll(["currentNumber", this.currentNumber]);
     }
@@ -210,33 +211,39 @@ export class ChatServer2 {
     }
   }
   
+  // ==================== CLEANUP ====================
   cleanup() {
-    const deadConns = [];
+    const now = Date.now();
+    
+    // Clean dead connections
     for (const ws of this.connections) {
-      if (!ws || ws.readyState !== 1) {
-        deadConns.push(ws);
+      if (ws.readyState !== 1) {
+        this.connections.delete(ws);
       }
-    }
-    for (const ws of deadConns) {
-      this.connections.delete(ws);
     }
     
-    const deadUsers = [];
-    for (const [name, user] of this.users) {
+    // Clean stale users (no connection)
+    for (const [userId, user] of this.users) {
       if (!user.ws || user.ws.readyState !== 1) {
-        deadUsers.push(name);
+        // Remove from seat first
+        if (user.room && user.seat) {
+          const room = this.rooms.get(user.room);
+          if (room) {
+            room.removeSeat(user.seat);
+            this.broadcastRoom(user.room, ["removeKursi", user.room, user.seat]);
+            this.broadcastRoom(user.room, ["roomUserCount", user.room, room.getCount()]);
+          }
+        }
+        this.users.delete(userId);
       }
-    }
-    for (const name of deadUsers) {
-      this.users.delete(name);
     }
   }
   
+  // ==================== BROADCAST ====================
   broadcastRoom(room, msg) {
     const msgStr = JSON.stringify(msg);
-    const snapshot = [...this.connections];
-    for (const ws of snapshot) {
-      if (ws && ws.room === room && ws.readyState === 1 && !ws._closing) {
+    for (const ws of this.connections) {
+      if (ws.room === room && ws.readyState === 1) {
         try { ws.send(msgStr); } catch(e) {}
       }
     }
@@ -244,16 +251,15 @@ export class ChatServer2 {
   
   broadcastAll(msg) {
     const msgStr = JSON.stringify(msg);
-    const snapshot = [...this.connections];
-    for (const ws of snapshot) {
-      if (ws && ws.readyState === 1 && !ws._closing) {
+    for (const ws of this.connections) {
+      if (ws.readyState === 1) {
         try { ws.send(msgStr); } catch(e) {}
       }
     }
   }
   
   async safeSend(ws, msg) {
-    if (!ws || ws.readyState !== 1 || ws._closing) return false;
+    if (!ws || ws.readyState !== 1) return false;
     try {
       ws.send(JSON.stringify(msg));
       return true;
@@ -262,33 +268,23 @@ export class ChatServer2 {
     }
   }
   
+  // ==================== CONNECTION ====================
   async handleConnect(ws) {
-    if (!ws || this.isShuttingDown) return;
-    
-    ws.username = null;
+    ws.userId = null;
     ws.room = null;
     ws.seat = null;
-    ws.idtarget = null;
-    ws._closing = false;
-    
-    // FOR GAME COMPATIBILITY
-    Object.defineProperty(ws, 'roomname', {
-      get: () => ws.room,
-      set: (val) => { ws.room = val; }
-    });
-    
     this.connections.add(ws);
   }
   
+  // ==================== LOGIN ====================
   async handleSetIdTarget2(ws, userId, isNew) {
-    if (!ws || ws._closing) return;
-    
     if (!userId || userId.length > CONSTANTS.MAX_USERNAME_LENGTH) {
       this.safeSend(ws, ["error", "Invalid username"]);
-      try { ws.close(); } catch(e) {}
+      ws.close();
       return;
     }
     
+    // Kick old connection
     const old = this.users.get(userId);
     if (old && old.ws && old.ws.readyState === 1 && old.ws !== ws) {
       try {
@@ -297,22 +293,23 @@ export class ChatServer2 {
       } catch(e) {}
     }
     
-    this.users.set(userId, { ws, room: null, seat: null, lastSeen: Date.now() });
-    ws.username = userId;
-    ws.idtarget = userId;
+    // Register
+    this.users.set(userId, { ws, room: null, seat: null });
+    ws.userId = userId;
     
     this.safeSend(ws, ["loginOk", userId]);
     
     if (isNew) {
       this.safeSend(ws, ["joinroomawal"]);
     } else {
+      // Try reconnect
       let restored = false;
       for (const [roomName, room] of this.rooms) {
         const seat = room.findSeatByUser(userId);
         if (seat !== null) {
           ws.room = roomName;
           ws.seat = seat;
-          this.users.set(userId, { ws, room: roomName, seat, lastSeen: Date.now() });
+          this.users.set(userId, { ws, room: roomName, seat });
           
           this.safeSend(ws, ["reconnectSuccess", roomName, seat]);
           this.safeSend(ws, ["numberKursiSaya", seat]);
@@ -332,8 +329,9 @@ export class ChatServer2 {
     }
   }
   
+  // ==================== JOIN ROOM ====================
   async handleJoinRoom(ws, roomName) {
-    if (!ws || ws._closing || !ws.username) {
+    if (!ws.userId) {
       this.safeSend(ws, ["error", "Login first"]);
       return false;
     }
@@ -346,6 +344,7 @@ export class ChatServer2 {
       return false;
     }
     
+    // Leave old room
     if (ws.room) {
       const oldRoom = this.rooms.get(ws.room);
       if (oldRoom && ws.seat) {
@@ -355,31 +354,33 @@ export class ChatServer2 {
       }
     }
     
-    let seat = room.findSeatByUser(ws.username);
+    // Find or create seat
+    let seat = room.findSeatByUser(ws.userId);
     if (seat === null) {
       seat = room.getEmptySeat();
       if (seat === null) return false;
-      room.addSeat(seat, ws.username);
+      room.addSeat(seat, ws.userId);
     }
     
     ws.room = roomName;
     ws.seat = seat;
-    this.users.set(ws.username, { ws, room: roomName, seat, lastSeen: Date.now() });
+    this.users.set(ws.userId, { ws, room: roomName, seat });
     
     this.safeSend(ws, ["rooMasuk", seat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", room.getMute(), roomName]);
     this.safeSend(ws, ["roomUserCount", roomName, room.getCount()]);
     
-    this.broadcastRoom(roomName, ["userOccupiedSeat", roomName, seat, ws.username]);
+    this.broadcastRoom(roomName, ["userOccupiedSeat", roomName, seat, ws.userId]);
     
     setTimeout(() => this.sendAllStateTo(ws, roomName), 100);
     return true;
   }
   
+  // ==================== SEND STATE ====================
   async sendAllStateTo(ws, roomName) {
     const room = this.rooms.get(roomName);
-    if (!room || !ws || ws.readyState !== 1) return;
+    if (!room) return;
     
     const allSeats = room.getAllSeats();
     if (ws.seat) delete allSeats[ws.seat];
@@ -398,8 +399,9 @@ export class ChatServer2 {
     }
   }
   
+  // ==================== MESSAGE HANDLER ====================
   async handleMessage(ws, raw) {
-    if (!ws || ws.readyState !== 1 || ws._closing || this.isShuttingDown) return;
+    if (!ws || ws.readyState !== 1) return;
     
     let data;
     try {
@@ -409,11 +411,6 @@ export class ChatServer2 {
       data = JSON.parse(str);
       if (!Array.isArray(data)) return;
     } catch(e) { return; }
-    
-    if (ws.username) {
-      const user = this.users.get(ws.username);
-      if (user) user.lastSeen = Date.now();
-    }
     
     const [event, ...args] = data;
     
@@ -429,7 +426,7 @@ export class ChatServer2 {
           
         case "chat": {
           const [roomName, img, name, msg, color, textColor] = args;
-          if (ws.room === roomName && ws.username === name) {
+          if (ws.room === roomName && ws.userId === name) {
             const safeMsg = msg?.slice(0, CONSTANTS.MAX_MESSAGE_LENGTH) || "";
             this.broadcastRoom(roomName, ["chat", roomName, img, name, safeMsg, color, textColor]);
           }
@@ -457,7 +454,7 @@ export class ChatServer2 {
               this.broadcastRoom(roomName, ["roomUserCount", roomName, room.getCount()]);
               ws.room = null;
               ws.seat = null;
-              const user = this.users.get(ws.username);
+              const user = this.users.get(ws.userId);
               if (user) {
                 user.room = null;
                 user.seat = null;
@@ -469,11 +466,11 @@ export class ChatServer2 {
         
         case "updateKursi": {
           const [roomName, seat, noimg, name, color, bawah, atas, vip, vipTanda] = args;
-          if (ws.room === roomName && ws.username === name) {
+          if (ws.room === roomName && ws.userId === name) {
             const room = this.rooms.get(roomName);
-            if (room && room.updateSeat(seat, { 
-              noimageUrl: noimg, namauser: name, color, 
-              itembawah: bawah, itematas: atas, vip, viptanda: vipTanda 
+            if (room && room.updateSeat(seat, {
+              noimageUrl: noimg, namauser: name, color,
+              itembawah: bawah, itematas: atas, vip, viptanda: vipTanda
             })) {
               this.broadcastRoom(roomName, ["kursiBatchUpdate", roomName, [[seat, room.getSeat(seat)]]]);
             }
@@ -579,19 +576,8 @@ export class ChatServer2 {
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
-        case "gameLowCardStop":
-          console.log(`🎮 Game event: ${event}, room: ${ws.room}, game exists: ${!!this.game}`);
-          if (this.game) {
-            try { 
-              await this.game.handleEvent(ws, data); 
-              console.log(`✅ Game event ${event} done`);
-            } catch(e) { 
-              console.error("Game error:", e);
-              this.safeSend(ws, ["gameLowCardError", e.message]);
-            }
-          } else {
-            console.log(`❌ No game manager`);
-            this.safeSend(ws, ["gameLowCardError", "Game not available"]);
+          if (GAME_ROOMS.has(ws.room) && this.game) {
+            try { await this.game.handleEvent(ws, data); } catch(e) {}
           }
           break;
           
@@ -609,11 +595,11 @@ export class ChatServer2 {
   }
   
   cleanupWs(ws) {
-    if (!ws || ws._closing) return;
+    if (ws._closing) return;
     ws._closing = true;
     
-    if (ws.username) {
-      const user = this.users.get(ws.username);
+    if (ws.userId) {
+      const user = this.users.get(ws.userId);
       if (user && user.ws === ws) {
         if (ws.room && ws.seat) {
           const room = this.rooms.get(ws.room);
@@ -623,7 +609,7 @@ export class ChatServer2 {
             this.broadcastRoom(ws.room, ["roomUserCount", ws.room, room.getCount()]);
           }
         }
-        this.users.delete(ws.username);
+        this.users.delete(ws.userId);
       }
     }
     
@@ -637,69 +623,70 @@ export class ChatServer2 {
     if (this.isShuttingDown) return;
     this.isShuttingDown = true;
     
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    if (this.cleaner) { clearInterval(this.cleaner); this.cleaner = null; }
+    if (this.timer) clearInterval(this.timer);
+    if (this.cleaner) clearInterval(this.cleaner);
     
     if (this.game && this.game.destroy) {
-      try { await this.game.destroy(); } catch(e) {}
+      await this.game.destroy();
     }
     
-    const snapshot = [...this.connections];
-    for (const ws of snapshot) {
+    for (const ws of this.connections) {
       try { ws.close(); } catch(e) {}
     }
-    
-    this.connections.clear();
-    this.users.clear();
-    this.rooms.clear();
   }
   
+  // ==================== FETCH ====================
   async fetch(request) {
-    try {
-      const url = new URL(request.url);
-      const upgrade = request.headers.get("Upgrade");
-      
-      if (upgrade !== "websocket") {
-        if (url.pathname === "/health") {
-          let activeConns = 0;
-          for (const ws of this.connections) {
-            if (ws && ws.readyState === 1) activeConns++;
-          }
-          return new Response(JSON.stringify({
-            status: "healthy",
-            connections: activeConns,
-            users: this.users.size,
-            rooms: this.rooms.size,
-            uptime: Date.now() - this.startTime
-          }), { headers: { "content-type": "application/json" } });
-        }
-        return new Response("Chat Server Ready", { status: 200 });
+    const url = new URL(request.url);
+    const upgrade = request.headers.get("Upgrade");
+    
+    if (upgrade !== "websocket") {
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({
+          status: "ok",
+          connections: this.connections.size,
+          users: this.users.size,
+          uptime: Date.now() - this.startTime
+        }), { headers: { "content-type": "application/json" } });
       }
-      
-      if (this.connections.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
-        return new Response("Server full", { status: 503 });
-      }
-      
-      const pair = new WebSocketPair();
-      const client = pair[0];
-      const server = pair[1];
-      
-      this.state.acceptWebSocket(server);
-      await this.handleConnect(server);
-      
-      return new Response(null, { status: 101, webSocket: client });
-      
-    } catch(e) {
-      console.error("Fetch error:", e);
-      return new Response("Error: " + e.message, { status: 500 });
+      return new Response("Chat Server Ready", { status: 200 });
     }
+    
+    if (this.connections.size > CONSTANTS.MAX_GLOBAL_CONNECTIONS) {
+      return new Response("Server full", { status: 503 });
+    }
+    
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    
+    this.state.acceptWebSocket(server);
+    
+    // Setup WebSocket
+    server.accept();
+    server.userId = null;
+    server.room = null;
+    server.seat = null;
+    this.connections.add(server);
+    
+    server.addEventListener("message", async (event) => {
+      await this.handleMessage(server, event.data);
+    });
+    
+    server.addEventListener("close", () => {
+      this.cleanupWs(server);
+    });
+    
+    server.addEventListener("error", (err) => {
+      console.log("WS Error:", err);
+      this.cleanupWs(server);
+    });
+    
+    return new Response(null, { status: 101, webSocket: client });
   }
-  
-  async webSocketMessage(ws, msg) { await this.handleMessage(ws, msg); }
-  async webSocketClose(ws) { await this.cleanupWs(ws); }
-  async webSocketError(ws, err) { console.log("WS Error:", err); await this.cleanupWs(ws); }
 }
 
+// ==================== WORKER ====================
 export default {
   async fetch(request, env) {
     try {
