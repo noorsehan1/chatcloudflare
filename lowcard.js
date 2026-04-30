@@ -329,7 +329,7 @@ export class LowCardGameManager {
       return Math.floor(Math.random() * 12) + 1;
     }
     if (round >= 3) {
-      const isGetHighNumber = Math.random() < 0.6;
+      const isGetHighNumber = Math.random() < 0.7;
       if (isGetHighNumber) {
         const bigNumbers = [8, 9, 10, 11, 12];
         return bigNumbers[Math.floor(Math.random() * bigNumbers.length)];
