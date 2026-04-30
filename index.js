@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FIREBASE STYLE (WITH GAME SUPPORT) ====================
+// ==================== CHAT SERVER - SIMPLE & WORKING ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -12,8 +12,7 @@ const CONSTANTS = {
   MAX_GLOBAL_CONNECTIONS: 2000,
   TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL: 900,
-  CLEANUP_INTERVAL_MS: 60000,
-  GAME_STUCK_TIMEOUT_MS: 300000 // 5 menit
+  CLEANUP_INTERVAL_MS: 60000
 };
 
 const roomList = [
@@ -27,20 +26,6 @@ const GAME_ROOMS = new Set([
   "LowCard 1", "LowCard 2", "Noxxeliverothcifsa",
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"
 ]);
-
-// ==================== GAME MANAGER STUB ====================
-class GameManagerStub {
-  constructor() {}
-  masterTick() {}
-  async handleEvent(ws, data) {
-    if (ws && ws.readyState === 1) {
-      try { ws.send(JSON.stringify(["gameLowCardError", "Game not available"])); } catch(e) {}
-    }
-  }
-  async destroy() {}
-  async endGame(room) {}
-  async forceEndGame(room) {}
-}
 
 // ==================== ROOM MANAGER ====================
 class RoomManager {
@@ -165,7 +150,6 @@ export class ChatServer2 {
     this.isShuttingDown = false;
     
     this.users = new Map();
-    this.userConnections = new Map();
     this.rooms = new Map();
     this.connections = new Set();
     
@@ -174,7 +158,6 @@ export class ChatServer2 {
     
     this.timer = null;
     this.cleaner = null;
-    this.gameStuckChecker = null;
     
     this.game = null;
     
@@ -189,7 +172,6 @@ export class ChatServer2 {
   startTimers() {
     if (this.timer) clearInterval(this.timer);
     if (this.cleaner) clearInterval(this.cleaner);
-    if (this.gameStuckChecker) clearInterval(this.gameStuckChecker);
     
     this.timer = setInterval(() => {
       try { this.tick(); } catch(e) { console.error("Tick error:", e); }
@@ -198,58 +180,16 @@ export class ChatServer2 {
     this.cleaner = setInterval(() => {
       try { this.cleanup(); } catch(e) { console.error("Cleanup error:", e); }
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
-    
-    // Game stuck checker setiap 10 detik
-    this.gameStuckChecker = setInterval(() => {
-      try { this.checkStuckGames(); } catch(e) { console.error("Stuck checker error:", e); }
-    }, 10000);
   }
   
   async initGame() {
     try {
       const { LowCardGameManager } = await import("./lowcard.js");
       this.game = new LowCardGameManager(this);
-      console.log("✅ LowCardGameManager loaded successfully");
+      console.log("✅ Game loaded");
     } catch(e) {
-      console.log("❌ LowCardGameManager not available:", e.message);
-      this.game = new GameManagerStub();
-    }
-  }
-  
-  checkStuckGames() {
-    if (!this.game || !this.game.activeGames) return;
-    
-    const now = Date.now();
-    for (const [room, game] of this.game.activeGames) {
-      if (!game || !game._isActive) continue;
-      
-      const lastActivity = game._lastActivity || game._createdAt;
-      let isStuck = false;
-      
-      // Cek game stuck di registration
-      if (game._phase === 'registration' && game.registrationTimeLeft === 0) {
-        isStuck = true;
-        console.log(`⚠️ Stuck registration game in ${room}, force ending...`);
-      }
-      
-      // Cek game stuck di draw
-      if (game._phase === 'draw' && game.drawTimeLeft === 0 && !game.evaluationLocked && game.drawTimeExpired === false) {
-        isStuck = true;
-        console.log(`⚠️ Stuck draw game in ${room}, force evaluating...`);
-        if (this.game._forceEvaluateRound) {
-          this.game._forceEvaluateRound(room);
-        }
-      }
-      
-      // Cek game terlalu lama (5 menit)
-      if (now - lastActivity > CONSTANTS.GAME_STUCK_TIMEOUT_MS) {
-        isStuck = true;
-        console.log(`⚠️ Game in ${room} stuck for ${Math.floor((now - lastActivity)/1000)}s, force ending...`);
-      }
-      
-      if (isStuck && this.game.endGame) {
-        this.game.endGame(room);
-      }
+      console.log("❌ Game not available:", e.message);
+      this.game = null;
     }
   }
   
@@ -266,13 +206,11 @@ export class ChatServer2 {
     }
     
     if (this.game && this.game.masterTick) {
-      try { this.game.masterTick(); } catch(e) { console.error("Game tick error:", e); }
+      try { this.game.masterTick(); } catch(e) {}
     }
   }
   
   cleanup() {
-    if (this.isShuttingDown) return;
-    
     const deadConns = [];
     for (const ws of this.connections) {
       if (!ws || ws.readyState !== 1) {
@@ -291,16 +229,7 @@ export class ChatServer2 {
     }
     for (const name of deadUsers) {
       this.users.delete(name);
-      this.userConnections.delete(name);
     }
-  }
-  
-  getUserConnections(username) {
-    const user = this.users.get(username);
-    if (user && user.ws && user.ws.readyState === 1) {
-      return new Set([user.ws]);
-    }
-    return new Set();
   }
   
   broadcastRoom(room, msg) {
@@ -333,10 +262,6 @@ export class ChatServer2 {
     }
   }
   
-  sendToUser(ws, msg) {
-    return this.safeSend(ws, msg);
-  }
-  
   async handleConnect(ws) {
     if (!ws || this.isShuttingDown) return;
     
@@ -346,6 +271,7 @@ export class ChatServer2 {
     ws.idtarget = null;
     ws._closing = false;
     
+    // FOR GAME COMPATIBILITY
     Object.defineProperty(ws, 'roomname', {
       get: () => ws.room,
       set: (val) => { ws.room = val; }
@@ -372,7 +298,6 @@ export class ChatServer2 {
     }
     
     this.users.set(userId, { ws, room: null, seat: null, lastSeen: Date.now() });
-    this.userConnections.set(userId, new Set([ws]));
     ws.username = userId;
     ws.idtarget = userId;
     
@@ -654,18 +579,19 @@ export class ChatServer2 {
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
-          console.log(`🎮 Game event: ${event} in room: ${ws.room}, isGameRoom: ${GAME_ROOMS.has(ws.room)}, hasGame: ${!!this.game}`);
-          if (GAME_ROOMS.has(ws.room) && this.game) {
+        case "gameLowCardStop":
+          console.log(`🎮 Game event: ${event}, room: ${ws.room}, game exists: ${!!this.game}`);
+          if (this.game) {
             try { 
               await this.game.handleEvent(ws, data); 
-              console.log(`✅ Game event ${event} processed`);
+              console.log(`✅ Game event ${event} done`);
             } catch(e) { 
               console.error("Game error:", e);
-              this.safeSend(ws, ["gameLowCardError", "Game error: " + e.message]);
+              this.safeSend(ws, ["gameLowCardError", e.message]);
             }
           } else {
-            console.log(`❌ Game event rejected - not a game room or no game manager`);
-            this.safeSend(ws, ["gameLowCardError", "Game not available in this room"]);
+            console.log(`❌ No game manager`);
+            this.safeSend(ws, ["gameLowCardError", "Game not available"]);
           }
           break;
           
@@ -698,7 +624,6 @@ export class ChatServer2 {
           }
         }
         this.users.delete(ws.username);
-        this.userConnections.delete(ws.username);
       }
     }
     
@@ -708,22 +633,12 @@ export class ChatServer2 {
     }
   }
   
-  async forceEndGame(room) {
-    if (this.game && this.game.endGame) {
-      await this.game.endGame(room);
-      this.broadcastRoom(room, ["gameLowCardEnd", "Game ended by admin"]);
-      return true;
-    }
-    return false;
-  }
-  
   async shutdown() {
     if (this.isShuttingDown) return;
     this.isShuttingDown = true;
     
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this.cleaner) { clearInterval(this.cleaner); this.cleaner = null; }
-    if (this.gameStuckChecker) { clearInterval(this.gameStuckChecker); this.gameStuckChecker = null; }
     
     if (this.game && this.game.destroy) {
       try { await this.game.destroy(); } catch(e) {}
@@ -736,7 +651,6 @@ export class ChatServer2 {
     
     this.connections.clear();
     this.users.clear();
-    this.userConnections.clear();
     this.rooms.clear();
   }
   
@@ -751,35 +665,14 @@ export class ChatServer2 {
           for (const ws of this.connections) {
             if (ws && ws.readyState === 1) activeConns++;
           }
-          const gameStats = this.game?.healthCheck ? this.game.healthCheck() : { activeGames: 0 };
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeConns,
             users: this.users.size,
             rooms: this.rooms.size,
-            activeGames: gameStats.activeGames || 0,
             uptime: Date.now() - this.startTime
           }), { headers: { "content-type": "application/json" } });
         }
-        
-        if (url.pathname === "/force-end-game") {
-          const room = url.searchParams.get("room");
-          if (room) {
-            await this.forceEndGame(room);
-            return new Response(`Game ended for room: ${room}`, { status: 200 });
-          }
-          return new Response("No room specified", { status: 400 });
-        }
-        
-        if (url.pathname === "/reset-games") {
-          if (this.game && this.game.activeGames) {
-            for (const [room] of this.game.activeGames) {
-              await this.forceEndGame(room);
-            }
-          }
-          return new Response("All games reset", { status: 200 });
-        }
-        
         return new Response("Chat Server Ready", { status: 200 });
       }
       
