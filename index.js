@@ -42,7 +42,7 @@ const GAME_ROOMS = new Set([
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"
 ]);
 
-// ==================== SIMPLE ROOM MANAGER ====================
+// ==================== ROOM MANAGER ====================
 class RoomManager {
   constructor(name) {
     this.name = name;
@@ -156,7 +156,7 @@ class RoomManager {
   }
 }
 
-// ==================== FIREBASE STYLE CHAT SERVER ====================
+// ==================== CHAT SERVER ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -164,7 +164,7 @@ export class ChatServer2 {
     this.startTime = Date.now();
     this.isShuttingDown = false;
     
-    // Simple data structures
+    // Data structures - SIMPLE
     this.users = new Map();        // userId -> { ws, room, seat }
     this.rooms = new Map();        // roomName -> RoomManager
     this.connections = new Set();  // all WebSockets
@@ -193,7 +193,6 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== TICK ====================
   tick() {
     if (this.isShuttingDown) return;
     
@@ -211,10 +210,7 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== CLEANUP ====================
   cleanup() {
-    const now = Date.now();
-    
     // Clean dead connections
     for (const ws of this.connections) {
       if (ws.readyState !== 1) {
@@ -222,10 +218,9 @@ export class ChatServer2 {
       }
     }
     
-    // Clean stale users (no connection)
+    // Clean stale users
     for (const [userId, user] of this.users) {
       if (!user.ws || user.ws.readyState !== 1) {
-        // Remove from seat first
         if (user.room && user.seat) {
           const room = this.rooms.get(user.room);
           if (room) {
@@ -239,7 +234,6 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== BROADCAST ====================
   broadcastRoom(room, msg) {
     const msgStr = JSON.stringify(msg);
     for (const ws of this.connections) {
@@ -268,68 +262,119 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== CONNECTION ====================
   async handleConnect(ws) {
     ws.userId = null;
     ws.room = null;
     ws.seat = null;
+    ws.roomname = null;  // alias for compatibility
+    ws.idtarget = null;   // alias for compatibility
     this.connections.add(ws);
+    
+    // Setup aliases for game compatibility
+    Object.defineProperty(ws, 'roomname', {
+      get: () => ws.room,
+      set: (val) => { ws.room = val; }
+    });
+    Object.defineProperty(ws, 'idtarget', {
+      get: () => ws.userId,
+      set: (val) => { ws.userId = val; }
+    });
+    Object.defineProperty(ws, 'username', {
+      get: () => ws.userId,
+      set: (val) => { ws.userId = val; }
+    });
   }
   
-  // ==================== LOGIN ====================
-  async handleSetIdTarget2(ws, userId, isNew) {
-    if (!userId || userId.length > CONSTANTS.MAX_USERNAME_LENGTH) {
-      this.safeSend(ws, ["error", "Invalid username"]);
-      ws.close();
-      return;
-    }
-    
-    // Kick old connection
-    const old = this.users.get(userId);
-    if (old && old.ws && old.ws.readyState === 1 && old.ws !== ws) {
-      try {
-        old.ws.send(JSON.stringify(["kicked", "Login from another device"]));
-        old.ws.close();
-      } catch(e) {}
-    }
-    
-    // Register
-    this.users.set(userId, { ws, room: null, seat: null });
-    ws.userId = userId;
-    
-    this.safeSend(ws, ["loginOk", userId]);
-    
-    if (isNew) {
-      this.safeSend(ws, ["joinroomawal"]);
-    } else {
-      // Try reconnect
-      let restored = false;
-      for (const [roomName, room] of this.rooms) {
-        const seat = room.findSeatByUser(userId);
-        if (seat !== null) {
-          ws.room = roomName;
-          ws.seat = seat;
-          this.users.set(userId, { ws, room: roomName, seat });
-          
-          this.safeSend(ws, ["reconnectSuccess", roomName, seat]);
-          this.safeSend(ws, ["numberKursiSaya", seat]);
-          this.safeSend(ws, ["currentNumber", this.currentNumber]);
-          this.safeSend(ws, ["muteTypeResponse", room.getMute(), roomName]);
-          this.safeSend(ws, ["roomUserCount", roomName, room.getCount()]);
-          
-          await this.sendAllStateTo(ws, roomName);
-          this.broadcastRoom(roomName, ["userReconnected", roomName, seat, userId]);
-          restored = true;
-          break;
+  // ========== setIdTarget2 LOGIKA PERSIS SEPERTI ASLI ==========
+  async handleSetIdTarget2(ws, id, baru) {
+    if (!id || !ws) return;
+
+    try {
+      if (ws.readyState !== 1) return;
+      
+      if (!id || id.length === 0 || id.length > CONSTANTS.MAX_USERNAME_LENGTH) {
+        await this.safeSend(ws, ["error", "Invalid user ID"]);
+        ws.close(1000, "Invalid ID");
+        return;
+      }
+      
+      if (baru === true) {
+        // Kick old connection
+        const oldUser = this.users.get(id);
+        if (oldUser && oldUser.ws && oldUser.ws.readyState === 1 && oldUser.ws !== ws) {
+          try {
+            oldUser.ws.send(JSON.stringify(["kicked", "Login from another device"]));
+            oldUser.ws.close();
+          } catch(e) {}
         }
+        
+        // Remove user from all seats
+        for (const [roomName, room] of this.rooms) {
+          const seat = room.findSeatByUser(id);
+          if (seat) {
+            room.removeSeat(seat);
+            this.broadcastRoom(roomName, ["removeKursi", roomName, seat]);
+            this.broadcastRoom(roomName, ["roomUserCount", roomName, room.getCount()]);
+          }
+        }
+        
+        // Clear old user data
+        this.users.delete(id);
+        
+        // Register new user
+        ws.userId = id;
+        ws.idtarget = id;
+        ws.room = null;
+        ws.seat = null;
+        
+        this.users.set(id, { ws, room: null, seat: null });
+        this.safeSend(ws, ["joinroomawal"]);
+        
+      } else {
+        // RECONNECT logic
+        const existingUser = this.users.get(id);
+        
+        if (existingUser && existingUser.room && existingUser.seat) {
+          const room = this.rooms.get(existingUser.room);
+          if (room) {
+            const seatData = room.getSeat(existingUser.seat);
+            if (seatData && seatData.namauser === id) {
+              // Restore connection
+              ws.userId = id;
+              ws.idtarget = id;
+              ws.room = existingUser.room;
+              ws.seat = existingUser.seat;
+              
+              this.users.set(id, { ws, room: existingUser.room, seat: existingUser.seat });
+              
+              await this.safeSend(ws, ["reconnectSuccess", existingUser.room, existingUser.seat]);
+              await this.safeSend(ws, ["numberKursiSaya", existingUser.seat]);
+              await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+              await this.safeSend(ws, ["muteTypeResponse", room.getMute(), existingUser.room]);
+              await this.safeSend(ws, ["roomUserCount", existingUser.room, room.getCount()]);
+              
+              await this.sendAllStateTo(ws, existingUser.room);
+              this.broadcastRoom(existingUser.room, ["userReconnected", existingUser.room, existingUser.seat, id]);
+              return;
+            }
+          }
+        }
+        
+        // No seat - need new join
+        ws.userId = id;
+        ws.idtarget = id;
+        this.users.set(id, { ws, room: null, seat: null });
+        await this.safeSend(ws, ["needJoinRoom"]);
       }
-      if (!restored) {
-        this.safeSend(ws, ["needJoinRoom"]);
+      
+    } catch (error) {
+      console.error("SetIdTarget2 error:", error);
+      if (ws && ws.readyState === 1) {
+        await this.safeSend(ws, ["error", "Connection failed"]);
       }
     }
   }
   
-  // ==================== JOIN ROOM ====================
   async handleJoinRoom(ws, roomName) {
     if (!ws.userId) {
       this.safeSend(ws, ["error", "Login first"]);
@@ -377,7 +422,6 @@ export class ChatServer2 {
     return true;
   }
   
-  // ==================== SEND STATE ====================
   async sendAllStateTo(ws, roomName) {
     const room = this.rooms.get(roomName);
     if (!room) return;
@@ -399,7 +443,6 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== MESSAGE HANDLER ====================
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1) return;
     
@@ -635,7 +678,6 @@ export class ChatServer2 {
     }
   }
   
-  // ==================== FETCH ====================
   async fetch(request) {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
@@ -661,28 +703,22 @@ export class ChatServer2 {
     const server = pair[1];
     
     this.state.acceptWebSocket(server);
-    
-    // Setup WebSocket
-    server.accept();
-    server.userId = null;
-    server.room = null;
-    server.seat = null;
-    this.connections.add(server);
-    
-    server.addEventListener("message", async (event) => {
-      await this.handleMessage(server, event.data);
-    });
-    
-    server.addEventListener("close", () => {
-      this.cleanupWs(server);
-    });
-    
-    server.addEventListener("error", (err) => {
-      console.log("WS Error:", err);
-      this.cleanupWs(server);
-    });
+    await this.handleConnect(server);
     
     return new Response(null, { status: 101, webSocket: client });
+  }
+  
+  async webSocketMessage(ws, msg) {
+    await this.handleMessage(ws, msg);
+  }
+  
+  async webSocketClose(ws) {
+    await this.cleanupWs(ws);
+  }
+  
+  async webSocketError(ws, err) {
+    console.log("WS Error:", err);
+    await this.cleanupWs(ws);
   }
 }
 
