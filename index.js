@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FIREBASE STYLE (COMPATIBLE WITH GAME) ====================
+// ==================== CHAT SERVER - FIREBASE STYLE (WITH GAME SUPPORT) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -12,7 +12,8 @@ const CONSTANTS = {
   MAX_GLOBAL_CONNECTIONS: 2000,
   TICK_INTERVAL_MS: 1000,
   NUMBER_TICK_INTERVAL: 900,
-  CLEANUP_INTERVAL_MS: 60000
+  CLEANUP_INTERVAL_MS: 60000,
+  GAME_STUCK_TIMEOUT_MS: 300000 // 5 menit
 };
 
 const roomList = [
@@ -37,6 +38,8 @@ class GameManagerStub {
     }
   }
   async destroy() {}
+  async endGame(room) {}
+  async forceEndGame(room) {}
 }
 
 // ==================== ROOM MANAGER ====================
@@ -161,37 +164,32 @@ export class ChatServer2 {
     this.startTime = Date.now();
     this.isShuttingDown = false;
     
-    // Simple data structures
-    this.users = new Map();      // username -> { ws, room, seat }
-    this.userConnections = new Map(); // FOR GAME COMPATIBILITY: username -> Set of connections
-    this.rooms = new Map();      // roomName -> RoomManager
-    this.connections = new Set(); // all WebSockets
+    this.users = new Map();
+    this.userConnections = new Map();
+    this.rooms = new Map();
+    this.connections = new Set();
     
     this.currentNumber = 1;
     this.tickCount = 0;
     
-    // Timers
     this.timer = null;
     this.cleaner = null;
+    this.gameStuckChecker = null;
     
-    // Game
     this.game = null;
     
-    // Init rooms
     for (const name of roomList) {
       this.rooms.set(name, new RoomManager(name));
     }
     
-    // Start timers
     this.startTimers();
-    
-    // Init game (async, don't await)
     this.initGame();
   }
   
   startTimers() {
     if (this.timer) clearInterval(this.timer);
     if (this.cleaner) clearInterval(this.cleaner);
+    if (this.gameStuckChecker) clearInterval(this.gameStuckChecker);
     
     this.timer = setInterval(() => {
       try { this.tick(); } catch(e) { console.error("Tick error:", e); }
@@ -200,16 +198,58 @@ export class ChatServer2 {
     this.cleaner = setInterval(() => {
       try { this.cleanup(); } catch(e) { console.error("Cleanup error:", e); }
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
+    
+    // Game stuck checker setiap 10 detik
+    this.gameStuckChecker = setInterval(() => {
+      try { this.checkStuckGames(); } catch(e) { console.error("Stuck checker error:", e); }
+    }, 10000);
   }
   
   async initGame() {
     try {
       const { LowCardGameManager } = await import("./lowcard.js");
       this.game = new LowCardGameManager(this);
-      console.log("LowCardGameManager loaded successfully");
+      console.log("✅ LowCardGameManager loaded successfully");
     } catch(e) {
-      console.log("LowCardGameManager not available, using stub");
+      console.log("❌ LowCardGameManager not available:", e.message);
       this.game = new GameManagerStub();
+    }
+  }
+  
+  checkStuckGames() {
+    if (!this.game || !this.game.activeGames) return;
+    
+    const now = Date.now();
+    for (const [room, game] of this.game.activeGames) {
+      if (!game || !game._isActive) continue;
+      
+      const lastActivity = game._lastActivity || game._createdAt;
+      let isStuck = false;
+      
+      // Cek game stuck di registration
+      if (game._phase === 'registration' && game.registrationTimeLeft === 0) {
+        isStuck = true;
+        console.log(`⚠️ Stuck registration game in ${room}, force ending...`);
+      }
+      
+      // Cek game stuck di draw
+      if (game._phase === 'draw' && game.drawTimeLeft === 0 && !game.evaluationLocked && game.drawTimeExpired === false) {
+        isStuck = true;
+        console.log(`⚠️ Stuck draw game in ${room}, force evaluating...`);
+        if (this.game._forceEvaluateRound) {
+          this.game._forceEvaluateRound(room);
+        }
+      }
+      
+      // Cek game terlalu lama (5 menit)
+      if (now - lastActivity > CONSTANTS.GAME_STUCK_TIMEOUT_MS) {
+        isStuck = true;
+        console.log(`⚠️ Game in ${room} stuck for ${Math.floor((now - lastActivity)/1000)}s, force ending...`);
+      }
+      
+      if (isStuck && this.game.endGame) {
+        this.game.endGame(room);
+      }
     }
   }
   
@@ -226,15 +266,13 @@ export class ChatServer2 {
     }
     
     if (this.game && this.game.masterTick) {
-      try { this.game.masterTick(); } catch(e) {}
+      try { this.game.masterTick(); } catch(e) { console.error("Game tick error:", e); }
     }
   }
   
-  // SAFE CLEANUP - copy before delete
   cleanup() {
     if (this.isShuttingDown) return;
     
-    // Clean dead connections - COPY THEN DELETE
     const deadConns = [];
     for (const ws of this.connections) {
       if (!ws || ws.readyState !== 1) {
@@ -245,7 +283,6 @@ export class ChatServer2 {
       this.connections.delete(ws);
     }
     
-    // Clean stale users - COPY THEN DELETE
     const deadUsers = [];
     for (const [name, user] of this.users) {
       if (!user.ws || user.ws.readyState !== 1) {
@@ -258,7 +295,6 @@ export class ChatServer2 {
     }
   }
   
-  // FOR GAME COMPATIBILITY - get user connections
   getUserConnections(username) {
     const user = this.users.get(username);
     if (user && user.ws && user.ws.readyState === 1) {
@@ -267,7 +303,6 @@ export class ChatServer2 {
     return new Set();
   }
   
-  // SAFE BROADCAST - copy connections before loop
   broadcastRoom(room, msg) {
     const msgStr = JSON.stringify(msg);
     const snapshot = [...this.connections];
@@ -302,12 +337,6 @@ export class ChatServer2 {
     return this.safeSend(ws, msg);
   }
   
-  sendToUsername(username, msg) {
-    const user = this.users.get(username);
-    if (user && user.ws) return this.safeSend(user.ws, msg);
-    return false;
-  }
-  
   async handleConnect(ws) {
     if (!ws || this.isShuttingDown) return;
     
@@ -317,7 +346,6 @@ export class ChatServer2 {
     ws.idtarget = null;
     ws._closing = false;
     
-    // FOR GAME COMPATIBILITY - alias roomname
     Object.defineProperty(ws, 'roomname', {
       get: () => ws.room,
       set: (val) => { ws.room = val; }
@@ -326,7 +354,6 @@ export class ChatServer2 {
     this.connections.add(ws);
   }
   
-  // setIdTarget2 LOGIKA TIDAK DIUBAH
   async handleSetIdTarget2(ws, userId, isNew) {
     if (!ws || ws._closing) return;
     
@@ -336,7 +363,6 @@ export class ChatServer2 {
       return;
     }
     
-    // Kick old connection if exists
     const old = this.users.get(userId);
     if (old && old.ws && old.ws.readyState === 1 && old.ws !== ws) {
       try {
@@ -345,7 +371,6 @@ export class ChatServer2 {
       } catch(e) {}
     }
     
-    // Register user
     this.users.set(userId, { ws, room: null, seat: null, lastSeen: Date.now() });
     this.userConnections.set(userId, new Set([ws]));
     ws.username = userId;
@@ -356,7 +381,6 @@ export class ChatServer2 {
     if (isNew) {
       this.safeSend(ws, ["joinroomawal"]);
     } else {
-      // Try restore session
       let restored = false;
       for (const [roomName, room] of this.rooms) {
         const seat = room.findSeatByUser(userId);
@@ -397,7 +421,6 @@ export class ChatServer2 {
       return false;
     }
     
-    // Leave old room
     if (ws.room) {
       const oldRoom = this.rooms.get(ws.room);
       if (oldRoom && ws.seat) {
@@ -407,7 +430,6 @@ export class ChatServer2 {
       }
     }
     
-    // Find or create seat
     let seat = room.findSeatByUser(ws.username);
     if (seat === null) {
       seat = room.getEmptySeat();
@@ -434,20 +456,17 @@ export class ChatServer2 {
     const room = this.rooms.get(roomName);
     if (!room || !ws || ws.readyState !== 1) return;
     
-    // Send all seats (except self)
     const allSeats = room.getAllSeats();
     if (ws.seat) delete allSeats[ws.seat];
     if (Object.keys(allSeats).length) {
       this.safeSend(ws, ["allUpdateKursiList", roomName, allSeats]);
     }
     
-    // Send all points (except self)
     const allPoints = room.getAllPoints().filter(p => p.seat !== ws.seat);
     if (allPoints.length) {
       this.safeSend(ws, ["allPointsList", roomName, allPoints]);
     }
     
-    // Send self point
     const myPoint = room.getPoint(ws.seat);
     if (myPoint) {
       this.safeSend(ws, ["pointUpdated", roomName, ws.seat, myPoint.x, myPoint.y, myPoint.fast ? 1 : 0]);
@@ -466,7 +485,6 @@ export class ChatServer2 {
       if (!Array.isArray(data)) return;
     } catch(e) { return; }
     
-    // Update last seen
     if (ws.username) {
       const user = this.users.get(ws.username);
       if (user) user.lastSeen = Date.now();
@@ -474,7 +492,6 @@ export class ChatServer2 {
     
     const [event, ...args] = data;
     
-    // Error handler for each event
     try {
       switch(event) {
         case "setIdTarget2":
@@ -637,8 +654,18 @@ export class ChatServer2 {
         case "gameLowCardJoin":
         case "gameLowCardNumber":
         case "gameLowCardEnd":
+          console.log(`🎮 Game event: ${event} in room: ${ws.room}, isGameRoom: ${GAME_ROOMS.has(ws.room)}, hasGame: ${!!this.game}`);
           if (GAME_ROOMS.has(ws.room) && this.game) {
-            try { await this.game.handleEvent(ws, data); } catch(e) { console.error("Game error:", e); }
+            try { 
+              await this.game.handleEvent(ws, data); 
+              console.log(`✅ Game event ${event} processed`);
+            } catch(e) { 
+              console.error("Game error:", e);
+              this.safeSend(ws, ["gameLowCardError", "Game error: " + e.message]);
+            }
+          } else {
+            console.log(`❌ Game event rejected - not a game room or no game manager`);
+            this.safeSend(ws, ["gameLowCardError", "Game not available in this room"]);
           }
           break;
           
@@ -681,26 +708,27 @@ export class ChatServer2 {
     }
   }
   
+  async forceEndGame(room) {
+    if (this.game && this.game.endGame) {
+      await this.game.endGame(room);
+      this.broadcastRoom(room, ["gameLowCardEnd", "Game ended by admin"]);
+      return true;
+    }
+    return false;
+  }
+  
   async shutdown() {
     if (this.isShuttingDown) return;
     this.isShuttingDown = true;
     
-    // Clear timers
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    if (this.cleaner) {
-      clearInterval(this.cleaner);
-      this.cleaner = null;
-    }
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.cleaner) { clearInterval(this.cleaner); this.cleaner = null; }
+    if (this.gameStuckChecker) { clearInterval(this.gameStuckChecker); this.gameStuckChecker = null; }
     
-    // Destroy game
     if (this.game && this.game.destroy) {
       try { await this.game.destroy(); } catch(e) {}
     }
     
-    // Close all connections
     const snapshot = [...this.connections];
     for (const ws of snapshot) {
       try { ws.close(); } catch(e) {}
@@ -723,14 +751,35 @@ export class ChatServer2 {
           for (const ws of this.connections) {
             if (ws && ws.readyState === 1) activeConns++;
           }
+          const gameStats = this.game?.healthCheck ? this.game.healthCheck() : { activeGames: 0 };
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeConns,
             users: this.users.size,
             rooms: this.rooms.size,
+            activeGames: gameStats.activeGames || 0,
             uptime: Date.now() - this.startTime
           }), { headers: { "content-type": "application/json" } });
         }
+        
+        if (url.pathname === "/force-end-game") {
+          const room = url.searchParams.get("room");
+          if (room) {
+            await this.forceEndGame(room);
+            return new Response(`Game ended for room: ${room}`, { status: 200 });
+          }
+          return new Response("No room specified", { status: 400 });
+        }
+        
+        if (url.pathname === "/reset-games") {
+          if (this.game && this.game.activeGames) {
+            for (const [room] of this.game.activeGames) {
+              await this.forceEndGame(room);
+            }
+          }
+          return new Response("All games reset", { status: 200 });
+        }
+        
         return new Response("Chat Server Ready", { status: 200 });
       }
       
@@ -753,21 +802,11 @@ export class ChatServer2 {
     }
   }
   
-  async webSocketMessage(ws, msg) { 
-    await this.handleMessage(ws, msg); 
-  }
-  
-  async webSocketClose(ws) { 
-    await this.cleanupWs(ws); 
-  }
-  
-  async webSocketError(ws, err) { 
-    console.log("WS Error:", err); 
-    await this.cleanupWs(ws); 
-  }
+  async webSocketMessage(ws, msg) { await this.handleMessage(ws, msg); }
+  async webSocketClose(ws) { await this.cleanupWs(ws); }
+  async webSocketError(ws, err) { console.log("WS Error:", err); await this.cleanupWs(ws); }
 }
 
-// ==================== WORKER ====================
 export default {
   async fetch(request, env) {
     try {
