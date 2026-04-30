@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER 2 - FINAL FULL FIXED ====================
+// ==================== CHAT SERVER 2 - FULL CLASS FINAL ====================
 // name = "chatcloudnew"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
@@ -32,7 +32,7 @@ const CONSTANTS = Object.freeze({
   LOCK_TIMEOUT_MS: 5000,
   PM_BUFFER_MAX_SIZE: 1000,
   GC_INTERVAL_MS: 60000,
-  STALE_CONNECTION_TIMEOUT_MS: 300000,
+  STALE_CONNECTION_TIMEOUT_MS: 5000,
   BROADCAST_BATCH_SIZE: 50,
   CLEANUP_BATCH_SIZE: 100,
 });
@@ -384,7 +384,7 @@ class RoomManager {
   }
 }
 
-// ==================== ChatServer2 - FINAL FULL FIXED ====================
+// ==================== ChatServer2 - FULL CLASS FINAL ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -441,16 +441,62 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
 
-    this._masterTickCounter = 0;
-    this._masterTimer = null;
-    this._gcTimer = null;
-    this._startMasterTimer();
-    this._startGarbageCollector();
+    // 🔥 FIX 1: RESTORE WEBSOCKETS saat DO bangun
+    this._restoreWebSockets();
+    
+    // 🔥 FIX 2: Pakai Alarm API, BUKAN setInterval
+    this._scheduleNextAlarm();
+  }
+
+  // 🔥 RESTORE WEBSOCKET dari hibernasi
+  _restoreWebSockets() {
+    try {
+      const sockets = this.state.getWebSockets();
+      for (const ws of sockets) {
+        this._setupWebSocket(ws);
+      }
+    } catch (error) {
+      console.error("Failed to restore WebSockets:", error);
+    }
+  }
+
+  // 🔥 Setup WebSocket yang baru direstore
+  _setupWebSocket(ws) {
+    if (!ws) return;
+    
+    ws._isClosing = false;
+    ws._restored = true;
+    ws._connectionTime = Date.now();
+    
+    this._wsRawSet.add(ws);
+    
+    if (ws.roomname && this.roomClients.has(ws.roomname)) {
+      this.roomClients.get(ws.roomname).add(ws);
+    }
+  }
+
+  // 🔥 SCHEDULE ALARM (pengganti setInterval)
+  _scheduleNextAlarm() {
+    if (this._isClosing || !this._alive) return;
+    this.state.setAlarm(Date.now() + CONSTANTS.MASTER_TICK_INTERVAL_MS);
+  }
+
+  // 🔥 ALARM HANDLER (pengganti master timer)
+  async alarm() {
+    if (this._isClosing || !this._alive) return;
+    
+    try {
+      await this._masterTick();
+      await this._runGarbageCollector();
+    } catch (error) {
+      console.error("Alarm execution error:", error);
+    } finally {
+      this._scheduleNextAlarm();
+    }
   }
 
   _startGarbageCollector() {
-    if (this._gcTimer) clearInterval(this._gcTimer);
-    this._gcTimer = setInterval(() => this._runGarbageCollector(), CONSTANTS.GC_INTERVAL_MS);
+    // Tidak perlu karena sudah pakai alarm
   }
 
   async _runGarbageCollector() {
@@ -459,182 +505,141 @@ export class ChatServer2 {
     const release = this.userLock.tryAcquire();
     if (!release) return;
     
-    let lockReleased = false;
-    
     try {
       const now = Date.now();
       const seatsToRemove = [];
+      const usersToCleanup = [];
       
       for (const [room, roomManager] of this.roomManagers) {
         for (const [seat, seatData] of roomManager.seats) {
-          if (seatData && now - seatData.lastUpdated > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
-            const isOnline = this.userConnections.has(seatData.namauser);
+          if (seatData && now - (seatData.lastUpdated || 0) > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
+            const isOnline = this._isUserOnline(seatData.namauser);
             if (!isOnline) {
-              seatsToRemove.push({ room, seat });
+              seatsToRemove.push({ room, seat, userId: seatData.namauser });
             }
           }
         }
       }
       
-      if (seatsToRemove.length > 0) {
-        for (const item of seatsToRemove) {
-          const roomManager = this.roomManagers.get(item.room);
-          if (roomManager) {
-            roomManager.removeSeat(item.seat);
+      for (const [userId, lastSeen] of this.userLastSeen) {
+        if (now - lastSeen > CONSTANTS.STALE_CONNECTION_TIMEOUT_MS) {
+          const isStillConnected = this._isUserOnline(userId);
+          if (!isStillConnected) {
+            usersToCleanup.push(userId);
           }
-        }
-        
-        release();
-        lockReleased = true;
-        
-        for (const item of seatsToRemove) {
-          this.broadcastToRoom(item.room, ["removeKursi", item.room, item.seat]);
-          this.updateRoomCount(item.room);
-        }
-        return;
-      }
-      
-      for (const [userId, connections] of this.userConnections) {
-        const validConns = [];
-        for (const conn of connections) {
-          if (conn && conn.readyState === 1 && !conn._isClosing) {
-            validConns.push(conn);
-          }
-        }
-        
-        if (validConns.length === 0) {
-          this.userConnections.delete(userId);
-          this.userConnectionVersion.delete(userId);
-          this.userLastSeen.delete(userId);
-          
-          const seatInfo = this.userToSeat.get(userId);
-          if (seatInfo) {
-            const roomManager = this.roomManagers.get(seatInfo.room);
-            if (roomManager) {
-              const seatData = roomManager.getSeat(seatInfo.seat);
-              if (seatData && seatData.namauser === userId) {
-                roomManager.removeSeat(seatInfo.seat);
-                
-                release();
-                lockReleased = true;
-                
-                this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                this.updateRoomCount(seatInfo.room);
-                return;
-              }
-            }
-          }
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
-        } else {
-          this.userConnections.set(userId, new Set(validConns));
         }
       }
       
-    } catch (e) {
-      console.error("GC error:", e);
-    } finally {
-      if (!lockReleased && release) release();
-    }
-  }
-
-  // ========== FIXED CLEANUP - HAPUS SEMUA DATA ==========
- async _cleanupWebSocket(ws) {
-  if (!ws || ws._isClosing) return;
-  ws._isClosing = true;
-  
-  const release = await safeAcquire(this.userLock);
-  if (!release) return;
-  
-  try {
-    const userId = ws.idtarget;
-    const roomName = ws.roomname;
-    
-    // 1. HAPUS dari roomClients
-    if (roomName) {
-      const clientSet = this.roomClients.get(roomName);
-      if (clientSet) clientSet.delete(ws);
-    }
-    
-    // 2. HAPUS semua data user
-    if (userId) {
-      const userConns = this.userConnections.get(userId);
-      if (userConns) {
-        userConns.delete(ws);
-        
-        // Jika tidak ada koneksi lain, hapus SEMUA data
-        if (userConns.size === 0) {
-          // ✅ HAPUS SEMUA DATA USER
-          this.userConnections.delete(userId);
-          this.userConnectionVersion.delete(userId);
-          this.userLastSeen.delete(userId);
-          this.userToSeat.delete(userId);      // ← KURSI MAPPING
-          this.userCurrentRoom.delete(userId); // ← ROOM USER
-          
-          // ✅ HAPUS KURSI dari RoomManager
-          const seatInfo = this.userToSeat.get(userId);
-          if (seatInfo) {
-            const roomManager = this.roomManagers.get(seatInfo.room);
-            if (roomManager) {
-              const seatData = roomManager.getSeat(seatInfo.seat);
-              if (seatData && seatData.namauser === userId) {
-                roomManager.removeSeat(seatInfo.seat);  // ← HAPUS KURSI
-                
-                // Lepas lock sebelum broadcast
-                release();
-                
-                // ✅ BROADCAST ke semua user di room
-                this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                this.updateRoomCount(seatInfo.room);
-                
-                // Bersihkan WebSocket
-                this._wsRawSet.delete(ws);
-                try { ws.close(1000, "Cleanup completed"); } catch(e) {}
-                
-                return;  // Selesai
-              }
-            }
-          }
+      for (const item of seatsToRemove) {
+        const roomManager = this.roomManagers.get(item.room);
+        if (roomManager) {
+          roomManager.removeSeat(item.seat);
         }
       }
-    }
-    
-    // 3. HAPUS WebSocket dari global set
-    this._wsRawSet.delete(ws);
-    
-    // 4. TUTUP WebSocket jika masih terbuka
-    if (ws.readyState === 1) {
-      try { ws.close(1000, "Cleanup completed"); } catch(e) {}
-    }
-    
-    // 5. RESET properties WebSocket
-    ws.roomname = undefined;
-    ws.idtarget = undefined;
-    ws._connectionVersion = undefined;
-    
-  } catch (e) {
-    console.error("Cleanup error:", e);
-    
-    // ✅ ERROR HANDLING - tetap bersihkan data
-    const userId = ws.idtarget;
-    if (userId) {
-      try {
-        this.userConnections.delete(userId);
-        this.userConnectionVersion.delete(userId);
+      
+      for (const userId of usersToCleanup) {
         this.userLastSeen.delete(userId);
-        this.userToSeat.delete(userId);
-        this.userCurrentRoom.delete(userId);
-      } catch(e2) {}
+      }
+      
+      const roomsUpdated = new Set();
+      for (const item of seatsToRemove) {
+        roomsUpdated.add(item.room);
+        this.broadcastToRoom(item.room, ["removeKursi", item.room, item.seat]);
+      }
+      
+      for (const room of roomsUpdated) {
+        this.updateRoomCount(room);
+      }
+      
+      await this._cleanupInvalidConnections();
+      
+    } catch (error) {
+      console.error("GC error:", error);
+    } finally {
+      if (release) release();
     }
-    this._wsRawSet.delete(ws);
-    
-  } finally {
-    if (release) release();
   }
-}
+  
+  _isUserOnline(userId) {
+    const connections = this.userConnections.get(userId);
+    if (!connections || connections.size === 0) return false;
+    
+    for (const conn of connections) {
+      if (conn && conn.readyState === 1 && !conn._isClosing) {
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  async _cleanupInvalidConnections() {
+    const toRemove = [];
+    
+    for (const [userId, connections] of this.userConnections) {
+      const validConns = [];
+      for (const conn of connections) {
+        if (conn && conn.readyState === 1 && !conn._isClosing) {
+          validConns.push(conn);
+        }
+      }
+      
+      if (validConns.length === 0) {
+        toRemove.push(userId);
+      } else if (validConns.length !== connections.size) {
+        this.userConnections.set(userId, new Set(validConns));
+      }
+    }
+    
+    for (const userId of toRemove) {
+      this.userConnections.delete(userId);
+      this.userConnectionVersion.delete(userId);
+    }
+  }
 
+  async _cleanupWebSocket(ws) {
+    if (!ws || ws._isClosing) return;
+    ws._isClosing = true;
+    
+    const release = await safeAcquire(this.userLock);
+    if (!release) return;
+    
+    try {
+      const userId = ws.idtarget;
+      const roomName = ws.roomname;
+      
+      if (roomName) {
+        const clientSet = this.roomClients.get(roomName);
+        if (clientSet) clientSet.delete(ws);
+      }
+      
+      if (userId) {
+        const userConns = this.userConnections.get(userId);
+        if (userConns) {
+          userConns.delete(ws);
+          
+          if (userConns.size === 0) {
+            this.userLastSeen.set(userId, Date.now());
+          }
+        }
+      }
+      
+      this._wsRawSet.delete(ws);
+      
+      if (ws.readyState === 1) {
+        try { ws.close(1000, "Cleanup completed"); } catch(e) {}
+      }
+      
+      ws.roomname = undefined;
+      ws.idtarget = undefined;
+      ws._connectionVersion = undefined;
+      
+    } catch (error) {
+      console.error("Cleanup error:", error);
+    } finally {
+      if (release) release();
+    }
+  }
 
-  // ========== FIXED CLEANUP ONLY - HAPUS SEMUA DATA ==========
   async _cleanupWebSocketOnly(ws) {
     if (!ws || ws._isClosing) return;
     ws._isClosing = true;
@@ -657,27 +662,7 @@ export class ChatServer2 {
           userConns.delete(ws);
           
           if (userConns.size === 0) {
-            // ✅ HAPUS SEMUA DATA USER
-            this.userConnections.delete(userId);
-            this.userConnectionVersion.delete(userId);
-            this.userLastSeen.delete(userId);
-            this.userToSeat.delete(userId);
-            this.userCurrentRoom.delete(userId);
-            
-            const seatInfo = this.userToSeat.get(userId);
-            if (seatInfo) {
-              const roomManager = this.roomManagers.get(seatInfo.room);
-              if (roomManager) {
-                const seatData = roomManager.getSeat(seatInfo.seat);
-                if (seatData && seatData.namauser === userId) {
-                  roomManager.removeSeat(seatInfo.seat);
-                  release();
-                  this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                  this.updateRoomCount(seatInfo.room);
-                  return;
-                }
-              }
-            }
+            this.userLastSeen.set(userId, Date.now());
           }
         }
       }
@@ -691,27 +676,15 @@ export class ChatServer2 {
       ws.roomname = undefined;
       ws.idtarget = undefined;
       
-    } catch (e) {
-      console.error("Cleanup only error:", e);
-      
-      // ✅ ERROR HANDLING - tetap bersihkan data
-      const userId = ws.idtarget;
-      if (userId) {
-        try {
-          this.userConnections.delete(userId);
-          this.userToSeat.delete(userId);
-          this.userCurrentRoom.delete(userId);
-        } catch(e2) {}
-      }
-      
+    } catch (error) {
+      console.error("Cleanup only error:", error);
     } finally {
       if (release) release();
     }
   }
 
   _startMasterTimer() {
-    if (this._masterTimer) clearInterval(this._masterTimer);
-    this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
+    // Tidak perlu karena sudah pakai alarm
   }
 
   async _masterTick() {
@@ -721,7 +694,7 @@ export class ChatServer2 {
     if (!release) return;
     
     try {
-      this._masterTickCounter++;
+      this._masterTickCounter = (this._masterTickCounter || 0) + 1;
       const now = Date.now();
 
       if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_INTERVAL_TICKS === 0) {
@@ -843,10 +816,7 @@ export class ChatServer2 {
     }
   }
 
-  // ========== HANDLE RECONNECT ==========
   async handleReconnect(ws, userId) {
-    console.log(`Handling reconnect for user: ${userId}`);
-    
     const release = await safeAcquire(this.userLock);
     if (!release) {
       await this.safeSend(ws, ["error", "Server busy, please retry"]);
@@ -864,7 +834,8 @@ export class ChatServer2 {
           const seatData = roomManager.getSeat(seat);
           
           if (seatData && seatData.namauser === userId) {
-            // Bersihkan koneksi lama
+            this.userLastSeen.set(userId, Date.now());
+            
             const oldConns = this.userConnections.get(userId);
             if (oldConns) {
               for (const oldWs of oldConns) {
@@ -877,7 +848,6 @@ export class ChatServer2 {
               }
             }
             
-            // Setup koneksi baru
             ws.idtarget = userId;
             ws.roomname = room;
             ws._isClosing = false;
@@ -899,9 +869,10 @@ export class ChatServer2 {
             clientSet.add(ws);
             
             this.userConnectionVersion.set(userId, ws._connectionVersion);
-            this.userLastSeen.set(userId, Date.now());
             
-            // Kirim state
+            const updatedSeatData = { ...seatData, lastUpdated: Date.now() };
+            roomManager.updateSeat(seat, updatedSeatData);
+            
             await this.safeSend(ws, ["reconnectSuccess", room, seat]);
             await this.safeSend(ws, ["numberKursiSaya", seat]);
             await this.safeSend(ws, ["currentNumber", this.currentNumber]);
@@ -931,19 +902,17 @@ export class ChatServer2 {
             
             this.broadcastToRoom(room, ["userReconnected", room, seat, userId]);
             
-            console.log(`User ${userId} reconnected to room ${room} seat ${seat}`);
             return true;
           }
         }
       }
       
-      // Tidak ada seat - perlu join room baru
-      console.log(`User ${userId} has no seat, need to join room`);
       await this.safeSend(ws, ["needJoinRoom"]);
       
       ws.idtarget = userId;
       ws._isClosing = false;
       ws._connectionVersion = Date.now();
+      this.userLastSeen.set(userId, Date.now());
       
       let userConns = this.userConnections.get(userId);
       if (!userConns) {
@@ -952,7 +921,6 @@ export class ChatServer2 {
       }
       userConns.add(ws);
       this._wsRawSet.add(ws);
-      this.userLastSeen.set(userId, Date.now());
       
       return false;
       
@@ -1197,7 +1165,6 @@ export class ChatServer2 {
         await this.safeSend(ws, ["joinroomawal"]);
         
       } else {
-        // RECONNECT
         release();
         await this.handleReconnect(ws, id);
       }
@@ -1464,8 +1431,9 @@ export class ChatServer2 {
     this._isClosing = true;
     this._alive = false;
     
-    if (this._masterTimer) { clearInterval(this._masterTimer); this._masterTimer = null; }
-    if (this._gcTimer) { clearInterval(this._gcTimer); this._gcTimer = null; }
+    try {
+      await this.state.storage.deleteAlarm();
+    } catch(e) {}
     
     if (this.chatBuffer) await this.chatBuffer.destroy();
     if (this.pmBuffer) await this.pmBuffer.destroy();
@@ -1503,7 +1471,8 @@ export class ChatServer2 {
           return new Response(JSON.stringify({
             status: "healthy",
             connections: activeCount,
-            uptime: Date.now() - this._startTime
+            uptime: Date.now() - this._startTime,
+            restored: Array.from(this._wsRawSet).filter(w => w._restored).length
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/shutdown") { 
@@ -1525,13 +1494,13 @@ export class ChatServer2 {
       const client = pair[0];
       const server = pair[1];
 
-      // ✅ HIBERNATION API - PAKAI INI!
       this.state.acceptWebSocket(server);
       
       const ws = server;
       ws.roomname = undefined;
       ws.idtarget = undefined;
       ws._isClosing = false;
+      ws._restored = false;
       ws._connectionTime = Date.now();
       ws._connectionVersion = Date.now();
 
@@ -1546,16 +1515,29 @@ export class ChatServer2 {
   }
 
   async webSocketMessage(ws, message) {
-    await this.handleMessage(ws, message);
+    try {
+      await this.handleMessage(ws, message);
+    } catch (error) {
+      console.error("WebSocket message handler crashed:", error);
+      try {
+        await this.safeSend(ws, ["error", "Message processing failed"]);
+      } catch (e) {}
+    }
   }
 
   async webSocketClose(ws, code, reason) {
-    await this._cleanupWebSocket(ws);
+    try {
+      await this._cleanupWebSocket(ws);
+    } catch (error) {
+      console.error("WebSocket close handler error:", error);
+    }
   }
 
   async webSocketError(ws, error) {
     console.error("WebSocket error:", error);
-    await this._cleanupWebSocket(ws);
+    try {
+      await this._cleanupWebSocket(ws);
+    } catch (e) {}
   }
 
   async _forceResetAllData() {
