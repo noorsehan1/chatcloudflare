@@ -154,7 +154,7 @@ class RoomManager {
 }
 
 // ==================== CHAT SERVER ====================
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -651,8 +651,8 @@ export class ChatServer {
 export default {
   async fetch(request, env) {
     try {
-      const id = env.CHAT_SERVER.idFromName("main");
-      const obj = env.CHAT_SERVER.get(id);
+      const id = env.CHAT_SERVER_2.idFromName("main");
+      const obj = env.CHAT_SERVER_2.get(id);
       return await obj.fetch(request);
     } catch(e) {
       console.error("Worker error:", e);
