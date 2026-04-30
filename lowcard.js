@@ -1,4 +1,4 @@
-// ==================== LOWCARDGAMEMANAGER.js - ZERO CRASH (LOGIKA TETAP) ====================
+// ==================== LOWCARDGAMEMANAGER.js ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -352,7 +352,7 @@ export class LowCardGameManager {
         registrationTimeLeft: CONSTANTS.REGISTRATION_TIME,
         drawTimeLeft: CONSTANTS.DRAW_TIME,
         hostId: ws.idtarget,
-        hostName: ws.username || ws.idtarget,
+        hostName: ws.idtarget,
         useBots: false,
         evaluationLocked: false,
         drawTimeExpired: false,
@@ -367,7 +367,7 @@ export class LowCardGameManager {
         _evalScheduled: false
       };
 
-      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
+      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.idtarget });
       this.activeGames.set(room, game);
       this._stats.totalGamesStarted++;
       
@@ -624,8 +624,8 @@ export class LowCardGameManager {
         return;
       }
 
-      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
-      this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
+      game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.idtarget });
+      this._safeBroadcast(room, ["gameLowCardJoin", ws.idtarget, game.betAmount]);
       
     } catch (e) {
       this._logError(`JoinGame error: ${e.message}`);
@@ -742,7 +742,6 @@ export class LowCardGameManager {
       
       const entries = Array.from(numbers.entries());
       
-      // ========== TAMBAH: CEK TIDAK ADA YANG DRAW ==========
       if (entries.length === 0) {
         this._safeBroadcast(room, ["gameLowCardError", "No players drew cards, game ended"]);
         if (game.players) game.players.clear();
@@ -756,7 +755,6 @@ export class LowCardGameManager {
         return;
       }
       
-      // ========== TAMBAH: CEK HANYA 1 YANG DRAW ==========
       const submittedPlayers = Array.from(numbers.keys());
       if (submittedPlayers.length === 1 && game.players.size > 1) {
         const winnerId = submittedPlayers[0];
@@ -778,7 +776,6 @@ export class LowCardGameManager {
         return;
       }
       
-      // ========== LOGIKA ASLI TETAP SAMA ==========
       const activePlayers = Array.from(players.keys()).filter(id => 
         eliminated && !eliminated.has(id)
       );
