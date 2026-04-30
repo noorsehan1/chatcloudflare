@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER FIREBASE STYLE ====================
+// ==================== CHAT SERVER FIREBASE STYLE - NO AUTO DELETE ====================
 // name = "chat-firebase"
 // main = "index.js"
 // compatibility_date = "2026-04-30"
@@ -16,8 +16,8 @@ const CONSTANTS = {
   MAX_USERNAME: 30,
   MAX_MESSAGE: 5000,
   MAX_GIFT_NAME: 30,
-  STALE_TIMEOUT: 300000,
-  GC_INTERVAL: 60000,
+  // HAPUS! STALE_TIMEOUT: 300000,  // ❌ TIDAK DIPAKAI
+  // HAPUS! GC_INTERVAL: 60000,     // ❌ TIDAK DIPAKAI
 };
 
 const roomList = Object.freeze([
@@ -59,7 +59,6 @@ class RoomManager {
       itematas: 0,
       vip: 0,
       viptanda: 0,
-      lastSeen: Date.now()
     });
     this.userSeat.set(userId, seat);
     return seat;
@@ -91,7 +90,6 @@ class RoomManager {
         itematas: data.itematas ?? existing.itematas,
         vip: data.vip ?? existing.vip,
         viptanda: data.viptanda ?? existing.viptanda,
-        lastSeen: Date.now()
       });
       return true;
     }
@@ -114,21 +112,8 @@ class RoomManager {
   getMute() { return this.mute; }
   setCurrentNumber(num) { this.currentNumber = num; }
   getCurrentNumber() { return this.currentNumber; }
-
-  cleanupStale() {
-    const now = Date.now();
-    const staleUsers = [];
-    for (const [userId, seat] of this.userSeat) {
-      const seatData = this.seats.get(seat);
-      if (seatData && now - seatData.lastSeen > CONSTANTS.STALE_TIMEOUT) {
-        staleUsers.push(userId);
-      }
-    }
-    for (const userId of staleUsers) {
-      this.removeUser(userId);
-    }
-    return staleUsers.length;
-  }
+  
+  // ❌ HAPUS cleanupStale() - TIDAK DIPERLUKAN!
 }
 
 // ==================== CHAT SERVER - FIREBASE STYLE ====================
@@ -142,8 +127,8 @@ export class ChatServer2 {
     this.wsUser = new Map();          // WebSocket -> userId
     this.currentNumber = 1;
     this.lowcard = null;
-    this.gcTimer = null;
     this.numberTimer = null;
+    // ❌ HAPUS gcTimer
 
     // Init rooms
     for (const room of roomList) {
@@ -155,24 +140,8 @@ export class ChatServer2 {
       this.lowcard = new LowCardGameManager(this);
     } catch(e) {}
 
-    // Start timers
-    this.gcTimer = setInterval(() => this._gc(), CONSTANTS.GC_INTERVAL);
+    // Start timer ONLY untuk number tick
     this.numberTimer = setInterval(() => this._updateNumber(), 1000);
-  }
-
-  // ==================== GARBAGE COLLECTION SEDERHANA ====================
-  _gc() {
-    let totalCleaned = 0;
-    for (const room of this.rooms.values()) {
-      totalCleaned += room.cleanupStale();
-    }
-    
-    // Bersihkan user yang WS nya sudah mati
-    for (const [ws, userId] of this.wsUser) {
-      if (ws.readyState !== 1) {
-        this._removeUserCompletely(userId);
-      }
-    }
   }
 
   _updateNumber() {
@@ -183,7 +152,9 @@ export class ChatServer2 {
     this._broadcastAll(["currentNumber", this.currentNumber]);
   }
 
-  // ==================== CORE - HAPUS USER TOTAL ====================
+  // ❌ HAPUS _gc() - TIDAK DIPERLUKAN!
+
+  // ==================== CORE - HAPUS USER ONLY WHEN WS CLOSES ====================
   _removeUserCompletely(userId) {
     const roomName = this.userRoom.get(userId);
     if (roomName) {
@@ -205,7 +176,7 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== CLEANUP WEB SOCKET (LANGSUNG, TANPA LOCK) ====================
+  // ==================== CLEANUP WEB SOCKET (HANYA SAAT CLOSE/ERROR) ====================
   _cleanupWs(ws) {
     const userId = this.wsUser.get(ws);
     if (userId) {
@@ -248,7 +219,6 @@ export class ChatServer2 {
 
   // ==================== JOIN ROOM ====================
   async _joinRoom(ws, roomName, userId, userData = {}) {
-    // Validasi
     if (!roomList.includes(roomName)) {
       this._broadcastToUser(userId, ["error", "Invalid room"]);
       return false;
@@ -281,10 +251,6 @@ export class ChatServer2 {
         return false;
       }
       room.addUser(userId, seat, userData);
-    } else {
-      // Update last seen
-      const seatData = room.getSeatData(seat);
-      if (seatData) seatData.lastSeen = Date.now();
     }
 
     // Update mapping
@@ -322,7 +288,7 @@ export class ChatServer2 {
     return true;
   }
 
-  // ==================== HANDLE MESSAGE (TANPA TRY-CATCH BERANTAK) ====================
+  // ==================== HANDLE MESSAGE ====================
   async _handleMessage(ws, raw) {
     let data;
     try {
@@ -339,7 +305,6 @@ export class ChatServer2 {
         const [_, id, isNew] = data;
         if (!id) return;
         
-        // Koneksi baru: bersihkan data lama user ini
         if (isNew === true) {
           this._removeUserCompletely(id);
         }
@@ -477,10 +442,8 @@ export class ChatServer2 {
     const client = pair[0];
     const server = pair[1];
     
-    // PAKAI HIBERNATION API - NO EVICTION!
     this.state.acceptWebSocket(server);
     
-    // EVENT LANGSUNG TANPA LOCK RIBET
     server.addEventListener("message", (event) => {
       this._handleMessage(server, event.data);
     });
@@ -498,7 +461,6 @@ export class ChatServer2 {
 
   // ==================== DESTROY ====================
   async destroy() {
-    if (this.gcTimer) clearInterval(this.gcTimer);
     if (this.numberTimer) clearInterval(this.numberTimer);
     if (this.lowcard) await this.lowcard.destroy();
   }
