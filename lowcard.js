@@ -1,15 +1,15 @@
-// ==================== LOWCARDGAMEMANAGER.js - OPTIMIZED FOR 3s TICK ====================
+// ==================== LOWCARDGAMEMANAGER.js - FULL CLASS FINAL ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 6,
-  CLEANUP_INTERVAL_MS: 180000,        // 3 menit (dari 10 menit)
-  REGISTRATION_TIME: 20,               // 20 detik
-  DRAW_TIME: 20,                       // 20 detik
+  CLEANUP_INTERVAL_MS: 180000,
+  REGISTRATION_TIME: 20,
+  DRAW_TIME: 20,
   BOT_DRAW_MIN_SECONDS: 2,
   BOT_DRAW_MAX_SECONDS: 10,
-  MASTER_TICK_INTERVAL_MS: 3000,       // 3 detik (sinkron dengan ChatServer)
-  EVALUATION_DELAY_MS: 3000,           // 3 detik
+  MASTER_TICK_INTERVAL_MS: 3000,
+  EVALUATION_DELAY_MS: 3000,
   MAX_EVALUATION_TIME_MS: 10000,
   MAX_DRAW_WAIT_MS: 30000,
   LOCK_TIMEOUT_MS: 5000,
@@ -263,10 +263,6 @@ export class LowCardGameManager {
     return tandaOptions[Math.floor(Math.random() * tandaOptions.length)];
   }
 
-  getRandomDrawTime() {
-    return Math.floor(Math.random() * (CONSTANTS.BOT_DRAW_MAX_SECONDS - CONSTANTS.BOT_DRAW_MIN_SECONDS + 1)) + CONSTANTS.BOT_DRAW_MIN_SECONDS;
-  }
-
   getBotNumberByRound(round) {
     if (round <= 2) {
       return Math.floor(Math.random() * 12) + 1;
@@ -365,7 +361,10 @@ export class LowCardGameManager {
         _evalStartTime: null,
         drawStartTime: null,
         _evalScheduled: false,
-        _registrationStartTime: Date.now()
+        _registrationStartTime: Date.now(),
+        _lastBroadcastTime: null,
+        _botDrawStartTime: null,
+        _lastDrawTickCount: 0
       };
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -394,93 +393,132 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
-    // Hitung sisa waktu REAL berdasarkan waktu mulai
-    const elapsed = (Date.now() - (game._registrationStartTime || Date.now())) / 1000;
-    const timeLeft = Math.max(0, Math.ceil(CONSTANTS.REGISTRATION_TIME - elapsed));
+    // Hitung berdasarkan TICK (setiap 3 detik berkurang 3)
+    if (game.registrationTimeLeft > 0) {
+      game.registrationTimeLeft = game.registrationTimeLeft - 3;
+      if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
+    }
     
-    const timesToNotify = [20, 15, 10, 5, 0];
+    const timeLeft = game.registrationTimeLeft;
     
-    if (timesToNotify.includes(timeLeft)) {
-      if (timeLeft === 0) {
-        this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
-        if (game.players && game.players.size === 1) {
-          this._addFourMozBots(room);
-        }
-        this._closeRegistration(room);
-        return;
-      } else {
-        if (timeLeft !== game.registrationTimeLeft) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
-        }
+    // NOTIFIKASI HANYA 3x: 15, 10, 5
+    if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
+      if (game._lastBroadcastTime !== timeLeft) {
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        game._lastBroadcastTime = timeLeft;
       }
     }
     
-    game.registrationTimeLeft = timeLeft;
+    // Cek waktu habis
+    if (timeLeft === 0 && game.registrationOpen) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+      if (game.players && game.players.size === 1) {
+        this._addFourMozBots(room);
+      }
+      this._closeRegistration(room);
+    }
   }
 
   _handleDrawTick(game, room) {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
-    // Hitung sisa waktu REAL untuk draw
-    const elapsed = (Date.now() - (game.drawStartTime || Date.now())) / 1000;
-    const timeLeft = Math.max(0, Math.ceil(CONSTANTS.DRAW_TIME - elapsed));
-
+    // Set drawStartTime jika belum
     if (game.drawStartTime === null && game._phase === 'draw') {
       game.drawStartTime = Date.now();
+      game._botDrawStartTime = Date.now();
+      game._lastDrawTickCount = 0;
     }
-
-    const timesToNotify = [20, 15, 10, 5, 0];
-
-    if (timesToNotify.includes(timeLeft)) {
-      if (timeLeft === 0) {
-        if (game.drawTimeExpired) return;
-        
-        this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
-        game.drawTimeExpired = true;
-
-        const activePlayers = game.players ? 
-          Array.from(game.players.keys()).filter(id => !game.eliminated.has(id)) : [];
-        const allDrawn = game.numbers ? game.numbers.size === activePlayers.length : false;
-
-        if (!allDrawn) {
-          this._safeBroadcast(room, ["gameLowCardInfo", "Time is up, processing current draws..."]);
-        }
-
-        this._scheduleEvaluation(room, game);
-        return;
-      } else {
-        if (timeLeft !== game.drawTimeLeft || !game._hasBroadcastInitial) {
-          this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
-        }
-        game._hasBroadcastInitial = true;
+    
+    // Hitung berdasarkan TICK (setiap 3 detik berkurang 3)
+    if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
+      game.drawTimeLeft = game.drawTimeLeft - 3;
+      if (game.drawTimeLeft < 0) game.drawTimeLeft = 0;
+    }
+    
+    const timeLeft = game.drawTimeLeft;
+    
+    // Hitung tick keberapa
+    const tickInterval = CONSTANTS.MASTER_TICK_INTERVAL_MS / 1000;
+    const elapsed = (Date.now() - (game.drawStartTime || Date.now())) / 1000;
+    const tickCount = Math.floor(elapsed / tickInterval);
+    
+    // NOTIFIKASI HANYA 3x: 15, 10, 5
+    if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
+      if (game._lastBroadcastTime !== timeLeft) {
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        game._lastBroadcastTime = timeLeft;
       }
     }
-
-    game.drawTimeLeft = timeLeft;
-
+    
+    // BOT DRAW RANDOM PER TICK
     if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
-      const toDraw = [];
-      const snapshot = Array.from(game._pendingBotDraws.entries());
-      const newMap = new Map();
       
-      for (const [botId, timeRemaining] of snapshot) {
-        if (timeRemaining <= 0) {
-          toDraw.push(botId);
-        } else {
-          newMap.set(botId, timeRemaining - 1);
+      if (tickCount > (game._lastDrawTickCount || 0)) {
+        game._lastDrawTickCount = tickCount;
+        
+        const activeBots = Array.from(game.botPlayers.keys())
+          .filter(botId => !game.eliminated.has(botId));
+        const totalBots = activeBots.length;
+        const alreadyDrawn = Array.from(game.numbers.keys())
+          .filter(id => game.botPlayers.has(id)).length;
+        const remainingBots = totalBots - alreadyDrawn;
+        
+        if (remainingBots > 0) {
+          const ticksRemaining = Math.max(1, Math.ceil(timeLeft / tickInterval));
+          const botsToDrawThisTick = Math.max(1, Math.ceil(remainingBots / ticksRemaining));
+          
+          const pendingBotList = Array.from(game._pendingBotDraws.keys());
+          const shuffled = [...pendingBotList];
+          for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+          }
+          
+          const toDrawThisTick = [];
+          for (let i = 0; i < Math.min(botsToDrawThisTick, shuffled.length); i++) {
+            toDrawThisTick.push(shuffled[i]);
+          }
+          
+          for (const botId of toDrawThisTick) {
+            game._pendingBotDraws.delete(botId);
+          }
+          
+          for (const botId of toDrawThisTick) {
+            if (!game.drawTimeExpired && !game.evaluationLocked && 
+                game.eliminated && !game.eliminated.has(botId) && 
+                game.numbers && !game.numbers.has(botId)) {
+              this._handleBotDraw(room, botId);
+            }
+          }
         }
       }
+    }
+    
+    // Cek waktu habis
+    if (timeLeft === 0 && !game.drawTimeExpired) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "TIME UP!"]);
+      game.drawTimeExpired = true;
       
-      game._pendingBotDraws = newMap;
-      
-      for (const botId of toDraw) {
-        if (!game.drawTimeExpired && !game.evaluationLocked && 
-            game.eliminated && !game.eliminated.has(botId) && 
-            game.numbers && !game.numbers.has(botId)) {
-          this._handleBotDraw(room, botId);
+      if (game.useBots && game._pendingBotDraws && game._pendingBotDraws.size > 0) {
+        const remainingBots = Array.from(game._pendingBotDraws.keys());
+        for (const botId of remainingBots) {
+          if (!game.numbers.has(botId)) {
+            this._handleBotDraw(room, botId);
+          }
         }
+        game._pendingBotDraws.clear();
       }
+
+      const activePlayers = game.players ? 
+        Array.from(game.players.keys()).filter(id => !game.eliminated.has(id)) : [];
+      const allDrawn = game.numbers ? game.numbers.size === activePlayers.length : false;
+
+      if (!allDrawn) {
+        this._safeBroadcast(room, ["gameLowCardInfo", "Time is up, processing current draws..."]);
+      }
+
+      this._scheduleEvaluation(room, game);
     }
   }
 
@@ -505,7 +543,7 @@ export class LowCardGameManager {
       
       game.players.set(botId, { id: botId, name: botName });
       game.botPlayers.set(botId, botName);
-      this._safeBroadcast(room, ["gameLowCardJoin", botName, game.betAmount]);
+      game._pendingBotDraws.set(botId, true);
     }
   }
 
@@ -546,6 +584,9 @@ export class LowCardGameManager {
     game.drawTimeExpired = false;
     game._hasBroadcastInitial = false;
     game.drawStartTime = null;
+    game._lastBroadcastTime = null;
+    game._botDrawStartTime = null;
+    game._lastDrawTickCount = 0;
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
@@ -554,16 +595,6 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardClosed", playersList]);
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
-
-    if (game.useBots && game.botPlayers) {
-      if (game._pendingBotDraws) game._pendingBotDraws.clear();
-      game._pendingBotDraws = new Map();
-      const activeBots = Array.from(game.botPlayers.keys())
-        .filter(botId => !game.eliminated.has(botId));
-      for (const botId of activeBots) {
-        game._pendingBotDraws.set(botId, this.getRandomDrawTime());
-      }
-    }
   }
 
   _handleBotDraw(room, botId) {
@@ -886,6 +917,9 @@ export class LowCardGameManager {
       game._hasBroadcastInitial = false;
       game.drawStartTime = null;
       game._evalScheduled = false;
+      game._lastBroadcastTime = null;
+      game._botDrawStartTime = null;
+      game._lastDrawTickCount = 0;
       
       if (game.useBots && game.botPlayers) {
         if (game._pendingBotDraws) game._pendingBotDraws.clear();
@@ -893,7 +927,7 @@ export class LowCardGameManager {
         const activeBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated.has(botId));
         for (const botId of activeBots) {
-          game._pendingBotDraws.set(botId, this.getRandomDrawTime());
+          game._pendingBotDraws.set(botId, true);
         }
       }
       
