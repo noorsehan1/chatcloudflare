@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FINAL STABLE (FIXED ROOM COUNT) ====================
+// ==================== CHAT SERVER - FINAL STABLE (ROOM COUNT FIXED) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 
@@ -223,26 +223,19 @@ export class ChatServer2 {
     return sent;
   }
   
-  // UPDATE ROOM COUNT UNTUK SEMUA USER DI ROOM
+  // ========== ROOM COUNT - PERSIS SEPERTI KODE AWAL ==========
+  getRoomCount(room) {
+    const rm = this.rooms.get(room);
+    return rm ? rm.getOccupiedCount() : 0;
+  }
+
   updateRoomCount(room) {
-    const roomManager = this.rooms.get(room);
-    if (!roomManager) return 0;
-    
-    const count = roomManager.getOccupiedCount();
-    const message = JSON.stringify(["roomUserCount", room, count]);
-    
-    // Broadcast ke SEMUA user di room ini
-    const clients = this.roomClients.get(room);
-    if (clients && clients.size > 0) {
-      for (const ws of clients) {
-        if (ws && ws.readyState === 1 && !ws._isClosing) {
-          try { ws.send(message); } catch(e) {}
-        }
-      }
-    }
-    
+    const count = this.getRoomCount(room);
+    // BROADCAST ke SEMUA user di room - persis seperti kode awal
+    this.broadcastToRoom(room, ["roomUserCount", room, count]);
     return count;
   }
+  // ===========================================================
   
   async handleJoinRoom(ws, room) {
     if (!ws.idtarget || !ROOMS.includes(room)) {
@@ -254,23 +247,17 @@ export class ChatServer2 {
     const roomManager = this.rooms.get(room);
     if (!roomManager) return false;
     
-    // Cek apakah user sudah punya seat di room ini
     let seat = this.userSeat.get(userId);
     if (this.userRoom.get(userId) === room && seat) {
       const seatData = roomManager.getSeat(seat);
       if (seatData && seatData.namauser === userId) {
-        // Sudah di room ini, tinggal update koneksi
         this.roomClients.get(room).add(ws);
         ws.roomname = room;
-        
         await this.safeSend(ws, ["rooMasuk", seat, room]);
         await this.safeSend(ws, ["numberKursiSaya", seat]);
         await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-        
-        // Kirim jumlah user saat ini
         await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
         
-        // Kirim semua kursi yang ada (kecuali kursi sendiri)
         const allSeats = roomManager.getAllSeats();
         const otherSeats = {};
         for (const [s, data] of Object.entries(allSeats)) {
@@ -280,7 +267,6 @@ export class ChatServer2 {
           await this.safeSend(ws, ["allUpdateKursiList", room, otherSeats]);
         }
         
-        // Kirim semua points
         const allPoints = roomManager.getAllPoints();
         if (allPoints.length > 0) {
           await this.safeSend(ws, ["allPointsList", room, allPoints]);
@@ -290,7 +276,6 @@ export class ChatServer2 {
       }
     }
     
-    // Leave old room jika ada
     const oldRoom = this.userRoom.get(userId);
     if (oldRoom && oldRoom !== room) {
       const oldSeat = this.userSeat.get(userId);
@@ -298,9 +283,8 @@ export class ChatServer2 {
         const oldManager = this.rooms.get(oldRoom);
         if (oldManager) {
           oldManager.removeSeat(oldSeat);
-          // Broadcast ke semua user di old room
           this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-          this.updateRoomCount(oldRoom); // Update jumlah untuk semua user di old room
+          this.updateRoomCount(oldRoom); // UPDATE ROOM COUNT OLD ROOM
         }
       }
       this.roomClients.get(oldRoom)?.delete(ws);
@@ -308,13 +292,11 @@ export class ChatServer2 {
       this.userSeat.delete(userId);
     }
     
-    // Cek kapasitas room
     if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
       await this.safeSend(ws, ["roomFull", room]);
       return false;
     }
     
-    // Add ke room baru
     seat = roomManager.addSeat(userId);
     if (!seat) {
       await this.safeSend(ws, ["roomFull", room]);
@@ -326,18 +308,15 @@ export class ChatServer2 {
     this.roomClients.get(room).add(ws);
     ws.roomname = room;
     
-    // Kirim response ke user yang join
     await this.safeSend(ws, ["rooMasuk", seat, room]);
     await this.safeSend(ws, ["numberKursiSaya", seat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+    await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
-    // UPDATE ROOM COUNT UNTUK SEMUA USER (termasuk user baru dan semua user lain)
-    this.updateRoomCount(room);
-    
-    // Broadcast ke semua user di room bahwa ada user baru (kecuali user baru sendiri)
+    // BROADCAST ke semua user di room ada user baru
     this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
+    this.updateRoomCount(room); // UPDATE ROOM COUNT NEW ROOM
     
-    // Kirim daftar kursi yang sudah ada ke user baru (kecuali kursi sendiri)
     const allSeats = roomManager.getAllSeats();
     const otherSeats = {};
     for (const [s, data] of Object.entries(allSeats)) {
@@ -404,9 +383,8 @@ export class ChatServer2 {
             const seatData = roomManager.getSeat(seat);
             if (seatData && seatData.namauser === ws.idtarget) {
               roomManager.removeSeat(seat);
-              // Broadcast ke semua user di room
               this.broadcastToRoom(room, ["removeKursi", room, seat]);
-              this.updateRoomCount(room); // Update jumlah untuk semua user di room
+              this.updateRoomCount(room); // UPDATE ROOM COUNT
               this.userRoom.delete(ws.idtarget);
               this.userSeat.delete(ws.idtarget);
               this.roomClients.get(room)?.delete(ws);
@@ -580,14 +558,12 @@ export class ChatServer2 {
       userConns.add(ws);
       
       if (isNew === true) {
-        // Kick old connections
         for (const conn of userConns) {
           if (conn !== ws && conn.readyState === 1) {
             try { conn.close(1000, "New connection"); } catch(e) {}
           }
         }
         
-        // Clean up old seats
         const oldRoom = this.userRoom.get(userId);
         if (oldRoom) {
           const oldSeat = this.userSeat.get(userId);
@@ -596,7 +572,7 @@ export class ChatServer2 {
             if (roomManager) {
               roomManager.removeSeat(oldSeat);
               this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-              this.updateRoomCount(oldRoom); // Update jumlah untuk semua user di old room
+              this.updateRoomCount(oldRoom); // UPDATE ROOM COUNT
             }
           }
           this.userRoom.delete(userId);
@@ -605,7 +581,6 @@ export class ChatServer2 {
         
         await this.safeSend(ws, ["joinroomawal"]);
       } else {
-        // Reconnect
         const existingRoom = this.userRoom.get(userId);
         const existingSeat = this.userSeat.get(userId);
         
@@ -685,9 +660,8 @@ export class ChatServer2 {
             const seatData = roomManager.getSeat(seat);
             if (seatData && seatData.namauser === userId) {
               roomManager.removeSeat(seat);
-              // Broadcast ke semua user di room
               this.broadcastToRoom(room, ["removeKursi", room, seat]);
-              this.updateRoomCount(room); // Update jumlah untuk semua user di room
+              this.updateRoomCount(room); // UPDATE ROOM COUNT
             }
           }
         }
