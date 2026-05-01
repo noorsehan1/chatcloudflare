@@ -137,8 +137,16 @@ export class LowCardGameManager {
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
     }
     
-    // NOTIFIKASI 5s dari sini (20s sudah dikirim di startGame)
-    if (game.registrationTimeLeft === 5) {
+    const timeLeft = game.registrationTimeLeft;
+    
+    // NOTIFIKASI 20s hanya sekali di awal
+    if (timeLeft === 20 && !game._hasSentReg20s) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+      game._hasSentReg20s = true;
+    }
+    
+    // NOTIFIKASI 5s
+    if (timeLeft === 5) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
     }
     
@@ -163,7 +171,13 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI 5s dari sini
+    // NOTIFIKASI 20s hanya sekali di awal draw phase
+    if (timeLeft === 20 && !game._hasSentDraw20s) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+      game._hasSentDraw20s = true;
+    }
+    
+    // NOTIFIKASI 5s
     if (timeLeft === 5) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
     }
@@ -436,7 +450,9 @@ export class LowCardGameManager {
         _evalTimeout: null,
         _evalStartTime: null,
         drawStartTime: null,
-        _evalScheduled: false
+        _evalScheduled: false,
+        _hasSentReg20s: false,    // Flag untuk 20s registration
+        _hasSentDraw20s: false    // Flag untuk 20s draw
       };
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -445,9 +461,6 @@ export class LowCardGameManager {
       
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
-      
-      // NOTIFIKASI 20s AWAL REGISTRASI
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
       this._logError(`StartGame error: ${e.message}`);
@@ -521,6 +534,7 @@ export class LowCardGameManager {
     game.drawTimeExpired = false;
     game._hasBroadcastInitial = false;
     game.drawStartTime = Date.now();
+    game._hasSentDraw20s = false;  // Reset flag untuk draw phase baru
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
@@ -530,8 +544,7 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
     
-    // NOTIFIKASI 20s AWAL DRAW PHASE
-    this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+    // TIDAK KIRIM 20s DI SINI (biarkan dari _handleDrawTick)
   }
 
   _handleBotDraw(room, botId) {
@@ -597,11 +610,6 @@ export class LowCardGameManager {
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
       this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
-      
-      // NOTIFIKASI 20s SAAT ADA USER JOIN (jika masih registration phase)
-      if (game._phase === 'registration' && game.registrationTimeLeft === 20) {
-        this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
-      }
       
     } catch (e) {
       this._logError(`JoinGame error: ${e.message}`);
@@ -825,11 +833,11 @@ export class LowCardGameManager {
       game._hasBroadcastInitial = false;
       game.drawStartTime = Date.now();
       game._evalScheduled = false;
+      game._hasSentDraw20s = false;  // Reset flag untuk ronde baru
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
       
-      // NOTIFIKASI 20s UNTUK RONDE BARU
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+      // TIDAK KIRIM 20s DI SINI (biarkan dari _handleDrawTick)
       
     } catch (e) {
       this._logError(`EvaluateRound error in ${room}: ${e.message}`);
