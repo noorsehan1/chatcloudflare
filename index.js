@@ -5,8 +5,8 @@
 import LowCardGameManager from "./lowcard.js";
 
 const C = {
-  TICK_INTERVAL: 3000,
-  NUMBER_TICK: 300,
+  TICK_INTERVAL: 5000,        // DIUBAH: dari 3000 ke 5000 (5 detik)
+  NUMBER_TICK: 300,           // 300 * 5 detik = 1500 detik (25 menit) ganti number
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   MAX_USERNAME: 20,
@@ -123,6 +123,10 @@ export class ChatServer2 {
     this.tickCount = 0;
     this.lowcard = null;
     
+    // Cache untuk currentNumber broadcast
+    this._cachedNumberMsg = null;
+    this._cachedNumber = null;
+    
     for (const room of ROOMS) {
       this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
@@ -141,9 +145,14 @@ export class ChatServer2 {
 
   cleanupDeadConnections() {
     const deadWs = [];
+    let count = 0;
+    const MAX_CLEANUP_PER_CYCLE = 100;
+    
     for (const ws of this.wsSet) {
+      if (count >= MAX_CLEANUP_PER_CYCLE) break;
       if (ws.readyState !== 1 || ws._closing) {
         deadWs.push(ws);
+        count++;
       }
     }
     
@@ -201,11 +210,22 @@ export class ChatServer2 {
         this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
         for (const room of this.rooms.values()) room.setNumber(this.currentNumber);
         
-        const msg = JSON.stringify(["currentNumber", this.currentNumber]);
+        // Gunakan cached message untuk optimasi
+        if (this._cachedNumber !== this.currentNumber) {
+          this._cachedNumberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
+          this._cachedNumber = this.currentNumber;
+        }
+        
+        // Broadcast hanya ke user yang memiliki room
+        const roomSet = new Set();
         for (const ws of this.wsSet) {
           if (ws?.readyState === 1 && !ws._closing && ws.room) {
-            try { ws.send(msg); } catch(e) {}
+            roomSet.add(ws.room);
           }
+        }
+        
+        for (const room of roomSet) {
+          this.broadcast(room, ["currentNumber", this.currentNumber]);
         }
       }
       
@@ -278,20 +298,19 @@ export class ChatServer2 {
     
     ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
     
-    const allSeats = roomMan.getAllSeats();
-    const seatInfo = this.userSeat.get(ws.userId);
-    const selfSeat = seatInfo?.room === room ? seatInfo.seat : null;
+    // Gunakan for...of langsung dari Map (lebih cepat)
+    const selfSeat = this.userSeat.get(ws.userId)?.seat;
     
     if (excludeSelf && selfSeat) {
       const filtered = {};
-      for (const [s, data] of Object.entries(allSeats)) {
-        if (parseInt(s) !== selfSeat) filtered[s] = data;
+      for (const [seat, data] of roomMan.seats) {
+        if (seat !== selfSeat) filtered[seat] = data;
       }
       if (Object.keys(filtered).length) {
         ws.send(JSON.stringify(["allUpdateKursiList", room, filtered]));
       }
-    } else if (Object.keys(allSeats).length) {
-      ws.send(JSON.stringify(["allUpdateKursiList", room, allSeats]));
+    } else if (roomMan.seats.size) {
+      ws.send(JSON.stringify(["allUpdateKursiList", room, roomMan.getAllSeats()]));
     }
     
     const allPoints = roomMan.getAllPoints();
@@ -763,6 +782,7 @@ export class ChatServer2 {
           connections: this.wsSet.size,
           rooms: ROOMS.length,
           gameInitialized: !!this.lowcard,
+          tickInterval: C.TICK_INTERVAL,
           uptime: Date.now() - (this._startTime || Date.now())
         }), { headers: { "Content-Type": "application/json" } });
       }
@@ -816,6 +836,10 @@ export class ChatServer2 {
     
     this.currentNumber = 1;
     this.tickCount = 0;
+    
+    // Reset cache
+    this._cachedNumberMsg = null;
+    this._cachedNumber = null;
     
     if (this.lowcard && this.lowcard.destroy) {
       await this.lowcard.destroy();
