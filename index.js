@@ -59,7 +59,7 @@ try {
 } catch(e) {}
 
 // ========== MAIN CLASS ==========
-export class ChatServer {
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -1227,8 +1227,8 @@ export default {
     try {
       const url = new URL(request.url);
       const roomName = url.searchParams.get("room") || "main";
-      const id = env.CHAT_SERVER.idFromName(roomName);
-      const obj = env.CHAT_SERVER.get(id);
+      const id = env.CHAT_SERVER_2.idFromName(roomName);
+      const obj = env.CHAT_SERVER_2.get(id);
       return obj.fetch(request);
     } catch(error) {
       console.error("Worker error:", error);
