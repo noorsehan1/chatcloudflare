@@ -137,12 +137,7 @@ export class LowCardGameManager {
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
     }
     
-    // NOTIFIKASI 20s dan 5s untuk REGISTRATION
-    if (game.registrationTimeLeft === 20) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
-    } else if (game.registrationTimeLeft === 5) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
-    }
+    // NOTIFIKASI DIHAPUS DARI SINI - biarkan dari chatServer.tick()
     
     // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
@@ -165,12 +160,7 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI 20s dan 5s untuk DRAW
-    if (timeLeft === 20) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
-    } else if (timeLeft === 5) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
-    }
+    // NOTIFIKASI DIHAPUS DARI SINI - biarkan dari chatServer.tick()
     
     // BOT DRAW LOGIC
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
@@ -179,9 +169,7 @@ export class LowCardGameManager {
       const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
       
       if (notDrawnBots.length > 0 && timeLeft > 0) {
-        // Hitung berapa bot yang harus draw di tick ini
         const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
-        const ticksRemaining = Math.max(1, Math.ceil(timeLeft / 5));
         const totalBots = activeBots.length;
         const alreadyDrawn = totalBots - notDrawnBots.length;
         const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 5)) * totalBots));
@@ -533,7 +521,7 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
     
-    // Kirim notifikasi awal 20s untuk DRAW
+    // NOTIFIKASI 20s UNTUK AWAL DRAW PHASE
     this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
   }
 
@@ -825,7 +813,9 @@ export class LowCardGameManager {
       game._evalScheduled = false;
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]); // Notifikasi awal ronde baru
+      
+      // NOTIFIKASI 20s UNTUK AWAL RONDE BARU
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
       this._logError(`EvaluateRound error in ${room}: ${e.message}`);
