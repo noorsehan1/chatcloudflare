@@ -152,6 +152,14 @@ export class ChatServer2 {
     }
   }
   
+  updateRoomCount(room) {
+    const roomManager = this.rooms.get(room);
+    if (!roomManager) return;
+    
+    const count = roomManager.getOccupiedCount();
+    this.broadcastToRoom(room, ["roomUserCount", room, count]);
+  }
+  
   broadcastToRoom(room, msg) {
     const clients = this.roomClients.get(room);
     if (!clients || clients.size === 0) return;
@@ -186,6 +194,7 @@ export class ChatServer2 {
         if (oldSeat) {
           oldRoomManager.removeSeat(oldSeat);
           this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+          this.updateRoomCount(oldRoom);
         }
       }
       this.userSeat.delete(userId);
@@ -224,8 +233,10 @@ export class ChatServer2 {
     await this.safeSend(ws, ["rooMasuk", seat, room]);
     await this.safeSend(ws, ["numberKursiSaya", seat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+    await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
     this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
+    this.updateRoomCount(room);
     
     return true;
   }
@@ -256,6 +267,7 @@ export class ChatServer2 {
           await this.safeSend(ws, ["reconnectSuccess", seatInfo.room, seatInfo.seat]);
           await this.safeSend(ws, ["numberKursiSaya", seatInfo.seat]);
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          await this.safeSend(ws, ["roomUserCount", seatInfo.room, roomManager.getOccupiedCount()]);
           
           this.broadcastToRoom(seatInfo.room, ["userReconnected", seatInfo.room, seatInfo.seat, id]);
           return;
@@ -304,21 +316,26 @@ export class ChatServer2 {
           await this.handleJoinRoom(ws, data[1]);
           break;
           
-        case "chat":
-          const [, room, , username, message] = data;
+        case "chat": {
+          const room = data[1];
+          const username = data[3];
+          const message = data[4];
           if (ws.roomname === room && ws.idtarget === username) {
             this.broadcastToRoom(room, ["chat", room, "", username, message, "", ""]);
           }
           break;
+        }
           
-        case "removeKursiAndPoint":
-          const [, room, seat] = data;
+        case "removeKursiAndPoint": {
+          const room = data[1];
+          const seat = data[2];
           const roomManager = this.rooms.get(room);
           if (roomManager && ws.roomname === room) {
             const seatData = roomManager.getSeat(seat);
             if (seatData && seatData.namauser === ws.idtarget) {
               roomManager.removeSeat(seat);
               this.broadcastToRoom(room, ["removeKursi", room, seat]);
+              this.updateRoomCount(room);
               
               this.userSeat.delete(ws.idtarget);
               this.roomClients.get(room)?.delete(ws);
@@ -326,21 +343,42 @@ export class ChatServer2 {
             }
           }
           break;
+        }
           
-        case "setMuteType":
+        case "setMuteType": {
           const muteRoom = data[2];
           if (ROOMS.includes(muteRoom)) {
             const success = this.rooms.get(muteRoom).setMute(data[1]);
             await this.safeSend(ws, ["muteTypeSet", !!data[1], success, muteRoom]);
           }
           break;
+        }
           
-        case "getMuteType":
+        case "getMuteType": {
           const getRoom = data[1];
           if (ROOMS.includes(getRoom)) {
             await this.safeSend(ws, ["muteTypeResponse", this.rooms.get(getRoom).getMute(), getRoom]);
           }
           break;
+        }
+          
+        case "getRoomUserCount": {
+          const roomName = data[1];
+          if (ROOMS.includes(roomName)) {
+            const count = this.rooms.get(roomName).getOccupiedCount();
+            await this.safeSend(ws, ["roomUserCount", roomName, count]);
+          }
+          break;
+        }
+          
+        case "getAllRoomsUserCount": {
+          const counts = {};
+          for (const room of ROOMS) {
+            counts[room] = this.rooms.get(room).getOccupiedCount();
+          }
+          await this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
+          break;
+        }
           
         case "getCurrentNumber":
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
@@ -405,6 +443,7 @@ export class ChatServer2 {
               if (seatData && seatData.namauser === userId) {
                 roomManager.removeSeat(seatInfo.seat);
                 this.broadcastToRoom(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+                this.updateRoomCount(seatInfo.room);
               }
             }
             this.userSeat.delete(userId);
@@ -475,7 +514,7 @@ export class ChatServer2 {
     
     this.wsSet.add(server);
     
-    // Timeout for handshake
+    // Timeout for handshake only - NO AUTO KICK FOR INACTIVE USERS
     setTimeout(() => {
       if (!server.idtarget && server.readyState === 1) {
         try { server.close(1000, "Timeout"); } catch(e) {}
