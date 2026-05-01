@@ -7,6 +7,7 @@ try {
   const lowcardModule = await import("./lowcard.js");
   LowCardGameManager = lowcardModule.LowCardGameManager;
 } catch (e) {
+  console.error("Failed to load lowcard.js:", e);
   LowCardGameManager = class StubLowCardGameManager {
     constructor() {}
     masterTick() {}
@@ -139,9 +140,17 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
     
-    try {
-      this.lowcard = new LowCardGameManager(this);
-    } catch(e) {}
+    // Inisialisasi game dengan delay untuk memastikan semua siap
+    setTimeout(() => {
+      try {
+        if (LowCardGameManager !== class StubLowCardGameManager {}) {
+          this.lowcard = new LowCardGameManager(this);
+          console.log("LowCardGameManager initialized successfully");
+        }
+      } catch(e) {
+        console.error("Failed to initialize LowCardGameManager:", e);
+      }
+    }, 100);
     
     this.timer = setInterval(() => this.tick(), C.TICK_INTERVAL);
     this.cleanupTimer = setInterval(() => this.cleanupDeadConnections(), C.CLEANUP_INTERVAL);
@@ -217,10 +226,16 @@ export class ChatServer2 {
         }
       }
       
-      if (this.lowcard && this.lowcard.masterTick) {
-        this.lowcard.masterTick();
+      // Game tick - pastikan lowcard ada
+      if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
+        try {
+          this.lowcard.masterTick();
+        } catch(e) {
+          console.error("Error in masterTick:", e);
+        }
       }
       
+      // Game time notifications
       if (this.lowcard && this.lowcard.activeGames) {
         for (const [room, game] of this.lowcard.activeGames) {
           if (!game || !game._isActive) continue;
@@ -237,7 +252,9 @@ export class ChatServer2 {
           }
         }
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error("Tick error:", e);
+    }
     finally {
       this._processing = false;
     }
@@ -448,7 +465,6 @@ export class ChatServer2 {
         ws.send(JSON.stringify(["roomFull", roomName]));
         return false;
       }
-      // BUAT KURSI BARU DENGAN DATA KOSONG - USER HARUS UPDATE SENDIRI
       seat = roomMan.addSeat(userId, "", "", 0, 0, 0, 0);
       if (!seat) return false;
     }
@@ -469,7 +485,6 @@ export class ChatServer2 {
     ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
     ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
     
-    // KIRIM DATA KURSI KOSONG KE USER BIAR DIA UPDATE SENDIRI
     const currentSeatData = roomMan.getSeat(seat);
     ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, currentSeatData]]]));
     
@@ -478,6 +493,35 @@ export class ChatServer2 {
     setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
     
     return true;
+  }
+
+  async handleGameEvent(ws, data) {
+    if (!this.lowcard) {
+      console.warn("Game not initialized");
+      return;
+    }
+    
+    try {
+      const [evt, room, ...args] = data;
+      
+      // Pastikan room adalah game room
+      if (!GAME_ROOMS.includes(room)) {
+        console.warn(`Game event from non-game room: ${room}`);
+        return;
+      }
+      
+      // Pastikan user ada di room tersebut
+      if (ws.room !== room) {
+        console.warn(`User ${ws.userId} not in room ${room}`);
+        return;
+      }
+      
+      // Kirim event ke game manager
+      await this.lowcard.handleEvent(ws, data);
+    } catch(e) {
+      console.error("Game event error:", e);
+      ws.send(JSON.stringify(["error", "Game error occurred"]));
+    }
   }
 
   async handleMessage(ws, raw) {
@@ -501,6 +545,17 @@ export class ChatServer2 {
           ws.close(1000, "Session expired");
           return;
         }
+      }
+      
+      // Game events - handle with proper room validation
+      const gameEvents = ["gameLowCardStart", "gameLowCardJoin", "gameLowCardNumber", "gameLowCardEnd"];
+      if (gameEvents.includes(evt)) {
+        if (GAME_ROOMS.includes(ws.room) && this.lowcard) {
+          await this.handleGameEvent(ws, data);
+        } else {
+          ws.send(JSON.stringify(["error", "Game not available in this room"]));
+        }
+        return;
       }
       
       switch(evt) {
@@ -701,15 +756,6 @@ export class ChatServer2 {
           break;
         }
           
-        case "gameLowCardStart":
-        case "gameLowCardJoin":
-        case "gameLowCardNumber":
-        case "gameLowCardEnd":
-          if (GAME_ROOMS.includes(ws.room) && this.lowcard) {
-            try { await this.lowcard.handleEvent(ws, data); } catch(e) {}
-          }
-          break;
-          
         case "onDestroy":
           await this.cleanup(ws);
           break;
@@ -731,6 +777,7 @@ export class ChatServer2 {
           status: "ok",
           connections: this.wsSet.size,
           rooms: ROOMS.length,
+          gameInitialized: !!this.lowcard,
           uptime: Date.now() - (this._startTime || Date.now())
         }), { headers: { "Content-Type": "application/json" } });
       }
@@ -781,6 +828,15 @@ export class ChatServer2 {
     
     this.currentNumber = 1;
     this.tickCount = 0;
+    
+    // Reinit game
+    try {
+      if (LowCardGameManager !== class StubLowCardGameManager {}) {
+        this.lowcard = new LowCardGameManager(this);
+      }
+    } catch(e) {
+      console.error("Failed to reinitialize game:", e);
+    }
   }
   
   async webSocketMessage(ws, msg) { await this.handleMessage(ws, msg); }
@@ -791,6 +847,9 @@ export class ChatServer2 {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    if (this.lowcard && typeof this.lowcard.destroy === 'function') {
+      await this.lowcard.destroy();
+    }
     for (const ws of this.wsSet) {
       if (ws.readyState === 1) {
         try { ws.close(1000, "Server shutting down"); } catch(e) {}
