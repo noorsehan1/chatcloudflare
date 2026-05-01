@@ -160,6 +160,43 @@ export class ChatServer2 {
     }
   }
 
+  async kickOldConnections(userId, excludeWs = null) {
+    const existingConns = this.userConns.get(userId);
+    if (existingConns && existingConns.size > 0) {
+      for (const oldWs of existingConns) {
+        if (oldWs !== excludeWs && oldWs.readyState === 1 && !oldWs._closing) {
+          oldWs._closing = true;
+          try {
+            oldWs.send(JSON.stringify(["kicked", "Akun Anda login di tempat lain"]));
+            oldWs.close(1000, "Duplicate login");
+          } catch(e) {}
+          
+          const oldRoom = oldWs.room;
+          if (oldRoom) {
+            const roomMan = this.rooms.get(oldRoom);
+            let seatToRemove = null;
+            for (const [seat, data] of roomMan.seats) {
+              if (data?.namauser === userId) seatToRemove = seat;
+            }
+            if (seatToRemove) {
+              roomMan.removeSeat(seatToRemove);
+              this.broadcast(oldRoom, ["removeKursi", oldRoom, seatToRemove]);
+              this.updateRoomCount(oldRoom);
+            }
+            
+            const clients = this.roomClients.get(oldRoom);
+            if (clients) clients.delete(oldWs);
+          }
+          
+          this.userSeat.delete(userId);
+          this.userRoom.delete(userId);
+          this.userVersion.delete(userId);
+          this.wsSet.delete(oldWs);
+        }
+      }
+    }
+  }
+
   async tick() {
     if (this.closing || this._processing) return;
     this._processing = true;
@@ -184,7 +221,6 @@ export class ChatServer2 {
         this.lowcard.masterTick();
       }
       
-      // Game time notifications
       if (this.lowcard && this.lowcard.activeGames) {
         for (const [room, game] of this.lowcard.activeGames) {
           if (!game || !game._isActive) continue;
@@ -317,19 +353,11 @@ export class ChatServer2 {
     ws._version = version;
     ws.userId = userId;
     
+    // Kick old connections with same username
+    await this.kickOldConnections(userId, ws);
+    
     if (isNew === true) {
-      // Kick old connections
-      const oldConns = this.userConns.get(userId);
-      if (oldConns) {
-        for (const old of oldConns) {
-          if (old !== ws && old.readyState === 1) {
-            old._closing = true;
-            try { old.close(1000, "New connection"); } catch(e) {}
-          }
-        }
-      }
-      
-      // Clear old seats
+      // Clear old seats di semua room
       for (const [roomName, roomMan] of this.rooms) {
         let seatToRemove = null;
         for (const [seat, data] of roomMan.seats) {
@@ -350,8 +378,7 @@ export class ChatServer2 {
       
       ws.send(JSON.stringify(["joinroomawal"]));
     } else {
-      // Always clear all data - no reconnect
-      // Clear any existing seats
+      // Clear all user data - no reconnect, always need join room
       for (const [roomName, roomMan] of this.rooms) {
         let seatToRemove = null;
         for (const [seat, data] of roomMan.seats) {
@@ -364,11 +391,9 @@ export class ChatServer2 {
         }
       }
       
-      // Clear all user data
       this.userSeat.delete(userId);
       this.userRoom.delete(userId);
       
-      // Set new connection
       let conns = this.userConns.get(userId);
       if (!conns) conns = new Set();
       conns.add(ws);
@@ -376,7 +401,6 @@ export class ChatServer2 {
       this.userVersion.set(userId, version);
       this.wsSet.add(ws);
       
-      // Always require join room
       ws.send(JSON.stringify(["needJoinRoom"]));
     }
   }
@@ -396,7 +420,6 @@ export class ChatServer2 {
     const userId = ws.userId;
     const oldRoom = ws.room;
     
-    // Leave old room
     if (oldRoom && oldRoom !== roomName) {
       const oldMan = this.rooms.get(oldRoom);
       let oldSeat = null;
@@ -418,7 +441,6 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
-    // Check existing seat
     let seat = null;
     for (const [s, data] of roomMan.seats) {
       if (data?.namauser === userId) seat = s;
@@ -433,7 +455,6 @@ export class ChatServer2 {
       if (!seat) return false;
     }
     
-    // Update state
     this.userSeat.set(userId, { room: roomName, seat });
     this.userRoom.set(userId, roomName);
     ws.room = roomName;
@@ -445,16 +466,13 @@ export class ChatServer2 {
     }
     clients.add(ws);
     
-    // Send responses
     ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
     ws.send(JSON.stringify(["numberKursiSaya", seat]));
     ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
     ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
     
-    // Broadcast to room
     this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
     
-    // Send all state after short delay
     setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
     
     return true;
@@ -473,7 +491,6 @@ export class ChatServer2 {
       
       const [evt, ...args] = data;
       
-      // Version check for authenticated actions
       const needAuth = ["joinRoom", "chat", "updatePoint", "removeKursiAndPoint", "updateKursi", "gift", "rollangak"];
       if (needAuth.includes(evt) && ws.userId) {
         const currentVer = this.userVersion.get(ws.userId);
