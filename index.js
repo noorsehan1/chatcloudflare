@@ -438,51 +438,44 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
-    // WAJIB: Tambahkan ke roomClients TERLEBIH DAHULU
+    let seat = null;
+    for (const [s, data] of roomMan.seats) {
+      if (data?.namauser === userId) seat = s;
+    }
+    
+    if (!seat) {
+      if (roomMan.getCount() >= C.MAX_SEATS) {
+        ws.send(JSON.stringify(["roomFull", roomName]));
+        return false;
+      }
+      // BUAT KURSI BARU DENGAN DATA KOSONG - USER HARUS UPDATE SENDIRI
+      seat = roomMan.addSeat(userId, "", "", 0, 0, 0, 0);
+      if (!seat) return false;
+    }
+    
+    this.userSeat.set(userId, { room: roomName, seat });
+    this.userRoom.set(userId, roomName);
+    ws.room = roomName;
+    
     let clients = this.roomClients.get(roomName);
     if (!clients) {
       clients = new Set();
       this.roomClients.set(roomName, clients);
     }
     clients.add(ws);
-    ws.room = roomName;
-    
-    // CEK APAKAH USER SUDAH PUNYA KURSI
-    let seat = null;
-    for (const [s, data] of roomMan.seats) {
-      if (data?.namauser === userId) seat = s;
-    }
-    
-    // JIKA BELUM PUNYA KURSI
-    if (!seat) {
-      ws.send(JSON.stringify(["needUpdateKursi", roomName]));
-      ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
-      
-      const allSeats = roomMan.getAllSeats();
-      if (Object.keys(allSeats).length) {
-        ws.send(JSON.stringify(["allUpdateKursiList", roomName, allSeats]));
-      }
-      return true;
-    }
-    
-    // JIKA SUDAH PUNYA KURSI
-    this.userSeat.set(userId, { room: roomName, seat });
-    this.userRoom.set(userId, roomName);
     
     ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
     ws.send(JSON.stringify(["numberKursiSaya", seat]));
     ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
     ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
     
-    const allSeats = roomMan.getAllSeats();
-    if (Object.keys(allSeats).length) {
-      ws.send(JSON.stringify(["allUpdateKursiList", roomName, allSeats]));
-    }
+    // KIRIM DATA KURSI KOSONG KE USER BIAR DIA UPDATE SENDIRI
+    const currentSeatData = roomMan.getSeat(seat);
+    ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, currentSeatData]]]));
     
-    const allPoints = roomMan.getAllPoints();
-    if (allPoints.length) {
-      ws.send(JSON.stringify(["allPointsList", roomName, allPoints]));
-    }
+    this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
+    
+    setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
     
     return true;
   }
@@ -570,105 +563,9 @@ export class ChatServer2 {
           
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
-          
-          if (kursiName !== ws.userId) {
-            ws.send(JSON.stringify(["error", "Cannot update other user's seat"]));
-            break;
-          }
-          
-          if (!ROOMS.includes(kursiRoom)) {
-            ws.send(JSON.stringify(["error", "Invalid room"]));
-            break;
-          }
-          
-          const roomMan = this.rooms.get(kursiRoom);
-          if (!roomMan) break;
-          
-          // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
-          let existingSeat = null;
-          for (const [seat, data] of roomMan.seats) {
-            if (data?.namauser === kursiName) {
-              existingSeat = seat;
-              break;
-            }
-          }
-          
-          // JIKA BELUM PUNYA KURSI, BUAT KURSI BARU
-          if (!existingSeat) {
-            // CEK APAKAH KURSI YANG DIMINTA KOSONG
-            if (roomMan.getSeat(kursiSeat)) {
-              ws.send(JSON.stringify(["error", "Seat already taken"]));
-              break;
-            }
-            
-            // BUAT KURSI BARU DENGAN DATA LENGKAP
-            roomMan.seats.set(kursiSeat, {
-              noimageUrl: kursiNoimg?.slice(0, 255) || "",
-              namauser: kursiName,
-              color: kursiColor || "",
-              itembawah: kursiBawah || 0,
-              itematas: kursiAtas || 0,
-              vip: kursiVip || 0,
-              viptanda: kursiVt || 0,
-              lastUpdated: Date.now()
-            });
-            
-            // UPDATE STATE USER
-            this.userSeat.set(ws.userId, { room: kursiRoom, seat: kursiSeat });
-            this.userRoom.set(ws.userId, kursiRoom);
-            ws.room = kursiRoom;
-            
-            // TAMBAHKAN KE roomClients (jika belum)
-            let clients = this.roomClients.get(kursiRoom);
-            if (!clients) {
-              clients = new Set();
-              this.roomClients.set(kursiRoom, clients);
-            }
-            clients.add(ws);
-            
-            // KIRIM RESPON KE USER
-            ws.send(JSON.stringify(["rooMasuk", kursiSeat, kursiRoom]));
-            ws.send(JSON.stringify(["numberKursiSaya", kursiSeat]));
-            ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), kursiRoom]));
-            
-            // BROADCAST KE ROOM
-            this.broadcast(kursiRoom, ["userOccupiedSeat", kursiRoom, kursiSeat, kursiName]);
-            this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, roomMan.getSeat(kursiSeat)]]]);
-            
-            this.updateRoomCount(kursiRoom);
-            
-            // KIRIM SEMUA STATE
-            setTimeout(() => this.sendAllStateTo(ws, kursiRoom, true), 100);
-            
-          } else {
-            // JIKA SUDAH PUNYA KURSI, UPDATE DATA NYA SAJA
-            if (existingSeat !== kursiSeat) {
-              // PINDAH KURSI? HAPUS YANG LAMA, BUAT YANG BARU
-              roomMan.removeSeat(existingSeat);
-              this.broadcast(kursiRoom, ["removeKursi", kursiRoom, existingSeat]);
-              
-              if (roomMan.getSeat(kursiSeat)) {
-                ws.send(JSON.stringify(["error", "New seat already taken"]));
-                break;
-              }
-              
-              roomMan.seats.set(kursiSeat, {
-                noimageUrl: kursiNoimg?.slice(0, 255) || "",
-                namauser: kursiName,
-                color: kursiColor || "",
-                itembawah: kursiBawah || 0,
-                itematas: kursiAtas || 0,
-                vip: kursiVip || 0,
-                viptanda: kursiVt || 0,
-                lastUpdated: Date.now()
-              });
-              
-              this.userSeat.set(ws.userId, { room: kursiRoom, seat: kursiSeat });
-              ws.send(JSON.stringify(["numberKursiSaya", kursiSeat]));
-              this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, roomMan.getSeat(kursiSeat)]]]);
-              
-            } else {
-              // UPDATE DATA DI KURSI YANG SAMA
+          if (ws.room === kursiRoom && kursiName === ws.userId) {
+            const roomMan = this.rooms.get(kursiRoom);
+            if (roomMan?.getSeat(kursiSeat)) {
               roomMan.updateSeat(kursiSeat, {
                 noimageUrl: kursiNoimg,
                 namauser: kursiName,
