@@ -2,8 +2,7 @@
 // name = "chatcloudnew"
 // main = "index.js"
 
-// IMPORT LANGSUNG di level atas (BUKAN dynamic import)
-import { LowCardGameManager } from "./lowcard.js";
+import LowCardGameManager from "./lowcard.js";
 
 const C = {
   TICK_INTERVAL: 3000,
@@ -129,7 +128,6 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
     
-    // Inisialisasi game
     try {
       this.lowcard = new LowCardGameManager(this);
       console.log("LowCardGameManager initialized successfully");
@@ -469,7 +467,7 @@ export class ChatServer2 {
     this.userRoom.set(userId, roomName);
     ws.room = roomName;
     
-    // PENTING UNTUK GAME
+    // Untuk game
     ws.roomname = roomName;
     ws.idtarget = userId;
     ws.username = userId;
@@ -531,7 +529,6 @@ export class ChatServer2 {
           return;
         }
         
-        // Pastikan properti game ada
         if (!ws.idtarget) ws.idtarget = ws.userId;
         if (!ws.roomname) ws.roomname = ws.room;
         if (!ws.username) ws.username = ws.userId;
