@@ -23,8 +23,8 @@ const C = {
   MAX_USERNAME: 20,
   MAX_MSG_SIZE: 2000,
   MAX_GIFT_NAME: 20,
-  HANDSHAKE_TIMEOUT: 30000,
-  MAX_GLOBAL_CONNECTIONS: 500
+  MAX_GLOBAL_CONNECTIONS: 500,
+  CLEANUP_INTERVAL: 60000
 };
 
 const ROOMS = [
@@ -144,6 +144,42 @@ export class ChatServer2 {
     } catch(e) {}
     
     this.timer = setInterval(() => this.tick(), C.TICK_INTERVAL);
+    this.cleanupTimer = setInterval(() => this.cleanupPeriodic(), C.CLEANUP_INTERVAL);
+  }
+
+  // ========== SAFE SEND - KUNCI UTAMA ==========
+  safeSend(ws, str) {
+    if (!ws || ws.readyState !== 1 || ws._closing) return false;
+
+    // Proteksi client lemot (anti memory leak)
+    if (ws.bufferedAmount > 1024 * 512) { // 512KB limit
+      ws._closing = true;
+      try { ws.close(1000, "Buffer overflow"); } catch(e) {}
+      return false;
+    }
+
+    try {
+      ws.send(str);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async cleanupPeriodic() {
+    if (this.closing) return;
+    
+    const toRemove = [];
+    
+    for (const ws of this.wsSet) {
+      if (!ws || ws.readyState !== 1 || ws._closing) {
+        toRemove.push(ws);
+      }
+    }
+    
+    for (const ws of toRemove) {
+      await this.cleanup(ws);
+    }
   }
 
   async tick() {
@@ -161,7 +197,7 @@ export class ChatServer2 {
         const msg = JSON.stringify(["currentNumber", this.currentNumber]);
         for (const ws of this.wsSet) {
           if (ws?.readyState === 1 && !ws._closing && ws.room) {
-            try { ws.send(msg); } catch(e) {}
+            this.safeSend(ws, msg);
           }
         }
       }
@@ -170,7 +206,6 @@ export class ChatServer2 {
         this.lowcard.masterTick();
       }
       
-      // Game time notifications
       if (this.lowcard && this.lowcard.activeGames) {
         for (const [room, game] of this.lowcard.activeGames) {
           if (!game || !game._isActive) continue;
@@ -196,13 +231,16 @@ export class ChatServer2 {
   broadcast(room, msg) {
     const clients = this.roomClients.get(room);
     if (!clients?.size) return 0;
+    
     const str = JSON.stringify(msg);
     let count = 0;
+    
     for (const ws of clients) {
-      if (ws?.readyState === 1 && !ws._closing && ws.room === room) {
-        try { ws.send(str); count++; } catch(e) {}
+      if (ws?.readyState === 1 && !ws._closing && ws.room === room && this.safeSend(ws, str)) {
+        count++;
       }
     }
+    
     return count;
   }
 
@@ -218,7 +256,7 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(room);
     if (!roomMan) return;
     
-    ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
+    this.safeSend(ws, JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
     
     const allSeats = roomMan.getAllSeats();
     const seatInfo = this.userSeat.get(ws.userId);
@@ -230,15 +268,15 @@ export class ChatServer2 {
         if (parseInt(s) !== selfSeat) filtered[s] = data;
       }
       if (Object.keys(filtered).length) {
-        ws.send(JSON.stringify(["allUpdateKursiList", room, filtered]));
+        this.safeSend(ws, JSON.stringify(["allUpdateKursiList", room, filtered]));
       }
     } else if (Object.keys(allSeats).length) {
-      ws.send(JSON.stringify(["allUpdateKursiList", room, allSeats]));
+      this.safeSend(ws, JSON.stringify(["allUpdateKursiList", room, allSeats]));
     }
     
     const allPoints = roomMan.getAllPoints();
     if (allPoints.length) {
-      ws.send(JSON.stringify(["allPointsList", room, allPoints]));
+      this.safeSend(ws, JSON.stringify(["allPointsList", room, allPoints]));
     }
   }
 
@@ -295,7 +333,7 @@ export class ChatServer2 {
 
   async handleSetId(ws, userId, isNew) {
     if (!userId || userId.length > C.MAX_USERNAME || userId.length === 0) {
-      ws.close(1000, "Invalid ID");
+      try { ws.close(1000, "Invalid ID"); } catch(e) {}
       return;
     }
     
@@ -304,7 +342,6 @@ export class ChatServer2 {
     ws.userId = userId;
     
     if (isNew === true) {
-      // Kick old connections
       const oldConns = this.userConns.get(userId);
       if (oldConns) {
         for (const old of oldConns) {
@@ -315,7 +352,6 @@ export class ChatServer2 {
         }
       }
       
-      // Clear old seats
       for (const [roomName, roomMan] of this.rooms) {
         let seatToRemove = null;
         for (const [seat, data] of roomMan.seats) {
@@ -334,9 +370,8 @@ export class ChatServer2 {
       this.userRoom.delete(userId);
       this.wsSet.add(ws);
       
-      ws.send(JSON.stringify(["joinroomawal"]));
+      this.safeSend(ws, JSON.stringify(["joinroomawal"]));
     } else {
-      // Reconnect
       let conns = this.userConns.get(userId);
       if (!conns) conns = new Set();
       conns.add(ws);
@@ -350,11 +385,11 @@ export class ChatServer2 {
         if (roomMan && roomMan.getSeat(seatInfo.seat)?.namauser === userId) {
           ws.room = seatInfo.room;
           
-          ws.send(JSON.stringify(["reconnectSuccess", seatInfo.room, seatInfo.seat]));
-          ws.send(JSON.stringify(["numberKursiSaya", seatInfo.seat]));
-          ws.send(JSON.stringify(["currentNumber", this.currentNumber]));
-          ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), seatInfo.room]));
-          ws.send(JSON.stringify(["roomUserCount", seatInfo.room, roomMan.getCount()]));
+          this.safeSend(ws, JSON.stringify(["reconnectSuccess", seatInfo.room, seatInfo.seat]));
+          this.safeSend(ws, JSON.stringify(["numberKursiSaya", seatInfo.seat]));
+          this.safeSend(ws, JSON.stringify(["currentNumber", this.currentNumber]));
+          this.safeSend(ws, JSON.stringify(["muteTypeResponse", roomMan.getMuted(), seatInfo.room]));
+          this.safeSend(ws, JSON.stringify(["roomUserCount", seatInfo.room, roomMan.getCount()]));
           
           const allSeats = roomMan.getAllSeats();
           const otherSeats = {};
@@ -362,44 +397,43 @@ export class ChatServer2 {
             if (parseInt(s) !== seatInfo.seat) otherSeats[s] = data;
           }
           if (Object.keys(otherSeats).length) {
-            ws.send(JSON.stringify(["allUpdateKursiList", seatInfo.room, otherSeats]));
+            this.safeSend(ws, JSON.stringify(["allUpdateKursiList", seatInfo.room, otherSeats]));
           }
           
           const allPoints = roomMan.getAllPoints();
           const otherPoints = allPoints.filter(p => p.seat !== seatInfo.seat);
           if (otherPoints.length) {
-            ws.send(JSON.stringify(["allPointsList", seatInfo.room, otherPoints]));
+            this.safeSend(ws, JSON.stringify(["allPointsList", seatInfo.room, otherPoints]));
           }
           
           const selfPoint = roomMan.getPoint(seatInfo.seat);
           if (selfPoint) {
-            ws.send(JSON.stringify(["pointUpdated", seatInfo.room, seatInfo.seat, selfPoint.x, selfPoint.y, selfPoint.fast ? 1 : 0]));
+            this.safeSend(ws, JSON.stringify(["pointUpdated", seatInfo.room, seatInfo.seat, selfPoint.x, selfPoint.y, selfPoint.fast ? 1 : 0]));
           }
           
           this.broadcast(seatInfo.room, ["userReconnected", seatInfo.room, seatInfo.seat, userId]);
           return;
         }
       }
-      ws.send(JSON.stringify(["needJoinRoom"]));
+      this.safeSend(ws, JSON.stringify(["needJoinRoom"]));
     }
   }
 
   async handleJoin(ws, roomName) {
     if (!ws.userId || !ROOMS.includes(roomName)) {
-      ws.send(JSON.stringify(["error", "Invalid room"]));
+      this.safeSend(ws, JSON.stringify(["error", "Invalid room"]));
       return false;
     }
     
     const currentVer = this.userVersion.get(ws.userId);
     if (currentVer !== ws._version) {
-      ws.send(JSON.stringify(["error", "Session expired"]));
+      this.safeSend(ws, JSON.stringify(["error", "Session expired"]));
       return false;
     }
     
     const userId = ws.userId;
     const oldRoom = ws.room;
     
-    // Leave old room
     if (oldRoom && oldRoom !== roomName) {
       const oldMan = this.rooms.get(oldRoom);
       let oldSeat = null;
@@ -421,7 +455,6 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
-    // Check existing seat
     let seat = null;
     for (const [s, data] of roomMan.seats) {
       if (data?.namauser === userId) seat = s;
@@ -429,14 +462,13 @@ export class ChatServer2 {
     
     if (!seat) {
       if (roomMan.getCount() >= C.MAX_SEATS) {
-        ws.send(JSON.stringify(["roomFull", roomName]));
+        this.safeSend(ws, JSON.stringify(["roomFull", roomName]));
         return false;
       }
       seat = roomMan.addSeat(userId);
       if (!seat) return false;
     }
     
-    // Update state
     this.userSeat.set(userId, { room: roomName, seat });
     this.userRoom.set(userId, roomName);
     ws.room = roomName;
@@ -448,16 +480,13 @@ export class ChatServer2 {
     }
     clients.add(ws);
     
-    // Send responses
-    ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
-    ws.send(JSON.stringify(["numberKursiSaya", seat]));
-    ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
-    ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
+    this.safeSend(ws, JSON.stringify(["rooMasuk", seat, roomName]));
+    this.safeSend(ws, JSON.stringify(["numberKursiSaya", seat]));
+    this.safeSend(ws, JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
+    this.safeSend(ws, JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
     
-    // Broadcast to room
     this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
     
-    // Send all state after short delay
     setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
     
     return true;
@@ -476,20 +505,19 @@ export class ChatServer2 {
       
       const [evt, ...args] = data;
       
-      // Version check for authenticated actions
       const needAuth = ["joinRoom", "chat", "updatePoint", "removeKursiAndPoint", "updateKursi", "gift", "rollangak"];
       if (needAuth.includes(evt) && ws.userId) {
         const currentVer = this.userVersion.get(ws.userId);
         if (currentVer !== ws._version) {
-          ws.send(JSON.stringify(["error", "Session expired"]));
-          ws.close(1000, "Session expired");
+          this.safeSend(ws, JSON.stringify(["error", "Session expired"]));
+          try { ws.close(1000, "Session expired"); } catch(e) {}
           return;
         }
       }
       
       switch(evt) {
         case "isInRoom":
-          ws.send(JSON.stringify(["inRoomStatus", this.userRoom.has(ws.userId)]));
+          this.safeSend(ws, JSON.stringify(["inRoomStatus", this.userRoom.has(ws.userId)]));
           break;
           
         case "setIdTarget2":
@@ -519,7 +547,13 @@ export class ChatServer2 {
             const seatData = roomMan?.getSeat(pointSeat);
             if (seatData?.namauser === ws.userId) {
               if (roomMan.updatePoint(pointSeat, parseFloat(pointX), parseFloat(pointY), pointFast === 1)) {
-                this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+                const msg = JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+                const clients = this.roomClients.get(pointRoom);
+                if (clients) {
+                  for (const c of clients) {
+                    this.safeSend(c, msg);
+                  }
+                }
               }
             }
           }
@@ -569,7 +603,7 @@ export class ChatServer2 {
           const [muteVal, muteRoom] = args;
           if (ROOMS.includes(muteRoom)) {
             this.rooms.get(muteRoom).setMuted(muteVal);
-            ws.send(JSON.stringify(["muteTypeSet", !!muteVal, true, muteRoom]));
+            this.safeSend(ws, JSON.stringify(["muteTypeSet", !!muteVal, true, muteRoom]));
             this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
           }
           break;
@@ -578,7 +612,7 @@ export class ChatServer2 {
         case "getMuteType": {
           const getMuteRoom = args[0];
           if (ROOMS.includes(getMuteRoom)) {
-            ws.send(JSON.stringify(["muteTypeResponse", this.rooms.get(getMuteRoom).getMuted(), getMuteRoom]));
+            this.safeSend(ws, JSON.stringify(["muteTypeResponse", this.rooms.get(getMuteRoom).getMuted(), getMuteRoom]));
           }
           break;
         }
@@ -586,20 +620,20 @@ export class ChatServer2 {
         case "getAllRoomsUserCount": {
           const counts = {};
           for (const room of ROOMS) counts[room] = this.rooms.get(room).getCount();
-          ws.send(JSON.stringify(["allRoomsUserCount", Object.entries(counts)]));
+          this.safeSend(ws, JSON.stringify(["allRoomsUserCount", Object.entries(counts)]));
           break;
         }
           
         case "getRoomUserCount": {
           const roomName = args[0];
           if (ROOMS.includes(roomName)) {
-            ws.send(JSON.stringify(["roomUserCount", roomName, this.rooms.get(roomName).getCount()]));
+            this.safeSend(ws, JSON.stringify(["roomUserCount", roomName, this.rooms.get(roomName).getCount()]));
           }
           break;
         }
           
         case "getCurrentNumber":
-          ws.send(JSON.stringify(["currentNumber", this.currentNumber]));
+          this.safeSend(ws, JSON.stringify(["currentNumber", this.currentNumber]));
           break;
           
         case "isUserOnline": {
@@ -611,7 +645,7 @@ export class ChatServer2 {
               if (c?.readyState === 1 && !c._closing) { isOnline = true; break; }
             }
           }
-          ws.send(JSON.stringify(["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]));
+          this.safeSend(ws, JSON.stringify(["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]));
           break;
         }
           
@@ -625,7 +659,7 @@ export class ChatServer2 {
               }
             }
           }
-          ws.send(JSON.stringify(["allOnlineUsers", users]));
+          this.safeSend(ws, JSON.stringify(["allOnlineUsers", users]));
           break;
         }
           
@@ -660,7 +694,7 @@ export class ChatServer2 {
           if (targetConns) {
             for (const c of targetConns) {
               if (c?.readyState === 1 && !c._closing) {
-                c.send(JSON.stringify(["notif", notifNoimg, notifUser, notifMsg, Date.now()]));
+                this.safeSend(c, JSON.stringify(["notif", notifNoimg, notifUser, notifMsg, Date.now()]));
                 break;
               }
             }
@@ -675,12 +709,12 @@ export class ChatServer2 {
             if (targetConns) {
               for (const c of targetConns) {
                 if (c?.readyState === 1 && !c._closing) {
-                  c.send(JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
+                  this.safeSend(c, JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
                   break;
                 }
               }
             }
-            ws.send(JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
+            this.safeSend(ws, JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
           }
           break;
         }
@@ -741,22 +775,13 @@ export class ChatServer2 {
     
     this.wsSet.add(server);
     
-    // Handshake timeout
-    setTimeout(() => {
-      if (!server.userId && server.readyState === 1 && !server._closing) {
-        server._closing = true;
-        try { server.close(1000, "Handshake timeout"); } catch(e) {}
-        this.wsSet.delete(server);
-      }
-    }, C.HANDSHAKE_TIMEOUT);
-    
     return new Response(null, { status: 101, webSocket: client });
   }
   
   async reset() {
     for (const ws of this.wsSet) {
       if (ws?.readyState === 1 && !ws._closing) {
-        try { ws.send(JSON.stringify(["serverRestart", "Server restarting..."])); } catch(e) {}
+        this.safeSend(ws, JSON.stringify(["serverRestart", "Server restarting..."]));
         try { ws.close(1000, "Restart"); } catch(e) {}
       }
     }
