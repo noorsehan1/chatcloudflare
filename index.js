@@ -2,24 +2,8 @@
 // name = "chatcloudnew"
 // main = "index.js"
 
-let LowCardGameManager;
-try {
-  const lowcardModule = await import("./lowcard.js");
-  LowCardGameManager = lowcardModule.LowCardGameManager;
-  console.log("LowCardGameManager loaded successfully");
-} catch (e) {
-  console.error("Failed to load lowcard.js:", e);
-  LowCardGameManager = class StubLowCardGameManager {
-    constructor() {
-      console.log("StubLowCardGameManager created");
-    }
-    masterTick() {}
-    async handleEvent() {
-      console.log("Stub handleEvent called");
-    }
-    async destroy() {}
-  };
-}
+// IMPORT LANGSUNG di level atas (BUKAN dynamic import)
+import { LowCardGameManager } from "./lowcard.js";
 
 const C = {
   TICK_INTERVAL: 3000,
@@ -145,9 +129,10 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
     
+    // Inisialisasi game
     try {
       this.lowcard = new LowCardGameManager(this);
-      console.log("LowCardGameManager initialized in ChatServer2");
+      console.log("LowCardGameManager initialized successfully");
     } catch(e) {
       console.error("Failed to init LowCardGameManager:", e);
     }
@@ -489,8 +474,6 @@ export class ChatServer2 {
     ws.idtarget = userId;
     ws.username = userId;
     
-    console.log(`[GAME DEBUG] User ${userId} joined room ${roomName}, ws.roomname=${ws.roomname}, ws.idtarget=${ws.idtarget}`);
-    
     let clients = this.roomClients.get(roomName);
     if (!clients) {
       clients = new Set();
@@ -526,11 +509,6 @@ export class ChatServer2 {
       
       const [evt, ...args] = data;
       
-      // DEBUG: Log game events
-      if (evt.startsWith("gameLowCard")) {
-        console.log(`[GAME DEBUG] Received event: ${evt} from user ${ws.userId} in room ${ws.room}`);
-      }
-      
       const needAuth = ["joinRoom", "chat", "updatePoint", "removeKursiAndPoint", "updateKursi", "gift", "rollangak"];
       if (needAuth.includes(evt) && ws.userId) {
         const currentVer = this.userVersion.get(ws.userId);
@@ -541,37 +519,28 @@ export class ChatServer2 {
         }
       }
       
-      // GAME EVENTS - handle dengan prioritas tinggi
+      // GAME EVENTS
       if (evt === "gameLowCardStart" || evt === "gameLowCardJoin" || evt === "gameLowCardNumber" || evt === "gameLowCardEnd") {
-        console.log(`[GAME DEBUG] Processing game event: ${evt}, room=${ws.room}, gameRooms=${GAME_ROOMS.includes(ws.room)}, lowcard=${!!this.lowcard}`);
-        
         if (!this.lowcard) {
-          console.error("[GAME DEBUG] LowCardGameManager not initialized!");
           this.safeSend(ws, ["gameLowCardError", "Game system not ready"]);
           return;
         }
         
         if (!GAME_ROOMS.includes(ws.room)) {
-          console.log(`[GAME DEBUG] Room ${ws.room} is not a game room`);
           this.safeSend(ws, ["gameLowCardError", "Game not available in this room"]);
           return;
         }
         
-        if (!ws.idtarget || !ws.roomname) {
-          console.log(`[GAME DEBUG] Missing ws props: idtarget=${ws.idtarget}, roomname=${ws.roomname}`);
-          // Coba set ulang dari ws.userId dan ws.room
-          if (!ws.idtarget && ws.userId) ws.idtarget = ws.userId;
-          if (!ws.roomname && ws.room) ws.roomname = ws.room;
-          if (!ws.username && ws.userId) ws.username = ws.userId;
-        }
+        // Pastikan properti game ada
+        if (!ws.idtarget) ws.idtarget = ws.userId;
+        if (!ws.roomname) ws.roomname = ws.room;
+        if (!ws.username) ws.username = ws.userId;
         
         try {
-          console.log(`[GAME DEBUG] Calling lowcard.handleEvent with data:`, data);
           await this.lowcard.handleEvent(ws, data);
-          console.log(`[GAME DEBUG] handleEvent completed for ${evt}`);
         } catch(e) {
-          console.error(`[GAME DEBUG] Error in handleEvent:`, e);
-          this.safeSend(ws, ["gameLowCardError", e.message || "Game error occurred"]);
+          console.error("Game event error:", e);
+          this.safeSend(ws, ["gameLowCardError", e.message || "Game error"]);
         }
         return;
       }
@@ -778,13 +747,6 @@ export class ChatServer2 {
         case "onDestroy":
           await this.cleanup(ws);
           break;
-          
-        default:
-          // Unknown event - log untuk debugging
-          if (!evt.startsWith("gameLowCard")) {
-            console.log(`[DEBUG] Unknown event: ${evt}`);
-          }
-          break;
       }
     } catch(e) {
       console.error("Message error:", e);
@@ -804,7 +766,6 @@ export class ChatServer2 {
           connections: this.wsSet.size,
           rooms: ROOMS.length,
           gameInitialized: !!this.lowcard,
-          gameType: this.lowcard?.constructor?.name || "none",
           uptime: Date.now() - (this._startTime || Date.now())
         }), { headers: { "Content-Type": "application/json" } });
       }
@@ -865,7 +826,6 @@ export class ChatServer2 {
     
     try {
       this.lowcard = new LowCardGameManager(this);
-      console.log("LowCardGameManager reinitialized after reset");
     } catch(e) {
       console.error("Failed to reinit game:", e);
     }
