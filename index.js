@@ -100,23 +100,20 @@ export class ChatServer2 {
     this._startTime = Date.now();
     this._isClosing = false;
     
-    // Sederhana - langsung pakai Map biasa
     this.rooms = new Map();
-    this.userRoom = new Map();        // userId -> room name
-    this.userSeat = new Map();        // userId -> seat number
-    this.roomClients = new Map();     // room -> Set of WebSockets
+    this.userRoom = new Map();
+    this.userSeat = new Map();
+    this.roomClients = new Map();
     this.wsSet = new Set();
     
     this.currentNumber = 1;
     this.tickCounter = 0;
     
-    // Initialize rooms
     for (const room of ROOMS) {
       this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
     }
     
-    // Game manager
     this.lowcard = null;
     try {
       this.lowcard = new LowCardGameManager(this);
@@ -124,7 +121,6 @@ export class ChatServer2 {
       console.error("Failed to init LowCardGameManager:", error);
     }
     
-    // Single timer
     this.timer = setInterval(() => this.masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
   }
   
@@ -133,7 +129,6 @@ export class ChatServer2 {
     
     this.tickCounter++;
     
-    // Number tick (every 15 minutes)
     if (this.tickCounter % CONSTANTS.NUMBER_TICK_COUNT === 0) {
       this.currentNumber = this.currentNumber < CONSTANTS.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
@@ -144,7 +139,6 @@ export class ChatServer2 {
       this.broadcastAll(["currentNumber", this.currentNumber]);
     }
     
-    // Game tick
     if (this.lowcard && typeof this.lowcard.masterTick === 'function') {
       try { this.lowcard.masterTick(); } catch(e) {}
     }
@@ -181,12 +175,10 @@ export class ChatServer2 {
     const roomManager = this.rooms.get(room);
     if (!roomManager) return false;
     
-    // Check if already in this room
     let seat = this.userSeat.get(userId);
     if (this.userRoom.get(userId) === room && seat) {
       const seatData = roomManager.getSeat(seat);
       if (seatData && seatData.namauser === userId) {
-        // Already here, just update connection
         this.roomClients.get(room).add(ws);
         ws.roomname = room;
         await this.safeSend(ws, ["rooMasuk", seat, room]);
@@ -195,7 +187,6 @@ export class ChatServer2 {
       }
     }
     
-    // Leave old room if any
     const oldRoom = this.userRoom.get(userId);
     if (oldRoom && oldRoom !== room) {
       const oldSeat = this.userSeat.get(userId);
@@ -209,13 +200,11 @@ export class ChatServer2 {
       this.roomClients.get(oldRoom)?.delete(ws);
     }
     
-    // Check room capacity
     if (roomManager.getOccupiedCount() >= CONSTANTS.MAX_SEATS) {
       await this.safeSend(ws, ["roomFull", room]);
       return false;
     }
     
-    // Add to new room
     seat = roomManager.addSeat(userId);
     if (!seat) {
       await this.safeSend(ws, ["roomFull", room]);
@@ -233,7 +222,6 @@ export class ChatServer2 {
     
     this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
     
-    // Send existing seats
     const allSeats = roomManager.getAllSeats();
     delete allSeats[seat];
     if (Object.keys(allSeats).length > 0) {
@@ -256,57 +244,68 @@ export class ChatServer2 {
       
       if (!Array.isArray(data) || data.length === 0) return;
       
-      const [evt, ...args] = data;
+      const evt = data[0];
       
       switch (evt) {
         case "setIdTarget2":
-          await this.handleSetId(ws, args[0], args[1]);
+          await this.handleSetId(ws, data[1], data[2]);
           break;
           
         case "joinRoom":
-          await this.handleJoinRoom(ws, args[0]);
+          await this.handleJoinRoom(ws, data[1]);
           break;
           
-        case "chat":
-          const [, roomname, username, message] = data;
-          if (ws.roomname === roomname && ws.idtarget === username) {
-            this.broadcastToRoom(roomname, ["chat", roomname, username, message]);
+        case "chat": {
+          const chatRoom = data[1];
+          const username = data[2];
+          const message = data[3];
+          if (ws.roomname === chatRoom && ws.idtarget === username) {
+            this.broadcastToRoom(chatRoom, ["chat", chatRoom, username, message]);
           }
           break;
+        }
           
-        case "removeKursiAndPoint":
-          const [room, seat] = args;
-          if (ws.roomname === room && this.userSeat.get(ws.idtarget) === seat) {
-            const roomManager = this.rooms.get(room);
+        case "removeKursiAndPoint": {
+          const removeRoom = data[1];
+          const seatNum = data[2];
+          if (ws.roomname === removeRoom && this.userSeat.get(ws.idtarget) === seatNum) {
+            const roomManager = this.rooms.get(removeRoom);
             if (roomManager) {
-              roomManager.removeSeat(seat);
-              this.broadcastToRoom(room, ["removeKursi", room, seat]);
+              roomManager.removeSeat(seatNum);
+              this.broadcastToRoom(removeRoom, ["removeKursi", removeRoom, seatNum]);
               this.userRoom.delete(ws.idtarget);
               this.userSeat.delete(ws.idtarget);
-              this.roomClients.get(room)?.delete(ws);
+              this.roomClients.get(removeRoom)?.delete(ws);
               ws.roomname = undefined;
             }
           }
           break;
+        }
           
-        case "setMuteType":
-          const [isMuted, roomName] = args;
-          if (ROOMS.includes(roomName)) {
-            const success = this.rooms.get(roomName).setMute(isMuted);
-            this.broadcastToRoom(roomName, ["muteStatusChanged", success, roomName]);
+        case "setMuteType": {
+          const isMuted = data[1];
+          const muteRoom = data[2];
+          if (ROOMS.includes(muteRoom)) {
+            const success = this.rooms.get(muteRoom).setMute(isMuted);
+            this.broadcastToRoom(muteRoom, ["muteStatusChanged", success, muteRoom]);
           }
           break;
+        }
           
         case "getCurrentNumber":
           await this.safeSend(ws, ["currentNumber", this.currentNumber]);
           break;
           
-        case "gift":
-          const [, roomname, sender, receiver, giftName] = data;
-          if (ROOMS.includes(roomname)) {
-            this.broadcastToRoom(roomname, ["gift", roomname, sender, receiver, giftName]);
+        case "gift": {
+          const giftRoom = data[1];
+          const sender = data[2];
+          const receiver = data[3];
+          const giftName = data[4] || "";
+          if (ROOMS.includes(giftRoom)) {
+            this.broadcastToRoom(giftRoom, ["gift", giftRoom, sender, receiver, giftName]);
           }
           break;
+        }
           
         case "gameLowCardStart":
         case "gameLowCardJoin":
@@ -332,16 +331,13 @@ export class ChatServer2 {
   async handleSetId(ws, userId, isNew) {
     if (!userId) return;
     
-    // Close old connections for this user
     if (isNew === true) {
-      const oldConns = this.wsSet;
-      for (const conn of oldConns) {
+      for (const conn of this.wsSet) {
         if (conn !== ws && conn.idtarget === userId && conn.readyState === 1) {
           try { conn.close(1000, "New connection"); } catch(e) {}
         }
       }
       
-      // Clean up old seat
       const oldRoom = this.userRoom.get(userId);
       if (oldRoom) {
         const oldSeat = this.userSeat.get(userId);
@@ -381,7 +377,6 @@ export class ChatServer2 {
     const userId = ws.idtarget;
     const room = ws.roomname;
     
-    // Remove from room
     if (room) {
       const clients = this.roomClients.get(room);
       if (clients) clients.delete(ws);
@@ -399,12 +394,10 @@ export class ChatServer2 {
       }
     }
     
-    // Clean up user data
     this.userRoom.delete(userId);
     this.userSeat.delete(userId);
     this.wsSet.delete(ws);
     
-    // Close connection
     if (ws.readyState === 1) {
       try { ws.close(1000, "Cleanup"); } catch(e) {}
     }
@@ -418,7 +411,6 @@ export class ChatServer2 {
     
     if (this.timer) clearInterval(this.timer);
     
-    // Close all connections
     for (const ws of this.wsSet) {
       try {
         if (ws.readyState === 1) {
@@ -428,7 +420,6 @@ export class ChatServer2 {
       } catch(e) {}
     }
     
-    // Cleanup
     if (this.lowcard && typeof this.lowcard.destroy === 'function') {
       try { await this.lowcard.destroy(); } catch(e) {}
     }
@@ -472,7 +463,6 @@ export class ChatServer2 {
       ws._isClosing = false;
       ws._isCleaning = false;
       
-      // Timeout for handshake
       setTimeout(() => {
         if (!ws.idtarget && ws.readyState === 1) {
           try { ws.close(1000, "Timeout"); } catch(e) {}
