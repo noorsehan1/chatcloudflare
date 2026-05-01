@@ -1,5 +1,5 @@
-// ==================== CHAT SERVER - FINAL MASTERPIECE ====================
-// name = "chat-masterpiece"
+// ==================== CHAT SERVER - FULL CLASS FIXED ====================
+// name = "chat-fixed"
 // main = "index.js"
 // compatibility_date = "2026-04-13"
 
@@ -59,7 +59,7 @@ try {
 } catch(e) {}
 
 // ========== MAIN CLASS ==========
-export class ChatServer2 {
+export class ChatServer {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -81,7 +81,7 @@ export class ChatServer2 {
     this.roomPoints = new Map();
     this.roomMuted = new Map();
     
-    // Message cache (single source of truth)
+    // Message cache
     this.cachedMessages = new Map();
     
     // Object pool
@@ -103,11 +103,9 @@ export class ChatServer2 {
     this.joinDelayCounter = 0;
     this.cleanupCursor = 0;
     
-    // Optimized: userState keys cache
+    // Optimized caches
     this.userStateKeysCache = null;
     this.userStateKeysCacheTime = 0;
-    
-    // Fast path detection result cache
     this._fastPathCache = new Map();
     
     // Initialize rooms
@@ -125,39 +123,6 @@ export class ChatServer2 {
     this.scheduleAlarm();
   }
   
-  // ========== FAST PATH DETECTION ==========
-  detectMessageType(raw) {
-    if (typeof raw !== "string") return null;
-    if (raw.length < 10) return null;
-    
-    // Check cached result
-    const cached = this._fastPathCache.get(raw);
-    if (cached) return cached;
-    
-    let result = null;
-    
-    // Ultra-fast detection using char codes
-    // Look for "chat" or "updatePoint" patterns
-    if (raw.includes('"chat"')) result = "chat";
-    else if (raw.includes('"updatePoint"')) result = "updatePoint";
-    else if (raw.includes('"gift"')) result = "gift";
-    else if (raw.includes('"rollangak"')) result = "roll";
-    else if (raw.includes('"setIdTarget2"')) result = "setIdTarget2";
-    else if (raw.includes('"joinRoom"')) result = "joinRoom";
-    else if (raw.includes('"updateKursi"')) result = "updateKursi";
-    else if (raw.includes('"removeKursiAndPoint"')) result = "removeKursi";
-    else if (raw.includes('"private"')) result = "private";
-    else if (raw.includes('"getOnlineUsers"')) result = "getOnlineUsers";
-    else if (raw.includes('"pointUpdated"')) result = "pointUpdated";
-    
-    // Cache small result
-    if (result && this._fastPathCache.size < 200) {
-      this._fastPathCache.set(raw, result);
-    }
-    
-    return result;
-  }
-  
   // ========== LRU CACHE ==========
   cacheSet(key, value) {
     if (this.cachedMessages.size >= MAX_CACHED_MESSAGES) {
@@ -172,7 +137,6 @@ export class ChatServer2 {
   }
   
   encodeMessage(msg) {
-    // Fast path for pre-serialized messages
     if (msg === this._msgCurrentNumber) {
       if (!this._msgCurrentNumberStr) {
         this._msgCurrentNumberStr = JSON.stringify(msg);
@@ -280,8 +244,7 @@ export class ChatServer2 {
     
     const now = Date.now();
     
-    // ========== OPTIMIZED USER STATE CLEANUP ==========
-    // Use cached keys array for better performance
+    // Cleanup userState dengan TTL
     if (!this.userStateKeysCache || (now - this.userStateKeysCacheTime) > USER_STATE_CACHE_TTL_MS) {
       this.userStateKeysCache = Array.from(this.userState.keys());
       this.userStateKeysCacheTime = now;
@@ -292,7 +255,6 @@ export class ChatServer2 {
       const state = this.userState.get(key);
       if (!state) continue;
       
-      // Check active connections
       const connSet = this.userIndex.get(key);
       let hasActive = false;
       if (connSet && connSet.size > 0) {
@@ -305,7 +267,6 @@ export class ChatServer2 {
         }
       }
       
-      // Use lastSeen for TTL check
       const lastSeen = state.lastSeen || state.t;
       const isExpired = (now - lastSeen) > HARD_TTL_MS;
       
@@ -313,18 +274,6 @@ export class ChatServer2 {
         this.userState.delete(key);
         removed++;
         if (removed >= USER_STATE_CLEANUP_BATCH) break;
-      }
-    }
-    
-    // Hard limit cleanup if still too large
-    if (this.userState.size > MAX_USER_STATE_SIZE) {
-      let extraRemoved = 0;
-      for (const [key, state] of this.userState) {
-        const lastSeen = state.lastSeen || state.t;
-        if ((now - lastSeen) > USER_STATE_TTL_MS) {
-          this.userState.delete(key);
-          if (++extraRemoved >= USER_STATE_CLEANUP_BATCH) break;
-        }
       }
     }
     
@@ -346,7 +295,6 @@ export class ChatServer2 {
       }
     }
     
-    // Cleanup fast path cache
     if (this._fastPathCache.size > 500) {
       this._fastPathCache.clear();
     }
@@ -358,7 +306,7 @@ export class ChatServer2 {
       this.currentNumber = this.currentNumber < MAX_NUMBER ? this.currentNumber + 1 : 1;
       this._msgCurrentNumber[1] = this.currentNumber;
       this._msgCurrentNumberStr = null;
-      await this.broadcastAsyncAll(this._msgCurrentNumber);
+      this.broadcastAsyncAll(this._msgCurrentNumber);
     }
     
     if (this.game?.masterTick) {
@@ -487,8 +435,6 @@ export class ChatServer2 {
     }
     
     this.connections.delete(connId);
-    
-    // Invalidate cache
     this.userStateKeysCache = null;
   }
   
@@ -508,7 +454,6 @@ export class ChatServer2 {
     if (ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
       if (conn) {
         conn.slowCount = (conn.slowCount || 0) + 1;
-        // Only kick if consistently slow for multiple ticks
         if (conn.slowCount > SLOW_CLIENT_TOLERANCE && ws.bufferedAmount > MAX_BUFFERED_AMOUNT * 2) {
           try { ws.close(1008, "Slow client"); } catch(e) {}
           return false;
@@ -559,7 +504,6 @@ export class ChatServer2 {
         this._send(conn.ws, str, conn);
       }
       
-      // Soft yield every 50, hard yield every 200
       if ((++i % BROADCAST_YIELD_EVERY) === 0) {
         await Promise.resolve();
       }
@@ -615,10 +559,8 @@ export class ChatServer2 {
     const seats = this.roomSeats.get(room);
     if (!seats) return null;
     
-    // Atomic seat reservation to prevent race condition
     for (let i = 1; i <= MAX_SEATS; i++) {
       if (!seats.has(i)) {
-        // Reserve immediately
         seats.set(i, "__RESERVED__");
         return i;
       }
@@ -630,7 +572,6 @@ export class ChatServer2 {
     const count = this.roomSeats.get(room)?.size || 0;
     this._msgRoomUserCount[1] = room;
     this._msgRoomUserCount[2] = count;
-    // Use delete instead of set(null)
     this.cacheDelete(`roomUserCount_${room}`);
     this.broadcast(room, this._msgRoomUserCount, null, "system");
     return count;
@@ -790,78 +731,16 @@ export class ChatServer2 {
       if (event.data.length > MAX_MESSAGE_SIZE_BYTES) return;
       
       const raw = event.data;
-      const fastType = this.detectMessageType(raw);
       
       let data;
-      
-      // Only parse if not a known fast path or needs full data
-      if (fastType === "chat" || fastType === "updatePoint" || fastType === "gift") {
-        try { data = JSON.parse(raw); } catch(e) { return; }
-      } else {
-        try { data = JSON.parse(raw); } catch(e) { return; }
-      }
+      try { data = JSON.parse(raw); } catch(e) { return; }
       
       const [type, ...args] = data;
       
-      // Fast path: realtime messages
-      if (type === "chat" || type === "updatePoint" || type === "gift" || type === "rollangak") {
-        if (!userId || !currentRoom) return;
-        
-        this.updateUserActivity(userId);
-        
-        if (type === "chat") {
-          if (!this.checkRateLimit(userId, "chat")) return;
-          if (!this.checkGlobalThrottle("chat")) return;
-          
-          const [, room, noimg, user, msg, color, textColor] = data;
-          if (room !== currentRoom || user !== userId) return;
-          if (this.roomMuted.get(currentRoom)) {
-            this._send(ws, this.encodeMessage(["error", "Room is muted"]));
-            return;
-          }
-          const sanitizedMsg = msg?.slice(0, MAX_MSG_SIZE) || "";
-          if (sanitizedMsg.includes('\0')) return;
-          this.broadcast(currentRoom, ["chat", room, noimg, user, sanitizedMsg, color, textColor], connId, "chat");
-          return;
-        }
-        
-        if (type === "updatePoint") {
-          if (!this.checkRateLimit(userId, "action")) return;
-          const [, room, seat, x, y, fast] = data;
-          if (room !== currentRoom || seat !== currentSeat) return;
-          const seats = this.roomSeats.get(room);
-          if (!seats || seats.get(seat) !== userId) return;
-          this.roomPoints.get(room).set(seat, {
-            x: parseFloat(x), y: parseFloat(y), fast: fast === 1 || fast === true
-          });
-          this.broadcast(currentRoom, ["pointUpdated", room, seat, x, y, fast], connId, "action");
-          return;
-        }
-        
-        if (type === "gift") {
-          if (!this.checkRateLimit(userId, "action")) return;
-          const [, room, sender, receiver, gift] = data;
-          if (room !== currentRoom || sender !== userId) return;
-          const safeGift = (gift || "").slice(0, MAX_GIFT_NAME);
-          this.broadcast(currentRoom, ["gift", room, sender, receiver, safeGift, Date.now()], connId, "action");
-          return;
-        }
-        
-        if (type === "rollangak") {
-          if (!this.checkRateLimit(userId, "action")) return;
-          const [, room, username, angka] = data;
-          if (room === currentRoom) {
-            this.broadcast(currentRoom, ["rollangakBroadcast", room, username, angka], connId, "action");
-          }
-          return;
-        }
-        
-        return;
-      }
-      
-      // Slow path: system messages
+      // ========== setIdTarget2 - FIXED ==========
       if (type === "setIdTarget2") {
         const [id, isNew] = args;
+        
         if (!id || id.length > MAX_USERNAME) {
           this._send(ws, this.encodeMessage(["error", "Invalid ID"]));
           return;
@@ -870,74 +749,87 @@ export class ChatServer2 {
         clearTimeout(timeout);
         userId = id;
         
+        // Update connection with userId
+        const conn = this.connections.get(connId);
+        if (conn) {
+          conn.userId = userId;
+          this.connections.set(connId, conn);
+        }
+        
+        // Add to user index
+        if (!this.userIndex.has(userId)) {
+          this.userIndex.set(userId, new Set());
+        }
+        this.userIndex.get(userId).add(connId);
+        
+        const userState = this.userState.get(id);
+        
         if (isNew === true) {
-          this.removeUserConnections(id);
+          // New connection: cleanup old connections for this user
+          const oldConnSet = this.userIndex.get(id);
+          if (oldConnSet) {
+            for (const oldConnId of oldConnSet) {
+              if (oldConnId !== connId) {
+                this.removeConnection(oldConnId);
+              }
+            }
+          }
+          
+          // Send joinroomawal like original code
           this._send(ws, this.encodeMessage(["joinroomawal"]));
           
-          const conn = this.connections.get(connId);
-          if (conn) {
-            conn.userId = userId;
-            this.connections.set(connId, conn);
-            if (!this.userIndex.has(userId)) {
-              this.userIndex.set(userId, new Set());
-            }
-            this.userIndex.get(userId).add(connId);
-          }
         } else {
-          const userState = this.userState.get(id);
-          
+          // Reconnect attempt: try to restore previous state
           if (userState && userState.room && userState.seat != null && !userState.offline) {
             currentRoom = userState.room;
             currentSeat = userState.seat;
             
-            const conn = this.connections.get(connId);
             if (conn) {
-              conn.userId = userId;
               conn.room = currentRoom;
               conn.seat = currentSeat;
               this.connections.set(connId, conn);
-              if (!this.userIndex.has(userId)) {
-                this.userIndex.set(userId, new Set());
-              }
-              this.userIndex.get(userId).add(connId);
-              if (this.roomIndex.has(currentRoom)) {
-                this.roomIndex.get(currentRoom).add(connId);
-              }
             }
             
+            // Add to room index
+            if (this.roomIndex.has(currentRoom)) {
+              this.roomIndex.get(currentRoom).add(connId);
+            }
+            
+            // Update user state
             userState.offline = false;
             userState.t = Date.now();
             userState.lastSeen = Date.now();
             this.userState.set(userId, userState);
             
+            // Send reconnect success messages
             this._send(ws, this.encodeMessage(["reconnectSuccess", currentRoom, currentSeat]));
             this._send(ws, this.encodeMessage(["numberKursiSaya", currentSeat]));
             this._send(ws, this.encodeMessage(["currentNumber", this.currentNumber]));
             this._send(ws, this.encodeMessage(["muteTypeResponse", this.roomMuted.get(currentRoom) || false, currentRoom]));
-            await this.sendRoomState(ws, currentRoom, currentSeat);
-          } else {
-            this._send(ws, this.encodeMessage(["needJoinRoom"]));
             
-            const conn = this.connections.get(connId);
-            if (conn) {
-              conn.userId = userId;
-              this.connections.set(connId, conn);
-              if (!this.userIndex.has(userId)) {
-                this.userIndex.set(userId, new Set());
-              }
-              this.userIndex.get(userId).add(connId);
-            }
+            // Send room state
+            await this.sendRoomState(ws, currentRoom, currentSeat);
+            
+          } else {
+            // No previous state, need to join room
+            this._send(ws, this.encodeMessage(["needJoinRoom"]));
           }
         }
         return;
       }
       
+      // Skip if not authenticated
       if (!userId) return;
       
+      // Update user activity for authenticated users
+      this.updateUserActivity(userId);
+      
+      // ========== JOIN ROOM ==========
       if (type === "joinRoom") {
         const [room] = args;
         if (!ROOMS.includes(room)) return;
         
+        // Leave old room if exists
         if (currentRoom && currentSeat != null) {
           const oldSeats = this.roomSeats.get(currentRoom);
           if (oldSeats && oldSeats.get(currentSeat) === userId) {
@@ -952,6 +844,7 @@ export class ChatServer2 {
           }
         }
         
+        // Get empty seat
         const seat = this.getEmptySeat(room);
         if (seat == null) {
           this._send(ws, this.encodeMessage(["roomFull", room]));
@@ -963,6 +856,8 @@ export class ChatServer2 {
         
         // Replace reserved with actual user
         this.roomSeats.get(room).set(seat, userId);
+        
+        // Save user state for reconnect
         this.userState.set(userId, {
           room: currentRoom,
           seat: currentSeat,
@@ -971,6 +866,7 @@ export class ChatServer2 {
           offline: false
         });
         
+        // Update connection
         const conn = this.connections.get(connId);
         if (conn) {
           conn.room = currentRoom;
@@ -978,8 +874,10 @@ export class ChatServer2 {
           this.connections.set(connId, conn);
         }
         
+        // Add to room index
         this.roomIndex.get(room).add(connId);
         
+        // Send join response
         this._send(ws, this.encodeMessage(["rooMasuk", seat, room]));
         this._send(ws, this.encodeMessage(["numberKursiSaya", seat]));
         this._send(ws, this.encodeMessage(["muteTypeResponse", this.roomMuted.get(room) || false, room]));
@@ -990,9 +888,11 @@ export class ChatServer2 {
         this.cacheDelete(`roomUserCount_${room}`);
         this._send(ws, this.encodeMessage(this._msgRoomUserCount));
         
+        // Broadcast to room
         this.broadcast(currentRoom, ["userOccupiedSeat", room, seat, userId], connId, "system");
         this.updateRoomCount(currentRoom);
         
+        // Send room state after delay
         this.joinDelayCounter++;
         const delay = MIN_ROOM_STATE_DELAY_MS + (this.joinDelayCounter % (MAX_ROOM_STATE_DELAY_MS - MIN_ROOM_STATE_DELAY_MS));
         setTimeout(async () => {
@@ -1001,8 +901,49 @@ export class ChatServer2 {
         return;
       }
       
+      // Must be in room for other actions
       if (currentRoom == null) return;
       
+      // ========== CHAT ==========
+      if (type === "chat") {
+        if (!this.checkRateLimit(userId, "chat")) return;
+        if (!this.checkGlobalThrottle("chat")) return;
+        
+        const [, room, noimg, user, msg, color, textColor] = data;
+        if (room !== currentRoom || user !== userId) return;
+        if (this.roomMuted.get(currentRoom)) {
+          this._send(ws, this.encodeMessage(["error", "Room is muted"]));
+          return;
+        }
+        
+        const sanitizedMsg = msg?.slice(0, MAX_MSG_SIZE) || "";
+        if (sanitizedMsg.includes('\0')) return;
+        
+        this.broadcast(currentRoom, ["chat", room, noimg, user, sanitizedMsg, color, textColor], connId, "chat");
+        return;
+      }
+      
+      // ========== UPDATE POINT ==========
+      if (type === "updatePoint") {
+        if (!this.checkRateLimit(userId, "action")) return;
+        
+        const [, room, seat, x, y, fast] = data;
+        if (room !== currentRoom || seat !== currentSeat) return;
+        
+        const seats = this.roomSeats.get(room);
+        if (!seats || seats.get(seat) !== userId) return;
+        
+        this.roomPoints.get(room).set(seat, {
+          x: parseFloat(x),
+          y: parseFloat(y),
+          fast: fast === 1 || fast === true
+        });
+        
+        this.broadcast(currentRoom, ["pointUpdated", room, seat, x, y, fast], connId, "action");
+        return;
+      }
+      
+      // ========== REMOVE SEAT ==========
       if (type === "removeKursiAndPoint") {
         const [, room, seat] = data;
         if (room !== currentRoom || seat !== currentSeat) return;
@@ -1041,6 +982,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== UPDATE KURSI ==========
       if (type === "updateKursi") {
         const [, room, seat, noimg, name, color, bawah, atas, vip, vtip] = data;
         if (room !== currentRoom || seat !== currentSeat || name !== userId) return;
@@ -1052,6 +994,19 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GIFT ==========
+      if (type === "gift") {
+        if (!this.checkRateLimit(userId, "action")) return;
+        
+        const [, room, sender, receiver, gift] = data;
+        if (room !== currentRoom || sender !== userId) return;
+        
+        const safeGift = (gift || "").slice(0, MAX_GIFT_NAME);
+        this.broadcast(currentRoom, ["gift", room, sender, receiver, safeGift, Date.now()], connId, "action");
+        return;
+      }
+      
+      // ========== PRIVATE MESSAGE ==========
       if (type === "private") {
         const [, targetId, noimg, msg, sender] = data;
         if (sender !== userId) return;
@@ -1071,6 +1026,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GET ONLINE USERS ==========
       if (type === "getOnlineUsers") {
         const users = [];
         let count = 0;
@@ -1082,12 +1038,15 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== IS USER ONLINE ==========
       if (type === "isUserOnline") {
         const [targetId, callbackId] = args;
-        this._send(ws, this.encodeMessage(["userOnlineStatus", targetId, this.userIndex.has(targetId), callbackId || ""]));
+        const isOnline = this.userIndex.has(targetId);
+        this._send(ws, this.encodeMessage(["userOnlineStatus", targetId, isOnline, callbackId || ""]));
         return;
       }
       
+      // ========== SET MUTE TYPE ==========
       if (type === "setMuteType") {
         const [isMuted, roomName] = args;
         if (roomName && ROOMS.includes(roomName)) {
@@ -1097,6 +1056,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GET MUTE TYPE ==========
       if (type === "getMuteType") {
         const [roomName] = args;
         if (roomName && ROOMS.includes(roomName)) {
@@ -1105,6 +1065,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GET ALL ROOMS USER COUNT ==========
       if (type === "getAllRoomsUserCount") {
         const counts = {};
         for (const room of ROOMS) {
@@ -1114,6 +1075,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GET ROOM USER COUNT ==========
       if (type === "getRoomUserCount") {
         const [roomName] = args;
         if (roomName && ROOMS.includes(roomName)) {
@@ -1125,6 +1087,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GET CURRENT NUMBER ==========
       if (type === "getCurrentNumber") {
         this._msgCurrentNumber[1] = this.currentNumber;
         this._msgCurrentNumberStr = null;
@@ -1132,11 +1095,24 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== IS IN ROOM ==========
       if (type === "isInRoom") {
         this._send(ws, this.encodeMessage(["inRoomStatus", currentRoom !== null]));
         return;
       }
       
+      // ========== ROLL ANGKA ==========
+      if (type === "rollangak") {
+        if (!this.checkRateLimit(userId, "action")) return;
+        
+        const [, room, username, angka] = data;
+        if (room === currentRoom) {
+          this.broadcast(currentRoom, ["rollangakBroadcast", room, username, angka], connId, "action");
+        }
+        return;
+      }
+      
+      // ========== MOD WARNING ==========
       if (type === "modwarning") {
         const [, room] = data;
         if (room === currentRoom) {
@@ -1145,6 +1121,7 @@ export class ChatServer2 {
         return;
       }
       
+      // ========== GAME COMMANDS ==========
       if (GAME_ROOMS.has(currentRoom) && this.game) {
         const gameCmds = ["gameLowCardStart", "gameLowCardJoin", "gameLowCardNumber", "gameLowCardEnd"];
         if (gameCmds.includes(type)) {
@@ -1250,8 +1227,8 @@ export default {
     try {
       const url = new URL(request.url);
       const roomName = url.searchParams.get("room") || "main";
-      const id = env.CHAT_SERVER_2.idFromName(roomName);
-      const obj = env.CHAT_SERVER_2.get(id);
+      const id = env.CHAT_SERVER.idFromName(roomName);
+      const obj = env.CHAT_SERVER.get(id);
       return obj.fetch(request);
     } catch(error) {
       console.error("Worker error:", error);
