@@ -131,6 +131,7 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
+    // Kurangi timer setiap tick (5 detik)
     if (game.registrationTimeLeft > 0) {
       game.registrationTimeLeft = game.registrationTimeLeft - 5;
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
@@ -138,12 +139,13 @@ export class LowCardGameManager {
     
     const timeLeft = game.registrationTimeLeft;
     
-    // NOTIFIKASI 20s SAJA (5s dari chatServer.tick)
+    // NOTIFIKASI 20s (hanya sekali)
     if (timeLeft === 20 && !game._hasSentReg20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentReg20s = true;
     }
     
+    // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
       if (game.players && game.players.size === 1) {
         this._addFourMozBots(room);
@@ -156,6 +158,7 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
+    // Kurangi timer setiap tick (5 detik)
     if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
       game.drawTimeLeft = game.drawTimeLeft - 5;
       if (game.drawTimeLeft < 0) game.drawTimeLeft = 0;
@@ -163,26 +166,37 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI 20s SAJA (5s dari chatServer.tick)
+    // NOTIFIKASI 20s (hanya sekali)
     if (timeLeft === 20 && !game._hasSentDraw20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentDraw20s = true;
     }
     
-    // BOT DRAW LOGIC
+    // BOT DRAW LOGIC - Semua bot harus draw sebelum 5 detik terakhir
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
       const activeBots = Array.from(game.botPlayers.keys())
         .filter(botId => !game.eliminated.has(botId));
       const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
       
       if (notDrawnBots.length > 0 && timeLeft > 0) {
-        const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
-        const totalBots = activeBots.length;
-        const alreadyDrawn = totalBots - notDrawnBots.length;
-        const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 5)) * totalBots));
-        const needToDraw = Math.min(notDrawnBots.length, Math.max(1, targetDrawn - alreadyDrawn));
+        let needToDraw = 0;
+        
+        // Jika waktu <= 10 detik (2 tick terakhir), draw SEMUA bot yang belum draw
+        if (timeLeft <= 10) {
+          needToDraw = notDrawnBots.length;
+        } else {
+          // Di awal (20-15 detik): draw 0-1 bot
+          // Di tengah (15-10 detik): draw 1-2 bot
+          const totalBots = activeBots.length;
+          const alreadyDrawn = totalBots - notDrawnBots.length;
+          const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
+          // Target draw berdasarkan waktu yang sudah berlalu (maks 3 tick untuk mencapai semua bot)
+          const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / 3) * totalBots));
+          needToDraw = Math.min(notDrawnBots.length, Math.max(0, targetDrawn - alreadyDrawn));
+        }
         
         if (needToDraw > 0) {
+          // Pilih bot secara RANDOM
           const shuffled = [...notDrawnBots];
           for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
@@ -196,9 +210,11 @@ export class LowCardGameManager {
       }
     }
     
+    // Cek waktu habis
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
+      // Draw semua bot yang belum draw (fallback)
       if (game.useBots && game.botPlayers) {
         const notDrawnBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated.has(botId) && !game.numbers.has(botId));
@@ -448,6 +464,7 @@ export class LowCardGameManager {
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
       
+      // NOTIFIKASI 20s AWAL REGISTRASI
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
