@@ -6,7 +6,7 @@ const CONSTANTS = Object.freeze({
   CLEANUP_INTERVAL_MS: 180000,
   REGISTRATION_TIME: 20,
   DRAW_TIME: 20,
-  MASTER_TICK_INTERVAL_MS: 3000,
+  MASTER_TICK_INTERVAL_MS: 5000,
   EVALUATION_DELAY_MS: 3000,
   MAX_EVALUATION_TIME_MS: 10000,
   MAX_DRAW_WAIT_MS: 30000,
@@ -131,11 +131,20 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
+    // Kurangi timer setiap tick (5 detik)
     if (game.registrationTimeLeft > 0) {
-      game.registrationTimeLeft = game.registrationTimeLeft - 3;
+      game.registrationTimeLeft = game.registrationTimeLeft - 5;
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
     }
     
+    // NOTIFIKASI 20s dan 5s untuk REGISTRATION
+    if (game.registrationTimeLeft === 20) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+    } else if (game.registrationTimeLeft === 5) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
+    }
+    
+    // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
       if (game.players && game.players.size === 1) {
         this._addFourMozBots(room);
@@ -148,23 +157,34 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
+    // Kurangi timer setiap tick (5 detik)
     if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
-      game.drawTimeLeft = game.drawTimeLeft - 3;
+      game.drawTimeLeft = game.drawTimeLeft - 5;
       if (game.drawTimeLeft < 0) game.drawTimeLeft = 0;
     }
     
     const timeLeft = game.drawTimeLeft;
     
+    // NOTIFIKASI 20s dan 5s untuk DRAW
+    if (timeLeft === 20) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+    } else if (timeLeft === 5) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
+    }
+    
+    // BOT DRAW LOGIC
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
       const activeBots = Array.from(game.botPlayers.keys())
         .filter(botId => !game.eliminated.has(botId));
       const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
       
       if (notDrawnBots.length > 0 && timeLeft > 0) {
-        const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 3;
+        // Hitung berapa bot yang harus draw di tick ini
+        const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
+        const ticksRemaining = Math.max(1, Math.ceil(timeLeft / 5));
         const totalBots = activeBots.length;
         const alreadyDrawn = totalBots - notDrawnBots.length;
-        const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 3)) * totalBots));
+        const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / (CONSTANTS.DRAW_TIME / 5)) * totalBots));
         const needToDraw = Math.min(notDrawnBots.length, Math.max(1, targetDrawn - alreadyDrawn));
         
         if (needToDraw > 0) {
@@ -181,6 +201,7 @@ export class LowCardGameManager {
       }
     }
     
+    // Cek waktu habis
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
@@ -511,6 +532,9 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardClosed", playersList]);
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
+    
+    // Kirim notifikasi awal 20s untuk DRAW
+    this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
   }
 
   _handleBotDraw(room, botId) {
@@ -801,6 +825,7 @@ export class LowCardGameManager {
       game._evalScheduled = false;
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]); // Notifikasi awal ronde baru
       
     } catch (e) {
       this._logError(`EvaluateRound error in ${room}: ${e.message}`);
@@ -921,5 +946,4 @@ export class LowCardGameManager {
   }
 }
 
-// EXPORT DEFAULT untuk memastikan bisa diimport
 export default LowCardGameManager;
