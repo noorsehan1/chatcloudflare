@@ -248,7 +248,9 @@ export class ChatServer2 {
       
       switch (evt) {
         case "setIdTarget2":
-          await this.handleSetId(ws, data[1], data[2]);
+          const userId = data[1];
+          const isNew = data[2] === true || data[2] === 1 || data[2] === "true" || data[2] === "1";
+          await this.handleSetId(ws, userId, isNew);
           break;
           
         case "joinRoom":
@@ -332,12 +334,14 @@ export class ChatServer2 {
     if (!userId) return;
     
     if (isNew === true) {
+      // NEW CONNECTION: Close old connections and clean up old data
       for (const conn of this.wsSet) {
         if (conn !== ws && conn.idtarget === userId && conn.readyState === 1) {
           try { conn.close(1000, "New connection"); } catch(e) {}
         }
       }
       
+      // Clean up old seat data
       const oldRoom = this.userRoom.get(userId);
       if (oldRoom) {
         const oldSeat = this.userSeat.get(userId);
@@ -351,13 +355,53 @@ export class ChatServer2 {
         this.userRoom.delete(userId);
         this.userSeat.delete(userId);
       }
+      
+      ws.idtarget = userId;
+      ws._isClosing = false;
+      this.wsSet.add(ws);
+      
+      await this.safeSend(ws, ["joinroomawal"]);
+      
+    } else {
+      // RECONNECT: Try to restore existing session
+      ws.idtarget = userId;
+      ws._isClosing = false;
+      this.wsSet.add(ws);
+      
+      // Check if user has existing seat
+      const existingRoom = this.userRoom.get(userId);
+      const existingSeat = this.userSeat.get(userId);
+      
+      if (existingRoom && existingSeat) {
+        const roomManager = this.rooms.get(existingRoom);
+        if (roomManager) {
+          const seatData = roomManager.getSeat(existingSeat);
+          if (seatData && seatData.namauser === userId) {
+            // Restore session
+            this.roomClients.get(existingRoom).add(ws);
+            ws.roomname = existingRoom;
+            
+            await this.safeSend(ws, ["reconnectSuccess", existingRoom, existingSeat]);
+            await this.safeSend(ws, ["numberKursiSaya", existingSeat]);
+            await this.safeSend(ws, ["currentNumber", this.currentNumber]);
+            await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), existingRoom]);
+            
+            // Send existing seats data
+            const allSeats = roomManager.getAllSeats();
+            delete allSeats[existingSeat];
+            if (Object.keys(allSeats).length > 0) {
+              await this.safeSend(ws, ["allUpdateKursiList", existingRoom, allSeats]);
+            }
+            
+            this.broadcastToRoom(existingRoom, ["userReconnected", existingRoom, existingSeat, userId]);
+            return;
+          }
+        }
+      }
+      
+      // No existing session, ask to join room
+      await this.safeSend(ws, ["needJoinRoom"]);
     }
-    
-    ws.idtarget = userId;
-    ws._isClosing = false;
-    this.wsSet.add(ws);
-    
-    await this.safeSend(ws, ["joinroomawal"]);
   }
   
   async safeSend(ws, msg) {
