@@ -6,7 +6,7 @@ import LowCardGameManager from "./lowcard.js";
 
 const C = {
   TICK_INTERVAL: 5000,        // DIUBAH: dari 3000 ke 5000 (5 detik)
-  NUMBER_TICK: 300,           // 300 * 5 detik = 1500 detik (25 menit) ganti number
+  NUMBER_TICK: 180,           // 300 * 5 detik = 1500 detik (25 menit) ganti number
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   MAX_USERNAME: 20,
