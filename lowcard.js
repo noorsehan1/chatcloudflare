@@ -139,7 +139,7 @@ export class LowCardGameManager {
     
     const timeLeft = game.registrationTimeLeft;
     
-    // NOTIFIKASI 20s hanya sekali di awal
+    // NOTIFIKASI 20s - HANYA JIKA FLAG MASIH FALSE
     if (timeLeft === 20 && !game._hasSentReg20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentReg20s = true;
@@ -171,7 +171,7 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI 20s hanya sekali di awal draw phase
+    // NOTIFIKASI 20s - HANYA JIKA FLAG MASIH FALSE
     if (timeLeft === 20 && !game._hasSentDraw20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentDraw20s = true;
@@ -451,8 +451,8 @@ export class LowCardGameManager {
         _evalStartTime: null,
         drawStartTime: null,
         _evalScheduled: false,
-        _hasSentReg20s: false,    // Flag untuk 20s registration
-        _hasSentDraw20s: false    // Flag untuk 20s draw
+        _hasSentReg20s: true,     // LANGSUNG TRUE biar tidak dobel dengan broadcast di bawah
+        _hasSentDraw20s: false
       };
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -461,6 +461,9 @@ export class LowCardGameManager {
       
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
+      
+      // NOTIFIKASI 20s AWAL REGISTRASI (HANYA SEKALI)
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
       this._logError(`StartGame error: ${e.message}`);
@@ -534,7 +537,7 @@ export class LowCardGameManager {
     game.drawTimeExpired = false;
     game._hasBroadcastInitial = false;
     game.drawStartTime = Date.now();
-    game._hasSentDraw20s = false;  // Reset flag untuk draw phase baru
+    game._hasSentDraw20s = false;  // Reset flag untuk draw phase
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
