@@ -781,7 +781,7 @@ export class ChatServer2 {
   async webSocketError(ws) { await this.cleanup(ws); }
 }
 
-export { ChatServer as ChatServer2 };
+export { ChatServer2 };
 
 export default {
   async fetch(req, env) {
