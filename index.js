@@ -35,6 +35,7 @@ const CONSTANTS = Object.freeze({
   PM_BUFFER_MAX_SIZE: 500,
   BROADCAST_BATCH_SIZE: 20,
   CLEANUP_BATCH_SIZE: 50,
+  WS_HANDSHAKE_TIMEOUT_MS: 30000,      // [FIX #3] timeout koneksi tanpa handshake
 });
 
 const roomList = Object.freeze([
@@ -502,17 +503,26 @@ export class ChatServer2 {
     this._masterTimer = setInterval(() => this._masterTick(), CONSTANTS.MASTER_TICK_INTERVAL_MS);
   }
 
+  // [FIX #2] Lock dilepas SEBELUM operasi async agar tidak menahan terlalu lama
   async _masterTick() {
     if (this._isClosing || !this._alive) return;
     
     const release = this.userLock.tryAcquire();
     if (!release) return;
-    
+
+    let counterSnapshot;
     try {
       this._masterTickCounter++;
+      counterSnapshot = this._masterTickCounter;
+    } finally {
+      // Lepas lock segera setelah update counter — sebelum semua operasi async
+      release();
+    }
 
+    // Semua operasi async berjalan di luar lock
+    try {
       // 1. NUMBER TICK (setiap 300 tick = 15 menit)
-      if (this._masterTickCounter % CONSTANTS.NUMBER_TICK_COUNT === 0) {
+      if (counterSnapshot % CONSTANTS.NUMBER_TICK_COUNT === 0) {
         await this._handleNumberTick();
       }
 
@@ -523,11 +533,9 @@ export class ChatServer2 {
       
       // 3. GAME TIME NOTIFICATION (dari tick)
       await this._handleGameTimeTick();
-      
+
     } catch (error) {
       console.error("Master tick error:", error);
-    } finally {
-      release();
     }
   }
 
@@ -934,6 +942,7 @@ export class ChatServer2 {
     }
   }
 
+  // [FIX #1] Ganti pola release manual dengan releaseOnce agar tidak double-release
   async handleSetIdTarget2(ws, id, baru) {
     if (!id || !ws) return;
 
@@ -942,6 +951,14 @@ export class ChatServer2 {
       await this.safeSend(ws, ["error", "Server busy"]);
       return;
     }
+
+    // Wrapper anti double-release: pastikan release hanya dipanggil sekali
+    let _released = false;
+    const releaseOnce = () => {
+      if (_released) return;
+      _released = true;
+      release();
+    };
     
     try {
       if (ws.readyState !== 1) return;
@@ -1001,7 +1018,8 @@ export class ChatServer2 {
         userConns.add(ws);
         this._wsRawSet.add(ws);
         
-        release();
+        // [FIX #1] Lepas lock dengan aman sebelum operasi broadcast
+        releaseOnce();
         
         for (const { room, seat } of roomsToUpdate) {
           this.broadcastToRoom(room, ["removeKursi", room, seat]);
@@ -1011,7 +1029,8 @@ export class ChatServer2 {
         await this.safeSend(ws, ["joinroomawal"]);
         
       } else {
-        release();
+        // [FIX #1] Lepas lock dengan aman sebelum handleReconnect
+        releaseOnce();
         await this.handleReconnect(ws, id);
       }
       
@@ -1021,7 +1040,8 @@ export class ChatServer2 {
         await this.safeSend(ws, ["error", "Connection failed"]);
       }
     } finally {
-      if (release) release();
+      // [FIX #1] Aman: tidak akan double-release karena releaseOnce memakai flag
+      releaseOnce();
     }
   }
 
@@ -1347,6 +1367,16 @@ export class ChatServer2 {
       ws._connectionVersion = Date.now();
 
       this._wsRawSet.add(ws);
+
+      // [FIX #3] Kick koneksi zombie yang tidak mengirim setIdTarget2 dalam 30 detik
+      setTimeout(() => {
+        if (!ws.idtarget && !ws._isClosing && ws.readyState === 1) {
+          console.warn("WebSocket timeout: no handshake received, closing zombie connection");
+          ws._isClosing = true;
+          try { ws.close(1000, "Handshake timeout"); } catch(e) {}
+          this._wsRawSet.delete(ws);
+        }
+      }, CONSTANTS.WS_HANDSHAKE_TIMEOUT_MS);
 
       return new Response(null, { status: 101, webSocket: client });
       
