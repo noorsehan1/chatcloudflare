@@ -438,13 +438,22 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
+    // WAJIB: Tambahkan ke roomClients TERLEBIH DAHULU
+    let clients = this.roomClients.get(roomName);
+    if (!clients) {
+      clients = new Set();
+      this.roomClients.set(roomName, clients);
+    }
+    clients.add(ws);
+    ws.room = roomName;
+    
     // CEK APAKAH USER SUDAH PUNYA KURSI
     let seat = null;
     for (const [s, data] of roomMan.seats) {
       if (data?.namauser === userId) seat = s;
     }
     
-    // JIKA BELUM PUNYA KURSI, KIRIM RESPON UNTUK UPDATE KURSI
+    // JIKA BELUM PUNYA KURSI
     if (!seat) {
       ws.send(JSON.stringify(["needUpdateKursi", roomName]));
       ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
@@ -459,14 +468,6 @@ export class ChatServer2 {
     // JIKA SUDAH PUNYA KURSI
     this.userSeat.set(userId, { room: roomName, seat });
     this.userRoom.set(userId, roomName);
-    ws.room = roomName;
-    
-    let clients = this.roomClients.get(roomName);
-    if (!clients) {
-      clients = new Set();
-      this.roomClients.set(roomName, clients);
-    }
-    clients.add(ws);
     
     ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
     ws.send(JSON.stringify(["numberKursiSaya", seat]));
@@ -617,7 +618,7 @@ export class ChatServer2 {
             this.userRoom.set(ws.userId, kursiRoom);
             ws.room = kursiRoom;
             
-            // TAMBAHKAN KE roomClients
+            // TAMBAHKAN KE roomClients (jika belum)
             let clients = this.roomClients.get(kursiRoom);
             if (!clients) {
               clients = new Set();
