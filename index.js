@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FINAL STABLE (FIXED) ====================
+// ==================== CHAT SERVER - FINAL STABLE (FIXED ROOM COUNT) ====================
 // name = "chatcloudnew"
 // main = "index.js"
 
@@ -223,10 +223,24 @@ export class ChatServer2 {
     return sent;
   }
   
+  // UPDATE ROOM COUNT UNTUK SEMUA USER DI ROOM
   updateRoomCount(room) {
     const roomManager = this.rooms.get(room);
-    const count = roomManager ? roomManager.getOccupiedCount() : 0;
-    this.broadcastToRoom(room, ["roomUserCount", room, count]);
+    if (!roomManager) return 0;
+    
+    const count = roomManager.getOccupiedCount();
+    const message = JSON.stringify(["roomUserCount", room, count]);
+    
+    // Broadcast ke SEMUA user di room ini
+    const clients = this.roomClients.get(room);
+    if (clients && clients.size > 0) {
+      for (const ws of clients) {
+        if (ws && ws.readyState === 1 && !ws._isClosing) {
+          try { ws.send(message); } catch(e) {}
+        }
+      }
+    }
+    
     return count;
   }
   
@@ -252,6 +266,8 @@ export class ChatServer2 {
         await this.safeSend(ws, ["rooMasuk", seat, room]);
         await this.safeSend(ws, ["numberKursiSaya", seat]);
         await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
+        
+        // Kirim jumlah user saat ini
         await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
         
         // Kirim semua kursi yang ada (kecuali kursi sendiri)
@@ -282,8 +298,9 @@ export class ChatServer2 {
         const oldManager = this.rooms.get(oldRoom);
         if (oldManager) {
           oldManager.removeSeat(oldSeat);
+          // Broadcast ke semua user di old room
           this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-          this.updateRoomCount(oldRoom);
+          this.updateRoomCount(oldRoom); // Update jumlah untuk semua user di old room
         }
       }
       this.roomClients.get(oldRoom)?.delete(ws);
@@ -313,13 +330,14 @@ export class ChatServer2 {
     await this.safeSend(ws, ["rooMasuk", seat, room]);
     await this.safeSend(ws, ["numberKursiSaya", seat]);
     await this.safeSend(ws, ["muteTypeResponse", roomManager.getMute(), room]);
-    await this.safeSend(ws, ["roomUserCount", room, roomManager.getOccupiedCount()]);
     
-    // Broadcast ke semua user di room bahwa ada user baru
-    this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
+    // UPDATE ROOM COUNT UNTUK SEMUA USER (termasuk user baru dan semua user lain)
     this.updateRoomCount(room);
     
-    // Kirim daftar kursi yang sudah ada ke user baru
+    // Broadcast ke semua user di room bahwa ada user baru (kecuali user baru sendiri)
+    this.broadcastToRoom(room, ["userOccupiedSeat", room, seat, userId]);
+    
+    // Kirim daftar kursi yang sudah ada ke user baru (kecuali kursi sendiri)
     const allSeats = roomManager.getAllSeats();
     const otherSeats = {};
     for (const [s, data] of Object.entries(allSeats)) {
@@ -386,8 +404,9 @@ export class ChatServer2 {
             const seatData = roomManager.getSeat(seat);
             if (seatData && seatData.namauser === ws.idtarget) {
               roomManager.removeSeat(seat);
+              // Broadcast ke semua user di room
               this.broadcastToRoom(room, ["removeKursi", room, seat]);
-              this.updateRoomCount(room);
+              this.updateRoomCount(room); // Update jumlah untuk semua user di room
               this.userRoom.delete(ws.idtarget);
               this.userSeat.delete(ws.idtarget);
               this.roomClients.get(room)?.delete(ws);
@@ -577,7 +596,7 @@ export class ChatServer2 {
             if (roomManager) {
               roomManager.removeSeat(oldSeat);
               this.broadcastToRoom(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-              this.updateRoomCount(oldRoom);
+              this.updateRoomCount(oldRoom); // Update jumlah untuk semua user di old room
             }
           }
           this.userRoom.delete(userId);
@@ -666,8 +685,9 @@ export class ChatServer2 {
             const seatData = roomManager.getSeat(seat);
             if (seatData && seatData.namauser === userId) {
               roomManager.removeSeat(seat);
+              // Broadcast ke semua user di room
               this.broadcastToRoom(room, ["removeKursi", room, seat]);
-              this.updateRoomCount(room);
+              this.updateRoomCount(room); // Update jumlah untuk semua user di room
             }
           }
         }
