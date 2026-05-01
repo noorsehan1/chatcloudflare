@@ -45,7 +45,8 @@ export class LowCardGameManager {
       if (!this._destroyed) this.cleanupStaleGames();
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
   }
-  
+
+  // [FIX #2] Tambah released flag agar release tidak bisa dipanggil dua kali
   async _acquireGameLock(room, timeoutMs = CONSTANTS.LOCK_TIMEOUT_MS) {
     if (!this._gameLocks.has(room)) {
       this._gameLocks.set(room, { locked: false, queue: [] });
@@ -55,7 +56,12 @@ export class LowCardGameManager {
     
     if (!lock.locked) {
       lock.locked = true;
-      return () => this._releaseGameLock(room);
+      let _released = false;
+      return () => {
+        if (_released) return;
+        _released = true;
+        this._releaseGameLock(room);
+      };
     }
     
     return new Promise((resolve, reject) => {
@@ -71,7 +77,12 @@ export class LowCardGameManager {
       lock.queue.push({
         resolve: () => {
           clearTimeout(timeout);
-          resolve(() => this._releaseGameLock(room));
+          let _released = false;
+          resolve(() => {
+            if (_released) return;
+            _released = true;
+            this._releaseGameLock(room);
+          });
         },
         reject
       });
@@ -87,6 +98,10 @@ export class LowCardGameManager {
       if (next) next.resolve();
     } else {
       lock.locked = false;
+      // [FIX #3] Bersihkan entry lock jika tidak ada game aktif dan queue kosong
+      if (!this.activeGames.has(room)) {
+        this._gameLocks.delete(room);
+      }
     }
   }
 
@@ -281,6 +296,7 @@ export class LowCardGameManager {
     console.error(`[LowCardGameManager] ${message}`);
   }
 
+  // [FIX #1] Tambah .catch(e => {}) pada semua pemanggilan endGame yang tidak di-await
   cleanupStaleGames() {
     if (this._destroyed) return;
     const now = Date.now();
@@ -314,7 +330,13 @@ export class LowCardGameManager {
       const game = this.activeGames.get(room);
       if (game && game._isActive) {
         this._clearGameTimeouts(game);
-        this.endGame(room);
+        // [FIX #1] Selalu tambahkan .catch() agar tidak ada unhandled rejection
+        this.endGame(room).catch(e => {
+          this._logError(`cleanupStaleGames endGame error for ${room}: ${e.message}`);
+        });
+      } else {
+        // Game tidak aktif, langsung hapus dari map
+        this.activeGames.delete(room);
       }
     }
   }
@@ -874,7 +896,10 @@ export class LowCardGameManager {
     };
   }
   
-  destroy() {
+  // [FIX #4] destroy() diperbaiki: endGame dipanggil sebelum _destroyed = true agar bisa execute,
+  // kemudian force clear semua state setelah selesai
+  async destroy() {
+    if (this._destroyed) return;
     this._destroyed = true;
     
     if (this._cleanupInterval) {
@@ -882,23 +907,43 @@ export class LowCardGameManager {
       this._cleanupInterval = null;
     }
     
+    // Hentikan semua timeout game aktif terlebih dahulu
     const snapshot = Array.from(this.activeGames.entries());
     for (const [room, game] of snapshot) {
       if (game) {
         this._clearGameTimeouts(game);
-        this.endGame(room).catch(e => {});
+        game._isActive = false;
+      }
+    }
+
+    // Broadcast end ke semua room yang aktif
+    for (const [room, game] of snapshot) {
+      if (game) {
+        try {
+          const playersList = [];
+          if (game.players) {
+            for (const player of game.players.values()) {
+              if (player && player.name) playersList.push(player.name);
+            }
+          }
+          if (playersList.length > 0) {
+            this._safeBroadcast(room, ["gameLowCardEnd", playersList]);
+          }
+        } catch (e) {}
       }
     }
     
-    this.activeGames.clear();
-    
+    // Tolak semua lock yang sedang menunggu
     for (const lock of this._gameLocks.values()) {
       for (const waiter of lock.queue) {
-        waiter.reject(new Error("Game manager destroyed"));
+        try { waiter.reject(new Error("Game manager destroyed")); } catch(e) {}
       }
+      lock.queue = [];
     }
-    this._gameLocks.clear();
     
+    // Bersihkan semua state
+    this.activeGames.clear();
+    this._gameLocks.clear();
     this.chatServer = null;
   }
 }
