@@ -137,7 +137,10 @@ export class LowCardGameManager {
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
     }
     
-    // NOTIFIKASI DIHAPUS DARI SINI - biarkan dari chatServer.tick()
+    // NOTIFIKASI 5s dari sini (20s sudah dikirim di startGame)
+    if (game.registrationTimeLeft === 5) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
+    }
     
     // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
@@ -160,7 +163,10 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI DIHAPUS DARI SINI - biarkan dari chatServer.tick()
+    // NOTIFIKASI 5s dari sini
+    if (timeLeft === 5) {
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
+    }
     
     // BOT DRAW LOGIC
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
@@ -440,6 +446,9 @@ export class LowCardGameManager {
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
       
+      // NOTIFIKASI 20s AWAL REGISTRASI
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+      
     } catch (e) {
       this._logError(`StartGame error: ${e.message}`);
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
@@ -521,7 +530,7 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
     
-    // NOTIFIKASI 20s UNTUK AWAL DRAW PHASE
+    // NOTIFIKASI 20s AWAL DRAW PHASE
     this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
   }
 
@@ -588,6 +597,11 @@ export class LowCardGameManager {
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
       this._safeBroadcast(room, ["gameLowCardJoin", ws.username || ws.idtarget, game.betAmount]);
+      
+      // NOTIFIKASI 20s SAAT ADA USER JOIN (jika masih registration phase)
+      if (game._phase === 'registration' && game.registrationTimeLeft === 20) {
+        this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
+      }
       
     } catch (e) {
       this._logError(`JoinGame error: ${e.message}`);
@@ -814,7 +828,7 @@ export class LowCardGameManager {
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
       
-      // NOTIFIKASI 20s UNTUK AWAL RONDE BARU
+      // NOTIFIKASI 20s UNTUK RONDE BARU
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
