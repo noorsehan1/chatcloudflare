@@ -131,7 +131,6 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
-    // Kurangi timer setiap tick (5 detik)
     if (game.registrationTimeLeft > 0) {
       game.registrationTimeLeft = game.registrationTimeLeft - 5;
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
@@ -139,18 +138,12 @@ export class LowCardGameManager {
     
     const timeLeft = game.registrationTimeLeft;
     
-    // NOTIFIKASI 20s - HANYA JIKA FLAG MASIH FALSE
+    // NOTIFIKASI 20s SAJA (5s dari chatServer.tick)
     if (timeLeft === 20 && !game._hasSentReg20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentReg20s = true;
     }
     
-    // NOTIFIKASI 5s
-    if (timeLeft === 5) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
-    }
-    
-    // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
       if (game.players && game.players.size === 1) {
         this._addFourMozBots(room);
@@ -163,7 +156,6 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
-    // Kurangi timer setiap tick (5 detik)
     if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
       game.drawTimeLeft = game.drawTimeLeft - 5;
       if (game.drawTimeLeft < 0) game.drawTimeLeft = 0;
@@ -171,15 +163,10 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // NOTIFIKASI 20s - HANYA JIKA FLAG MASIH FALSE
+    // NOTIFIKASI 20s SAJA (5s dari chatServer.tick)
     if (timeLeft === 20 && !game._hasSentDraw20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentDraw20s = true;
-    }
-    
-    // NOTIFIKASI 5s
-    if (timeLeft === 5) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
     }
     
     // BOT DRAW LOGIC
@@ -209,7 +196,6 @@ export class LowCardGameManager {
       }
     }
     
-    // Cek waktu habis
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
@@ -451,7 +437,7 @@ export class LowCardGameManager {
         _evalStartTime: null,
         drawStartTime: null,
         _evalScheduled: false,
-        _hasSentReg20s: true,     // LANGSUNG TRUE biar tidak dobel dengan broadcast di bawah
+        _hasSentReg20s: true,
         _hasSentDraw20s: false
       };
 
@@ -462,7 +448,6 @@ export class LowCardGameManager {
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
       
-      // NOTIFIKASI 20s AWAL REGISTRASI (HANYA SEKALI)
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
@@ -537,7 +522,7 @@ export class LowCardGameManager {
     game.drawTimeExpired = false;
     game._hasBroadcastInitial = false;
     game.drawStartTime = Date.now();
-    game._hasSentDraw20s = false;  // Reset flag untuk draw phase
+    game._hasSentDraw20s = false;
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
@@ -546,8 +531,6 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardClosed", playersList]);
     this._safeBroadcast(room, ["gameLowCardPlayersInGame", playersList, game.betAmount]);
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
-    
-    // TIDAK KIRIM 20s DI SINI (biarkan dari _handleDrawTick)
   }
 
   _handleBotDraw(room, botId) {
@@ -836,11 +819,9 @@ export class LowCardGameManager {
       game._hasBroadcastInitial = false;
       game.drawStartTime = Date.now();
       game._evalScheduled = false;
-      game._hasSentDraw20s = false;  // Reset flag untuk ronde baru
+      game._hasSentDraw20s = false;
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
-      
-      // TIDAK KIRIM 20s DI SINI (biarkan dari _handleDrawTick)
       
     } catch (e) {
       this._logError(`EvaluateRound error in ${room}: ${e.message}`);
