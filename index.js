@@ -1196,8 +1196,7 @@ export class ChatServer2 {
   }
 }
 
-// Cloudflare Workers Durable Object export
-export { ChatServer2 };
+
 
 export default {
   async fetch(req, env) {
