@@ -605,7 +605,7 @@ export class ChatServer2 {
           this.sendAllStateTo(ws, roomName, true);
         }
       } catch(e) {}
-    }, 100);
+    }, 1000);
     
     return true;
   }
