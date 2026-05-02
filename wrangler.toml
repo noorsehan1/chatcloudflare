@@ -1,7 +1,7 @@
 name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-03"
-
+compatibility_flags = ["durable_object_alarms"]
 # HAPUS usage_model = "bundled" - tidak perlu untuk free tier
 
 [[durable_objects.bindings]]
