@@ -309,27 +309,44 @@ export class ChatServer2 {
     return count;
   }
   
-  sendAllStateTo(ws, room, excludeSelf = true) {
-    if (!ws || ws.readyState !== 1 || ws.room !== room) return;
-    
-    const roomMan = this.rooms.get(room);
-    if (!roomMan) return;
-    
-    // Kirim jumlah user di room
-    ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
-    
-    // Kirim semua kursi (termasuk kursi sendiri)
-    const allSeats = roomMan.getAllSeats();
-    if (Object.keys(allSeats).length > 0) {
+ sendAllStateTo(ws, room, excludeSelf = true) {
+  if (!ws || ws.readyState !== 1 || ws.room !== room) return;
+  
+  const roomMan = this.rooms.get(room);
+  if (!roomMan) return;
+  
+  // Kirim jumlah user di room
+  ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
+  
+  // Kirim semua kursi (kecuali sendiri jika excludeSelf = true)
+  const allSeats = roomMan.getAllSeats();
+  if (Object.keys(allSeats).length > 0) {
+    if (excludeSelf) {
+      const selfSeat = this.userSeat.get(ws.userId)?.seat;
+      if (selfSeat) {
+        const filtered = {};
+        for (const [seat, data] of Object.entries(allSeats)) {
+          if (parseInt(seat) !== selfSeat) {
+            filtered[seat] = data;
+          }
+        }
+        if (Object.keys(filtered).length > 0) {
+          ws.send(JSON.stringify(["allUpdateKursiList", room, filtered]));
+        }
+      } else {
+        ws.send(JSON.stringify(["allUpdateKursiList", room, allSeats]));
+      }
+    } else {
       ws.send(JSON.stringify(["allUpdateKursiList", room, allSeats]));
     }
-    
-    // Kirim semua points
-    const allPoints = roomMan.getAllPoints();
-    if (allPoints.length) {
-      ws.send(JSON.stringify(["allPointsList", room, allPoints]));
-    }
   }
+  
+  // Kirim semua points
+  const allPoints = roomMan.getAllPoints();
+  if (allPoints.length) {
+    ws.send(JSON.stringify(["allPointsList", room, allPoints]));
+  }
+}
   
   async cleanup(ws) {
     if (!ws || ws._cleaning) return;
@@ -487,98 +504,102 @@ export class ChatServer2 {
     }
   }
   
-  async handleJoin(ws, roomName) {
-    if (!ws.userId || !ROOMS.includes(roomName)) {
-      ws.send(JSON.stringify(["error", "Invalid room"]));
-      return false;
-    }
-    
-    const currentVer = this.userVersion.get(ws.userId);
-    if (currentVer !== ws._version) {
-      ws.send(JSON.stringify(["error", "Session expired"]));
-      return false;
-    }
-    
-    const userId = ws.userId;
-    const oldRoom = ws.room;
-    
-    // Handle pindah room
-    if (oldRoom && oldRoom !== roomName) {
-      const oldMan = this.rooms.get(oldRoom);
-      let oldSeat = null;
-      for (const [seat, data] of oldMan.seats) {
-        if (data?.namauser === userId) oldSeat = seat;
-      }
-      if (oldSeat) {
-        oldMan.removeSeat(oldSeat);
-        this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-        this.updateRoomCount(oldRoom);
-      }
-      
-      const clients = this.roomClients.get(oldRoom);
-      if (clients) clients.delete(ws);
-      this.userSeat.delete(userId);
-      this.userRoom.delete(userId);
-    }
-    
-    const roomMan = this.rooms.get(roomName);
-    if (!roomMan) return false;
-    
-    // Cek apakah user sudah punya seat di room ini
-    let seat = null;
-    for (const [s, data] of roomMan.seats) {
-      if (data?.namauser === userId) seat = s;
-    }
-    
-    // Jika belum punya seat, cari seat baru
-    if (!seat) {
-      if (roomMan.getCount() >= C.MAX_SEATS) {
-        ws.send(JSON.stringify(["roomFull", roomName]));
-        return false;
-      }
-      seat = roomMan.addSeat(userId, "", "", 0, 0, 0, 0);
-      if (!seat) return false;
-    }
-    
-    // Simpan informasi user
-    this.userSeat.set(userId, { room: roomName, seat });
-    this.userRoom.set(userId, roomName);
-    ws.room = roomName;
-    ws.roomname = roomName;
-    ws.idtarget = userId;
-    ws.username = userId;
-    
-    // Tambahkan ke room clients
-    let clients = this.roomClients.get(roomName);
-    if (!clients) {
-      clients = new Set();
-      this.roomClients.set(roomName, clients);
-    }
-    clients.add(ws);
-    
-    // Kirim response ke user yang join
-    ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
-    ws.send(JSON.stringify(["numberKursiSaya", seat]));
-    ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
-    ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
-    
-    // Kirim data kursi user sendiri
-    const currentSeatData = roomMan.getSeat(seat);
-    ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, currentSeatData]]]));
-    
-    // Broadcast ke semua user di room bahwa ada user yang occupy seat
-    this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
-    
-    // Update room count
-    this.updateRoomCount(roomName);
-    
-    // Kirim semua state ke user (termasuk kursi lain)
-    setTimeout(() => {
-      this.sendAllStateTo(ws, roomName, false); // false = kirim semua termasuk sendiri
-    }, 100);
-    
-    return true;
+ async handleJoin(ws, roomName) {
+  if (!ws.userId || !ROOMS.includes(roomName)) {
+    ws.send(JSON.stringify(["error", "Invalid room"]));
+    return false;
   }
+  
+  const currentVer = this.userVersion.get(ws.userId);
+  if (currentVer !== ws._version) {
+    ws.send(JSON.stringify(["error", "Session expired"]));
+    return false;
+  }
+  
+  const userId = ws.userId;
+  const oldRoom = ws.room;
+  
+  // Handle pindah room
+  if (oldRoom && oldRoom !== roomName) {
+    const oldMan = this.rooms.get(oldRoom);
+    let oldSeat = null;
+    for (const [seat, data] of oldMan.seats) {
+      if (data?.namauser === userId) oldSeat = seat;
+    }
+    if (oldSeat) {
+      oldMan.removeSeat(oldSeat);
+      this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+      this.updateRoomCount(oldRoom);
+    }
+    
+    const clients = this.roomClients.get(oldRoom);
+    if (clients) clients.delete(ws);
+    this.userSeat.delete(userId);
+    this.userRoom.delete(userId);
+  }
+  
+  const roomMan = this.rooms.get(roomName);
+  if (!roomMan) return false;
+  
+  // Cek apakah user sudah punya seat di room ini
+  let seat = null;
+  for (const [s, data] of roomMan.seats) {
+    if (data?.namauser === userId) seat = s;
+  }
+  
+  // Jika belum punya seat, cari seat baru
+  if (!seat) {
+    if (roomMan.getCount() >= C.MAX_SEATS) {
+      ws.send(JSON.stringify(["roomFull", roomName]));
+      return false;
+    }
+    // PERUBAHAN: Buat seat dengan data KOSONG
+    seat = roomMan.addSeat(userId, "", "", 0, 0, 0, 0);
+    if (!seat) return false;
+  }
+  
+  // Simpan informasi user
+  this.userSeat.set(userId, { room: roomName, seat });
+  this.userRoom.set(userId, roomName);
+  ws.room = roomName;
+  ws.roomname = roomName;
+  ws.idtarget = userId;
+  ws.username = userId;
+  
+  // Tambahkan ke room clients
+  let clients = this.roomClients.get(roomName);
+  if (!clients) {
+    clients = new Set();
+    this.roomClients.set(roomName, clients);
+  }
+  clients.add(ws);
+  
+  // Kirim response ke user yang join
+  ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
+  ws.send(JSON.stringify(["numberKursiSaya", seat]));
+  ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
+  ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
+  
+  // PERUBAHAN: Kirim data kursi user sendiri dengan data KOSONG
+  // User nanti akan update sendiri melalui updateKursi
+  const emptySeatData = roomMan.getSeat(seat);
+  ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, emptySeatData]]]));
+  
+  // Broadcast ke semua user di room bahwa ada user yang occupy seat
+  // TAPI dengan data KOSONG juga
+  this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
+  
+  // Update room count
+  this.updateRoomCount(roomName);
+  
+  // PERUBAHAN: Kirim semua kursi LAIN (exclude self) dengan data yang sudah ada
+  // Ini akan menampilkan kursi user lain yang sudah update data
+  setTimeout(() => {
+    this.sendAllStateTo(ws, roomName, true); // true = exclude self
+  }, 1000);
+  
+  return true;
+}
   
   async handleMessage(ws, raw) {
     if (!ws || ws.readyState !== 1 || ws._closing) return;
