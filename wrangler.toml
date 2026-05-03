@@ -6,18 +6,4 @@ compatibility_date = "2024-12-18"
 name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["ChatServer2"]
-
-# HAPUS atau NONAKTIFKAN bagian ini (tidak support di Free Tier):
-# [limits]
-# cpu_ms = 30  # ❌ Tidak support Free Tier
-
-# HAPUS atau NONAKTIFKAN bagian ini:
-# [logging]
-# level = "info"  # ❌ Tidak support Free Tier
-
-# [observability]  # Opsional, bisa tetap di Free Tier
-# enabled = true
-# head_sampling_rate = 0.1
+# TIDAK perlu migrations karena tidak pakai storage SQLite
