@@ -1,4 +1,4 @@
-// ==================== index.js untuk chatcloudflare ====================
+// ==================== index.js untuk chatcloudflare (FIXED) ====================
 
 import LowCardGameManager from "./lowcard.js";
 
@@ -102,7 +102,7 @@ class RoomManager {
   }
 }
 
-// ============ ChatServer2 Class (Sesuai dengan wrangler.toml) ============
+// ============ ChatServer2 Class (FIXED) ============
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
@@ -113,11 +113,11 @@ export class ChatServer2 {
     
     this.wsSet = new Set();
     this.rooms = new Map();
-    this.userSeat = new Map();
-    this.userRoom = new Map();
-    this.userConns = new Map();
-    this.userVersion = new Map();
-    this.roomClients = new Map();
+    this.userSeat = new Map();      // userId -> { room, seat }
+    this.userRoom = new Map();       // userId -> roomName
+    this.userConns = new Map();      // userId -> Set of WebSocket
+    this.userVersion = new Map();    // userId -> version
+    this.roomClients = new Map();    // roomName -> Set of WebSocket
     
     this.currentNumber = 1;
     this.tickCount = 0;
@@ -159,7 +159,6 @@ export class ChatServer2 {
     const startTime = Date.now();
     
     try {
-      // 1. Tick handler
       this.tickCount++;
       const isNumberTick = this.tickCount % C.NUMBER_TICK === 0;
       
@@ -184,29 +183,24 @@ export class ChatServer2 {
         }
       }
       
-      // 2. Game tick
       if (this.lowcard && this.lowcard.masterTick) {
         this.lowcard.masterTick();
       }
       
-      // 3. Cleanup setiap 12 alarm (60 detik)
       this.cleanupCounter++;
       if (this.cleanupCounter >= (C.CLEANUP_INTERVAL / C.ALARM_INTERVAL)) {
         this.cleanupCounter = 0;
         await this.performCleanup();
       }
       
-      // 4. Memory optimization setiap 60 alarm
       if (this.tickCount % 60 === 0) {
         this.optimizeMemory();
       }
       
-      // 5. Log stats setiap 300 alarm
       if (this.tickCount % 300 === 0) {
         this.logStats();
       }
       
-      // 6. Persist state setiap 600 alarm
       if (this.tickCount % 600 === 0) {
         await this.persistState();
       }
@@ -321,22 +315,16 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(room);
     if (!roomMan) return;
     
+    // Kirim jumlah user di room
     ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
     
-    const selfSeat = this.userSeat.get(ws.userId)?.seat;
-    
-    if (excludeSelf && selfSeat) {
-      const filtered = {};
-      for (const [seat, data] of roomMan.seats) {
-        if (seat !== selfSeat) filtered[seat] = data;
-      }
-      if (Object.keys(filtered).length) {
-        ws.send(JSON.stringify(["allUpdateKursiList", room, filtered]));
-      }
-    } else if (roomMan.seats.size) {
-      ws.send(JSON.stringify(["allUpdateKursiList", room, roomMan.getAllSeats()]));
+    // Kirim semua kursi (termasuk kursi sendiri)
+    const allSeats = roomMan.getAllSeats();
+    if (Object.keys(allSeats).length > 0) {
+      ws.send(JSON.stringify(["allUpdateKursiList", room, allSeats]));
     }
     
+    // Kirim semua points
     const allPoints = roomMan.getAllPoints();
     if (allPoints.length) {
       ws.send(JSON.stringify(["allPointsList", room, allPoints]));
@@ -406,10 +394,12 @@ export class ChatServer2 {
     const version = Date.now();
     ws._version = version;
     ws.userId = userId;
+    ws.username = userId;
     
     await this.kickOldConnections(userId, ws);
     
     if (isNew === true) {
+      // Bersihkan seat yang mungkin tersisa dari user ini
       for (const [roomName, roomMan] of this.rooms) {
         let seatToRemove = null;
         for (const [seat, data] of roomMan.seats) {
@@ -422,7 +412,10 @@ export class ChatServer2 {
         }
       }
       
-      this.userConns.set(userId, new Set([ws]));
+      let conns = this.userConns.get(userId);
+      if (!conns) conns = new Set();
+      conns.add(ws);
+      this.userConns.set(userId, conns);
       this.userVersion.set(userId, version);
       this.userSeat.delete(userId);
       this.userRoom.delete(userId);
@@ -430,6 +423,7 @@ export class ChatServer2 {
       
       ws.send(JSON.stringify(["joinroomawal"]));
     } else {
+      // Bersihkan seat
       for (const [roomName, roomMan] of this.rooms) {
         let seatToRemove = null;
         for (const [seat, data] of roomMan.seats) {
@@ -508,6 +502,7 @@ export class ChatServer2 {
     const userId = ws.userId;
     const oldRoom = ws.room;
     
+    // Handle pindah room
     if (oldRoom && oldRoom !== roomName) {
       const oldMan = this.rooms.get(oldRoom);
       let oldSeat = null;
@@ -529,11 +524,13 @@ export class ChatServer2 {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
+    // Cek apakah user sudah punya seat di room ini
     let seat = null;
     for (const [s, data] of roomMan.seats) {
       if (data?.namauser === userId) seat = s;
     }
     
+    // Jika belum punya seat, cari seat baru
     if (!seat) {
       if (roomMan.getCount() >= C.MAX_SEATS) {
         ws.send(JSON.stringify(["roomFull", roomName]));
@@ -543,6 +540,7 @@ export class ChatServer2 {
       if (!seat) return false;
     }
     
+    // Simpan informasi user
     this.userSeat.set(userId, { room: roomName, seat });
     this.userRoom.set(userId, roomName);
     ws.room = roomName;
@@ -550,6 +548,7 @@ export class ChatServer2 {
     ws.idtarget = userId;
     ws.username = userId;
     
+    // Tambahkan ke room clients
     let clients = this.roomClients.get(roomName);
     if (!clients) {
       clients = new Set();
@@ -557,17 +556,26 @@ export class ChatServer2 {
     }
     clients.add(ws);
     
+    // Kirim response ke user yang join
     ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
     ws.send(JSON.stringify(["numberKursiSaya", seat]));
     ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
     ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
     
+    // Kirim data kursi user sendiri
     const currentSeatData = roomMan.getSeat(seat);
     ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, currentSeatData]]]));
     
+    // Broadcast ke semua user di room bahwa ada user yang occupy seat
     this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
     
-    setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
+    // Update room count
+    this.updateRoomCount(roomName);
+    
+    // Kirim semua state ke user (termasuk kursi lain)
+    setTimeout(() => {
+      this.sendAllStateTo(ws, roomName, false); // false = kirim semua termasuk sendiri
+    }, 100);
     
     return true;
   }
@@ -620,15 +628,16 @@ export class ChatServer2 {
         return;
       }
       
-      // Handle other events (simplified for brevity)
+      // Handle events
       switch(evt) {
         case "setIdTarget2":
           await this.handleSetId(ws, args[0], args[1]);
           break;
+          
         case "joinRoom":
           await this.handleJoin(ws, args[0]);
-          if (ws.room) this.updateRoomCount(ws.room);
           break;
+          
         case "chat": {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (ws.room === chatRoom && ws.userId === chatUser && ROOMS.includes(chatRoom)) {
@@ -639,17 +648,149 @@ export class ChatServer2 {
           }
           break;
         }
+        
+        case "updatePoint": {
+          const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
+          if (ws.room === pointRoom && pointSeat >= 1 && pointSeat <= C.MAX_SEATS) {
+            const roomMan = this.rooms.get(pointRoom);
+            const seatData = roomMan?.getSeat(pointSeat);
+            if (seatData?.namauser === ws.userId) {
+              if (roomMan.updatePoint(pointSeat, parseFloat(pointX), parseFloat(pointY), pointFast === 1)) {
+                this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+              }
+            }
+          }
+          break;
+        }
+        
+        case "updateKursi": {
+          const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
+          if (ws.room === kursiRoom && kursiName === ws.userId) {
+            const roomMan = this.rooms.get(kursiRoom);
+            if (roomMan?.getSeat(kursiSeat)) {
+              roomMan.updateSeat(kursiSeat, {
+                noimageUrl: kursiNoimg,
+                namauser: kursiName,
+                color: kursiColor,
+                itembawah: kursiBawah,
+                itematas: kursiAtas,
+                vip: kursiVip,
+                viptanda: kursiVt
+              });
+              // Broadcast ke semua user di room
+              this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, roomMan.getSeat(kursiSeat)]]]);
+            }
+          }
+          break;
+        }
+        
+        case "removeKursiAndPoint": {
+          const [removeRoom, removeSeat] = args;
+          if (ws.room === removeRoom) {
+            const roomMan = this.rooms.get(removeRoom);
+            if (roomMan?.getSeat(removeSeat)?.namauser === ws.userId) {
+              roomMan.removeSeat(removeSeat);
+              this.broadcast(removeRoom, ["removeKursi", removeRoom, removeSeat]);
+              this.updateRoomCount(removeRoom);
+              this.userSeat.delete(ws.userId);
+              this.userRoom.delete(ws.userId);
+              
+              const clients = this.roomClients.get(removeRoom);
+              if (clients) clients.delete(ws);
+              ws.room = null;
+              ws.roomname = null;
+            }
+          }
+          break;
+        }
+        
         case "getCurrentNumber":
           ws.send(JSON.stringify(["currentNumber", this.currentNumber]));
           break;
+          
         case "getAllRoomsUserCount": {
           const counts = {};
           for (const room of ROOMS) counts[room] = this.rooms.get(room).getCount();
           ws.send(JSON.stringify(["allRoomsUserCount", Object.entries(counts)]));
           break;
         }
-        default:
-          // Handle other events...
+        
+        case "getRoomUserCount": {
+          const roomName = args[0];
+          if (ROOMS.includes(roomName)) {
+            ws.send(JSON.stringify(["roomUserCount", roomName, this.rooms.get(roomName).getCount()]));
+          }
+          break;
+        }
+        
+        case "setMuteType": {
+          const [muteVal, muteRoom] = args;
+          if (ROOMS.includes(muteRoom)) {
+            this.rooms.get(muteRoom).setMuted(muteVal);
+            ws.send(JSON.stringify(["muteTypeSet", !!muteVal, true, muteRoom]));
+            this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
+          }
+          break;
+        }
+        
+        case "getMuteType": {
+          const getMuteRoom = args[0];
+          if (ROOMS.includes(getMuteRoom)) {
+            ws.send(JSON.stringify(["muteTypeResponse", this.rooms.get(getMuteRoom).getMuted(), getMuteRoom]));
+          }
+          break;
+        }
+        
+        case "gift": {
+          const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
+          if (ROOMS.includes(giftRoom) && giftSender === ws.userId) {
+            const safeName = (giftGiftName || "").slice(0, C.MAX_GIFT_NAME);
+            this.broadcast(giftRoom, ["gift", giftRoom, giftSender, giftReceiver, safeName, Date.now()]);
+          }
+          break;
+        }
+        
+        case "rollangak": {
+          const [rollRoom, rollUser, rollAngka] = args;
+          if (ROOMS.includes(rollRoom) && rollUser === ws.userId) {
+            this.broadcast(rollRoom, ["rollangakBroadcast", rollRoom, rollUser, rollAngka]);
+          }
+          break;
+        }
+        
+        case "sendnotif": {
+          const [notifTarget, notifNoimg, notifUser, notifMsg] = args;
+          const targetConns = this.userConns.get(notifTarget);
+          if (targetConns) {
+            for (const c of targetConns) {
+              if (c?.readyState === 1 && !c._closing) {
+                c.send(JSON.stringify(["notif", notifNoimg, notifUser, notifMsg, Date.now()]));
+                break;
+              }
+            }
+          }
+          break;
+        }
+        
+        case "private": {
+          const [privTarget, privNoimg, privMsg, privSender] = args;
+          if (privTarget && privSender === ws.userId) {
+            const targetConns = this.userConns.get(privTarget);
+            if (targetConns) {
+              for (const c of targetConns) {
+                if (c?.readyState === 1 && !c._closing) {
+                  c.send(JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
+                  break;
+                }
+              }
+            }
+            ws.send(JSON.stringify(["private", privTarget, privNoimg, privMsg, Date.now(), privSender]));
+          }
+          break;
+        }
+        
+        case "onDestroy":
+          await this.cleanup(ws);
           break;
       }
     } catch(e) {
@@ -674,6 +815,7 @@ export class ChatServer2 {
           tickCount: this.tickCount,
           currentNumber: this.currentNumber,
           nextAlarm: nextAlarm,
+          roomStats: Object.fromEntries(Array.from(this.rooms.entries()).map(([name, rm]) => [name, rm.getCount()])),
           uptime: Date.now() - (this._startTime || Date.now())
         }), { headers: { "Content-Type": "application/json" } });
       }
@@ -775,10 +917,9 @@ export class ChatServer2 {
   _startTime = Date.now();
 }
 
-// ============ Export default handler dengan binding yang benar ============
+// ============ Export default handler ============
 export default {
   async fetch(req, env) {
-    // Gunakan CHAT_SERVER_2 sesuai dengan wrangler.toml
     const id = env.CHAT_SERVER_2.idFromName("chat-room");
     const obj = env.CHAT_SERVER_2.get(id);
     return obj.fetch(req);
