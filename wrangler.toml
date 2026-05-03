@@ -2,6 +2,10 @@ name = "chatcloudflare"
 main = "index.js"
 compatibility_date = "2024-12-18"
 
+# Penting untuk alarm di Durable Objects
+[durable_objects]
+storage_backend = "sqlite"  # Default, tapi lebih eksplisit
+
 [[durable_objects.bindings]]
 name = "CHAT_SERVER_2"
 class_name = "ChatServer2"
@@ -9,3 +13,17 @@ class_name = "ChatServer2"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ChatServer2"]
+
+# OPTIONAL: Untuk observability (Free tier juga bisa)
+[observability]
+enabled = true
+head_sampling_rate = 0.1  # Sampling 10% untuk monitoring
+
+# OPTIONAL: Limit untuk keamanan Free Tier
+[limits]
+cpu_ms = 30  # Batas CPU per request (Free tier default 10ms, bisa naik ke 30 di plan tertentu)
+subrequests = 50  # Batas subrequest
+
+# OPTIONAL: Logging
+[logging]
+level = "info"  # debug/info/warning/error
