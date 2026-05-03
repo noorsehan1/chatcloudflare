@@ -1,19 +1,19 @@
-// ==================== CHAT SERVER - DURABLE OBJECTS OPTIMIZED ====================
+// ==================== CHAT SERVER COMPLETE - DURABLE OBJECTS OPTIMIZED ====================
 // name = "chatcloudnew"
 // main = "index.js"
 
 import LowCardGameManager from "./lowcard.js";
 
 const C = {
-  TICK_INTERVAL: 5000,        // 5 detik
-  NUMBER_TICK: 180,           // 180 * 5 = 900 detik (15 menit)
+  TICK_INTERVAL: 5000,
+  NUMBER_TICK: 180,
   MAX_SEATS: 35,
   MAX_NUMBER: 6,
   MAX_USERNAME: 20,
   MAX_MSG_SIZE: 2000,
   MAX_GIFT_NAME: 20,
   MAX_GLOBAL_CONNECTIONS: 500,
-  CLEANUP_INTERVAL: 60000,    // 1 menit cleanup via alarm
+  CLEANUP_INTERVAL: 60000,
   MAX_CLEANUP_PER_CYCLE: 50
 };
 
@@ -27,6 +27,7 @@ const ROOMS = [
 const GAME_ROOMS = ["LowCard 1", "LowCard 2", "Noxxeliverothcifsa",
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"];
 
+// ==================== ROOM MANAGER CLASS ====================
 class RoomManager {
   constructor(name) {
     this.name = name;
@@ -74,9 +75,14 @@ class RoomManager {
     return true;
   }
 
-  removeSeat(seat) { return this.seats.delete(seat); }
+  removeSeat(seat) { 
+    this.points.delete(seat);
+    return this.seats.delete(seat); 
+  }
+  
   getSeat(seat) { return this.seats.get(seat); }
   getCount() { return this.seats.size; }
+  
   getAllSeats() {
     const result = {};
     for (const [seat, data] of this.seats) result[seat] = data;
@@ -95,6 +101,7 @@ class RoomManager {
   }
 
   getPoint(seat) { return this.points.get(seat); }
+  
   getAllPoints() {
     const result = [];
     for (const [seat, point] of this.points) {
@@ -102,18 +109,25 @@ class RoomManager {
     }
     return result;
   }
+  
+  clearPoints() {
+    this.points.clear();
+  }
 }
 
+// ==================== MAIN CHAT SERVER CLASS ====================
 export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.alive = true;
     this.closing = false;
     this._processing = false;
     this._alarmStarted = false;
     this._cleanupCounter = 0;
+    this._initialized = false;
+    this._startTime = Date.now();
     
+    // Data structures
     this.wsSet = new Set();
     this.rooms = new Map();
     this.userSeat = new Map();
@@ -122,63 +136,79 @@ export class ChatServer2 {
     this.userVersion = new Map();
     this.roomClients = new Map();
     
+    // Game state
     this.currentNumber = 1;
     this.tickCount = 0;
     this.lowcard = null;
     
-    // Cache untuk currentNumber broadcast
+    // Cache
     this._cachedNumberMsg = null;
     this._cachedNumber = null;
     
+    // Initialize rooms
     for (const room of ROOMS) {
       this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
     }
     
+    console.log(`ChatServer2 constructor completed for ${this.state.id.name}`);
+  }
+  
+  // ==================== LAZY INITIALIZATION ====================
+  async ensureInitialized() {
+    if (this._initialized) return true;
+    
     try {
+      console.log("Initializing LowCardGameManager...");
       this.lowcard = new LowCardGameManager(this);
+      this._initialized = true;
       console.log("LowCardGameManager initialized successfully");
+      return true;
     } catch(e) {
-      console.error("Failed to init LowCardGameManager:", e);
+      console.error("LowCard init error:", e);
+      this._initialized = false;
+      return false;
     }
   }
 
-  // ==================== ALARM SYSTEM (PENGGANTI setInterval) ====================
+  // ==================== ALARM SYSTEM ====================
   async alarm() {
     if (this.closing) return;
     
     try {
-      // Jalankan tick utama
-      await this.tick();
+      await this.ensureInitialized();
+      await this.tickWithTimeout();
       
-      // Cleanup dead connections (setiap beberapa tick)
       this._cleanupCounter++;
       if (this._cleanupCounter >= (C.CLEANUP_INTERVAL / C.TICK_INTERVAL)) {
         this.cleanupDeadConnections();
         this._cleanupCounter = 0;
       }
       
-      // Schedule alarm berikutnya
       await this.state.storage.setAlarm(Date.now() + C.TICK_INTERVAL);
     } catch (e) {
       console.error("Alarm error:", e);
-      // Retry scheduling even if tick failed
       try {
         await this.state.storage.setAlarm(Date.now() + C.TICK_INTERVAL);
       } catch (alarmErr) {
         console.error("Failed to reschedule alarm:", alarmErr);
-        this._alarmStarted = false; // Allow retry on next fetch
+        this._alarmStarted = false;
       }
     }
   }
-
-  async startAlarmOnce() {
-    if (this._alarmStarted) return;
-    this._alarmStarted = true;
-    await this.state.storage.setAlarm(Date.now() + C.TICK_INTERVAL);
+  
+  async tickWithTimeout() {
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Tick timeout")), 5000);
+    });
+    
+    try {
+      await Promise.race([this.tick(), timeoutPromise]);
+    } catch(e) {
+      console.error("Tick timeout or error:", e);
+    }
   }
 
-  // ==================== TICK ====================
   async tick() {
     if (this._processing) return;
     this._processing = true;
@@ -189,18 +219,17 @@ export class ChatServer2 {
       
       if (isNumberTick) {
         this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
-        for (const room of this.rooms.values()) room.setNumber(this.currentNumber);
+        for (const room of this.rooms.values()) {
+          room.setNumber(this.currentNumber);
+        }
         
-        // Gunakan cached message untuk optimasi
         if (this._cachedNumber !== this.currentNumber) {
           this._cachedNumberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
           this._cachedNumber = this.currentNumber;
         }
         
-        // Broadcast hanya ke room yang memiliki clients
         for (const [room, clients] of this.roomClients) {
           if (clients.size === 0) continue;
-          
           for (const ws of clients) {
             if (ws?.readyState === 1 && !ws._closing && ws.room === room) {
               try {
@@ -211,12 +240,10 @@ export class ChatServer2 {
         }
       }
       
-      // Game tick
       if (this.lowcard && this.lowcard.masterTick) {
         this.lowcard.masterTick();
       }
       
-      // Broadcast game time left (optimized)
       if (this.lowcard && this.lowcard.activeGames) {
         for (const [room, game] of this.lowcard.activeGames) {
           if (!game || !game._isActive) continue;
@@ -238,6 +265,12 @@ export class ChatServer2 {
     } finally {
       this._processing = false;
     }
+  }
+
+  async startAlarmOnce() {
+    if (this._alarmStarted) return;
+    this._alarmStarted = true;
+    await this.state.storage.setAlarm(Date.now() + C.TICK_INTERVAL);
   }
 
   // ==================== CONNECTION MANAGEMENT ====================
@@ -266,18 +299,15 @@ export class ChatServer2 {
     const room = ws.room;
     let seatNumber = null;
     
-    // Get seat info before cleanup
     if (userId) {
       const seatInfo = this.userSeat.get(userId);
       if (seatInfo) seatNumber = seatInfo.seat;
     }
     
-    // Remove from room
     if (room) {
       const clients = this.roomClients.get(room);
       if (clients) clients.delete(ws);
       
-      // Remove seat if user owns it
       if (userId && seatNumber) {
         const roomMan = this.rooms.get(room);
         if (roomMan) {
@@ -291,7 +321,6 @@ export class ChatServer2 {
       }
     }
     
-    // Clean up user mappings
     if (userId) {
       const conns = this.userConns.get(userId);
       if (conns) {
@@ -305,13 +334,11 @@ export class ChatServer2 {
       }
     }
     
-    // Remove from wsSet and close
     this.wsSet.delete(ws);
     if (ws.readyState === 1) {
       try { ws.close(1000, "Cleanup"); } catch(e) {}
     }
     
-    // Clear references
     ws.room = null;
     ws.roomname = null;
     ws.idtarget = null;
@@ -420,7 +447,7 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== HANDLE MESSAGE ====================
+  // ==================== MESSAGE HANDLERS ====================
   async handleSetId(ws, userId, isNew) {
     if (!userId || userId.length > C.MAX_USERNAME || userId.length === 0) {
       ws.close(1000, "Invalid ID");
@@ -582,7 +609,7 @@ export class ChatServer2 {
         }
       }
       
-      // GAME EVENTS
+      // Game events
       if (evt === "gameLowCardStart" || evt === "gameLowCardJoin" || evt === "gameLowCardNumber" || evt === "gameLowCardEnd") {
         if (!this.lowcard) {
           this.safeSend(ws, ["gameLowCardError", "Game system not ready"]);
@@ -815,32 +842,30 @@ export class ChatServer2 {
     }
   }
 
-  // ==================== FETCH (ENTRY POINT) ====================
+  // ==================== FETCH ENTRY POINT ====================
   async fetch(req) {
     if (this.closing) return new Response("Shutting down", { status: 503 });
     
-    // 🔥 START ALARM DI SINI
     await this.startAlarmOnce();
     
     const url = new URL(req.url);
     
-    // Health check endpoint
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({
         status: "ok",
         connections: this.wsSet.size,
-        rooms: ROOMS.length,
+        rooms: this.rooms.size,
         gameInitialized: !!this.lowcard,
+        initialized: this._initialized,
         tickCount: this.tickCount,
         currentNumber: this.currentNumber,
         alarmStarted: this._alarmStarted,
-        uptime: Date.now() - (this._startTime || Date.now())
+        uptime: Date.now() - this._startTime
       }), { 
         headers: { "Content-Type": "application/json" } 
       });
     }
     
-    // Reset endpoint
     if (url.pathname === "/reset") {
       await this.reset();
       return new Response("Reset complete", { status: 200 });
@@ -873,7 +898,7 @@ export class ChatServer2 {
     return new Response(null, { status: 101, webSocket: client });
   }
   
-  // ==================== RESET ====================
+  // ==================== RESET METHOD ====================
   async reset() {
     for (const ws of this.wsSet) {
       if (ws?.readyState === 1 && !ws._closing) {
@@ -897,6 +922,7 @@ export class ChatServer2 {
     this.tickCount = 0;
     this._alarmStarted = false;
     this._cleanupCounter = 0;
+    this._initialized = false;
     
     this._cachedNumberMsg = null;
     this._cachedNumber = null;
@@ -904,15 +930,12 @@ export class ChatServer2 {
     if (this.lowcard && this.lowcard.destroy) {
       await this.lowcard.destroy();
     }
+    this.lowcard = null;
     
-    try {
-      this.lowcard = new LowCardGameManager(this);
-    } catch(e) {
-      console.error("Failed to reinit game:", e);
-    }
+    await this.startAlarmOnce();
   }
   
-  // ==================== DESTROY ====================
+  // ==================== DESTROY METHOD ====================
   async destroy() {
     this.closing = true;
     
@@ -951,11 +974,16 @@ export class ChatServer2 {
   }
 }
 
-// ==================== EXPORT ====================
+// ==================== WORKER EXPORT ====================
 export default {
   async fetch(req, env) {
-    const id = env.CHAT_SERVER_2.idFromName("chat-room");
-    const obj = env.CHAT_SERVER_2.get(id);
-    return obj.fetch(req);
+    try {
+      const id = env.CHAT_SERVER_2.idFromName("chat-room");
+      const obj = env.CHAT_SERVER_2.get(id);
+      return obj.fetch(req);
+    } catch(e) {
+      console.error("Worker fetch error:", e);
+      return new Response("Internal Server Error: " + e.message, { status: 500 });
+    }
   }
 }
