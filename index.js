@@ -2,7 +2,7 @@
 // name = "chatcloudnew"
 // main = "index.js"
 
-import LowCardGameManager from "./lowcard.js";
+ import LowCardGameManager from "./lowcard.js";
 
 const C = {
   TICK_INTERVAL: 5000,
