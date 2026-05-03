@@ -52,4 +52,4 @@ export default {
     const obj = env.CHAT_SERVER_2.get(id);
     return obj.fetch(request);
   }
-};ini work
+};
