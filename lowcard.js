@@ -1,10 +1,12 @@
-// ==================== LOWCARDGAMEMANAGER.js - DURABLE OBJECTS OPTIMIZED ====================
+// ==================== LOWCARDGAMEMANAGER.js (FIXED) ====================
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
   GAME_TIMEOUT_HOURS: 6,
+  CLEANUP_INTERVAL_MS: 180000,
   REGISTRATION_TIME: 20,
   DRAW_TIME: 20,
+  MASTER_TICK_INTERVAL_MS: 5000,
   EVALUATION_DELAY_MS: 3000,
   MAX_EVALUATION_TIME_MS: 10000,
   MAX_DRAW_WAIT_MS: 30000,
@@ -21,9 +23,9 @@ export class LowCardGameManager {
     this.activeGames = new Map();
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
+    this._cleanupInterval = null;
     this._gameLocks = new Map();
     this._masterTickCounter = 0;
-    this._lastCleanupTime = Date.now();
     
     this._stats = {
       totalGamesStarted: 0,
@@ -34,60 +36,77 @@ export class LowCardGameManager {
       totalLockTimeouts: 0
     };
     
-    // ❌ HAPUS setInterval - tidak boleh di DO!
-    // Cleanup akan dipanggil dari masterTick periodically
+    this._startCleanupInterval();
+  }
+  
+  _startCleanupInterval() {
+    if (this._cleanupInterval) clearInterval(this._cleanupInterval);
+    this._cleanupInterval = setInterval(() => {
+      if (!this._destroyed) this.cleanupStaleGames();
+    }, CONSTANTS.CLEANUP_INTERVAL_MS);
   }
 
-  // ✅ Method untuk cleanup (dipanggil dari masterTick)
-  _cleanupStaleGamesIfNeeded() {
-    const now = Date.now();
-    // Cleanup setiap 60 detik (12 ticks)
-    if (now - this._lastCleanupTime < 60000) return;
-    this._lastCleanupTime = now;
-    
-    const staleGames = [];
-    
-    for (const [room, game] of this.activeGames.entries()) {
-      if (!game || !game._isActive || game.players?.size === 0) {
-        staleGames.push(room);
-        continue;
-      }
-      
-      if (game._phase === 'evaluating' && game._evalStartTime && 
-          (now - game._evalStartTime) > CONSTANTS.MAX_EVALUATION_TIME_MS * 2) {
-        staleGames.push(room);
-        continue;
-      }
-      
-      if (game._phase === 'draw' && game.drawStartTime && 
-          (now - game.drawStartTime) > CONSTANTS.MAX_DRAW_WAIT_MS * 2) {
-        staleGames.push(room);
-        continue;
-      }
+  async _acquireGameLock(room, timeoutMs = CONSTANTS.LOCK_TIMEOUT_MS) {
+    if (!this._gameLocks.has(room)) {
+      this._gameLocks.set(room, { locked: false, queue: [] });
     }
     
-    for (const room of staleGames) {
-      const game = this.activeGames.get(room);
-      if (game && game._isActive) {
-        this._clearGameTimeouts(game);
-        this.endGame(room).catch(e => {
-          this._logError(`cleanupStaleGames endGame error for ${room}: ${e.message}`);
-        });
-      } else {
-        this.activeGames.delete(room);
+    const lock = this._gameLocks.get(room);
+    
+    if (!lock.locked) {
+      lock.locked = true;
+      let _released = false;
+      return () => {
+        if (_released) return;
+        _released = true;
+        this._releaseGameLock(room);
+      };
+    }
+    
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const index = lock.queue.findIndex(item => item.resolve === resolve);
+        if (index !== -1) {
+          lock.queue.splice(index, 1);
+        }
+        this._stats.totalLockTimeouts++;
+        reject(new Error(`Game lock timeout: ${room}`));
+      }, timeoutMs);
+      
+      lock.queue.push({
+        resolve: () => {
+          clearTimeout(timeout);
+          let _released = false;
+          resolve(() => {
+            if (_released) return;
+            _released = true;
+            this._releaseGameLock(room);
+          });
+        },
+        reject
+      });
+    });
+  }
+  
+  _releaseGameLock(room) {
+    const lock = this._gameLocks.get(room);
+    if (!lock) return;
+    
+    if (lock.queue.length > 0) {
+      const next = lock.queue.shift();
+      if (next) next.resolve();
+    } else {
+      lock.locked = false;
+      if (!this.activeGames.has(room)) {
+        this._gameLocks.delete(room);
       }
     }
   }
 
-  // ✅ Master tick - dipanggil dari ChatServer.alarm()
   masterTick() {
     if (this._destroyed) return;
     this._masterTickCounter++;
     
-    // Cleanup stale games periodically
-    this._cleanupStaleGamesIfNeeded();
-    
-    // Process each active game
     const snapshot = Array.from(this.activeGames.entries());
     for (const [room, game] of snapshot) {
       if (!game || !game._isActive) {
@@ -112,7 +131,6 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (!game.registrationOpen) return;
     
-    // Kurangi timer (5 detik per tick)
     if (game.registrationTimeLeft > 0) {
       game.registrationTimeLeft = game.registrationTimeLeft - 5;
       if (game.registrationTimeLeft < 0) game.registrationTimeLeft = 0;
@@ -120,19 +138,11 @@ export class LowCardGameManager {
     
     const timeLeft = game.registrationTimeLeft;
     
-    // Notifikasi 20s
     if (timeLeft === 20 && !game._hasSentReg20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentReg20s = true;
     }
     
-    // Notifikasi 5s
-    if (timeLeft === 5 && !game._hasSentReg5s) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
-      game._hasSentReg5s = true;
-    }
-    
-    // Cek waktu habis
     if (game.registrationTimeLeft === 0 && game.registrationOpen) {
       if (game.players && game.players.size === 1) {
         this._addFourMozBots(room);
@@ -145,7 +155,6 @@ export class LowCardGameManager {
     if (!game || !game._isActive) return;
     if (game.drawTimeExpired) return;
     
-    // Kurangi timer (5 detik per tick)
     if (game.drawTimeLeft > 0 && !game.drawTimeExpired) {
       game.drawTimeLeft = game.drawTimeLeft - 5;
       if (game.drawTimeLeft < 0) game.drawTimeLeft = 0;
@@ -153,28 +162,46 @@ export class LowCardGameManager {
     
     const timeLeft = game.drawTimeLeft;
     
-    // Notifikasi 20s
     if (timeLeft === 20 && !game._hasSentDraw20s) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       game._hasSentDraw20s = true;
     }
     
-    // Notifikasi 5s
-    if (timeLeft === 5 && !game._hasSentDraw5s) {
-      this._safeBroadcast(room, ["gameLowCardTimeLeft", "5s"]);
-      game._hasSentDraw5s = true;
-    }
-    
-    // Bot draw logic
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
-      this._handleBotDraws(game, room, timeLeft);
+      const activeBots = Array.from(game.botPlayers.keys())
+        .filter(botId => !game.eliminated.has(botId));
+      const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
+      
+      if (notDrawnBots.length > 0 && timeLeft > 0) {
+        let needToDraw = 0;
+        
+        if (timeLeft <= 10) {
+          needToDraw = notDrawnBots.length;
+        } else {
+          const totalBots = activeBots.length;
+          const alreadyDrawn = totalBots - notDrawnBots.length;
+          const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
+          const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / 3) * totalBots));
+          needToDraw = Math.min(notDrawnBots.length, Math.max(0, targetDrawn - alreadyDrawn));
+        }
+        
+        if (needToDraw > 0) {
+          const shuffled = [...notDrawnBots];
+          for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+          }
+          const toDraw = shuffled.slice(0, needToDraw);
+          for (const botId of toDraw) {
+            this._handleBotDraw(room, botId);
+          }
+        }
+      }
     }
     
-    // Cek waktu habis
     if (timeLeft === 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
-      // Draw semua bot yang belum draw (fallback)
       if (game.useBots && game.botPlayers) {
         const notDrawnBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated.has(botId) && !game.numbers.has(botId));
@@ -192,41 +219,6 @@ export class LowCardGameManager {
       }
 
       this._scheduleEvaluation(room, game);
-    }
-  }
-  
-  _handleBotDraws(game, room, timeLeft) {
-    const activeBots = Array.from(game.botPlayers.keys())
-      .filter(botId => !game.eliminated.has(botId));
-    const notDrawnBots = activeBots.filter(botId => !game.numbers.has(botId));
-    
-    if (notDrawnBots.length === 0) return;
-    
-    let needToDraw = 0;
-    
-    // Jika waktu <= 10 detik, draw SEMUA bot yang belum draw
-    if (timeLeft <= 10) {
-      needToDraw = notDrawnBots.length;
-    } else {
-      // Draw bertahap
-      const totalBots = activeBots.length;
-      const alreadyDrawn = totalBots - notDrawnBots.length;
-      const ticksElapsed = (CONSTANTS.DRAW_TIME - timeLeft) / 5;
-      const targetDrawn = Math.min(totalBots, Math.ceil((ticksElapsed / 3) * totalBots));
-      needToDraw = Math.min(notDrawnBots.length, Math.max(0, targetDrawn - alreadyDrawn));
-    }
-    
-    if (needToDraw > 0) {
-      // Pilih bot secara random
-      const shuffled = [...notDrawnBots];
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-      }
-      const toDraw = shuffled.slice(0, needToDraw);
-      for (const botId of toDraw) {
-        this._handleBotDraw(room, botId);
-      }
     }
   }
 
@@ -301,7 +293,48 @@ export class LowCardGameManager {
     this._stats.totalErrors++;
     this._stats.lastError = message;
     this._stats.lastErrorTime = Date.now();
-    console.error(`[LowCardGameManager] ${message}`);
+  }
+
+  cleanupStaleGames() {
+    if (this._destroyed) return;
+    const now = Date.now();
+    const staleGames = [];
+    
+    for (const [room, game] of this.activeGames.entries()) {
+      if (!game) {
+        staleGames.push(room);
+        continue;
+      }
+      
+      if (!game.players || game.players.size === 0) {
+        staleGames.push(room);
+        continue;
+      }
+      
+      if (game._phase === 'evaluating' && game._evalStartTime && 
+          (now - game._evalStartTime) > CONSTANTS.MAX_EVALUATION_TIME_MS * 2) {
+        staleGames.push(room);
+        continue;
+      }
+      
+      if (game._phase === 'draw' && game.drawStartTime && 
+          (now - game.drawStartTime) > CONSTANTS.MAX_DRAW_WAIT_MS * 2) {
+        staleGames.push(room);
+        continue;
+      }
+    }
+    
+    for (const room of staleGames) {
+      const game = this.activeGames.get(room);
+      if (game && game._isActive) {
+        this._clearGameTimeouts(game);
+        this.endGame(room).catch(e => {
+          this._logError(`cleanupStaleGames endGame error for ${room}: ${e.message}`);
+        });
+      } else {
+        this.activeGames.delete(room);
+      }
+    }
   }
 
   getRandomCardTanda() {
@@ -324,63 +357,6 @@ export class LowCardGameManager {
       }
     }
     return Math.floor(Math.random() * 12) + 1;
-  }
-
-  async _acquireGameLock(room, timeoutMs = CONSTANTS.LOCK_TIMEOUT_MS) {
-    if (!this._gameLocks.has(room)) {
-      this._gameLocks.set(room, { locked: false, queue: [] });
-    }
-    
-    const lock = this._gameLocks.get(room);
-    
-    if (!lock.locked) {
-      lock.locked = true;
-      let _released = false;
-      return () => {
-        if (_released) return;
-        _released = true;
-        this._releaseGameLock(room);
-      };
-    }
-    
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        const index = lock.queue.findIndex(item => item.resolve === resolve);
-        if (index !== -1) {
-          lock.queue.splice(index, 1);
-        }
-        this._stats.totalLockTimeouts++;
-        reject(new Error(`Game lock timeout: ${room}`));
-      }, timeoutMs);
-      
-      lock.queue.push({
-        resolve: () => {
-          clearTimeout(timeout);
-          let _released = false;
-          resolve(() => {
-            if (_released) return;
-            _released = true;
-            this._releaseGameLock(room);
-          });
-        },
-        reject
-      });
-    });
-  }
-  
-  _releaseGameLock(room) {
-    const lock = this._gameLocks.get(room);
-    if (!lock) return;
-    
-    if (lock.queue.length > 0) {
-      const next = lock.queue.shift();
-      if (next) next.resolve();
-    } else {
-      lock.locked = false;
-      if (!this.activeGames.has(room)) {
-        this._gameLocks.delete(room);
-      }
-    }
   }
 
   async handleEvent(ws, data) {
@@ -463,10 +439,8 @@ export class LowCardGameManager {
         _evalStartTime: null,
         drawStartTime: null,
         _evalScheduled: false,
-        _hasSentReg20s: false,
-        _hasSentReg5s: false,
-        _hasSentDraw20s: false,
-        _hasSentDraw5s: false
+        _hasSentReg20s: true,
+        _hasSentDraw20s: false
       };
 
       game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -475,6 +449,8 @@ export class LowCardGameManager {
       
       this._safeBroadcast(room, ["gameLowCardStart", game.betAmount]);
       this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
+      
+      this._safeBroadcast(room, ["gameLowCardTimeLeft", "20s"]);
       
     } catch (e) {
       this._logError(`StartGame error: ${e.message}`);
@@ -527,6 +503,18 @@ export class LowCardGameManager {
       const hostName = game.hostName;
       const betAmount = game.betAmount;
       
+      // PERBAIKAN: Pakai userConns, bukan userConnections
+      const hostConnections = this.chatServer?.userConns?.get(hostId);
+      if (hostConnections) {
+        const snapshot = Array.from(hostConnections);
+        for (const client of snapshot) {
+          // PERBAIKAN: Pakai _closing, bukan _isClosing
+          if (client && client.readyState === 1 && !client._closing) {
+            this._safeSend(client, ["gameLowCardNoJoin", hostName, betAmount]);
+            break;
+          }
+        }
+      }
       this._safeBroadcast(room, ["gameLowCardError", "Need at least 2 players", hostId]);
       this.activeGames.delete(room);
       return;
@@ -539,7 +527,6 @@ export class LowCardGameManager {
     game._hasBroadcastInitial = false;
     game.drawStartTime = Date.now();
     game._hasSentDraw20s = false;
-    game._hasSentDraw5s = false;
 
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
@@ -837,7 +824,6 @@ export class LowCardGameManager {
       game.drawStartTime = Date.now();
       game._evalScheduled = false;
       game._hasSentDraw20s = false;
-      game._hasSentDraw5s = false;
       
       this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
       
@@ -918,7 +904,11 @@ export class LowCardGameManager {
     if (this._destroyed) return;
     this._destroyed = true;
     
-    // Hapus semua timeout
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+    
     const snapshot = Array.from(this.activeGames.entries());
     for (const [room, game] of snapshot) {
       if (game) {
@@ -927,7 +917,6 @@ export class LowCardGameManager {
       }
     }
 
-    // Broadcast game end
     for (const [room, game] of snapshot) {
       if (game) {
         try {
@@ -944,7 +933,6 @@ export class LowCardGameManager {
       }
     }
     
-    // Clear locks
     for (const lock of this._gameLocks.values()) {
       for (const waiter of lock.queue) {
         try { waiter.reject(new Error("Game manager destroyed")); } catch(e) {}
