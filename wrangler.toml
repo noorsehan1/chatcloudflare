@@ -1,11 +1,10 @@
 name = "chatcloudnew"
 main = "index.js"
-compatibility_date = "2025-02-28"
-compatibility_flags = ["durable_object_alarms"]
+compatibility_date = "2024-12-18"
 
 [[durable_objects.bindings]]
-name = "CHAT_SERVER_2"
-class_name = "ChatServer2"
+name = "CHAT_SERVER_2"    # Nama binding (sama persis dengan yang dipanggil di env)
+class_name = "ChatServer2" # Nama class yang di-export
 
 [[migrations]]
 tag = "v1"
