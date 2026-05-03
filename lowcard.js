@@ -531,7 +531,7 @@ export class LowCardGameManager {
     
     game.useBots = true;
     
-    const botNames = ["🎮 Bot Alpha", "🎮 Bot Beta", "🎮 Bot Gamma", "🎮 Bot Delta"];
+    const botNames = ["🎮moz1", "🎮moz2", "🎮moz3", "🎮moz4"];
     
     for (let i = 0; i < CONSTANTS.MAX_BOTS_PER_GAME; i++) {
       const randomSuffix = Math.random().toString(36).substring(7);
