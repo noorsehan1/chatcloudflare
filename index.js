@@ -1,7 +1,7 @@
 // ==================== CHAT SERVER LENGKAP - DURABLE OBJECTS OPTIMIZED ====================
 // PASTI WORK untuk free tier Cloudflare
 
-const C = {
+ const C = {
   TICK_INTERVAL: 5000,
   NUMBER_TICK: 180,
   MAX_SEATS: 35,
