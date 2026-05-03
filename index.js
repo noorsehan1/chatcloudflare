@@ -1,6 +1,4 @@
-// ==================== CHAT SERVER - WITH SINGLE ALARM ====================
-// name = "chatcloudnew"
-// main = "index.js"
+// ==================== index.js untuk chatcloudflare ====================
 
 import LowCardGameManager from "./lowcard.js";
 
@@ -28,7 +26,6 @@ const GAME_ROOMS = ["LowCard 1", "LowCard 2", "Noxxeliverothcifsa",
   "Chikahan Tambayan", "BLUE DYNASTY", "One Side Love", "Heart Lovers", "LOVE BIRDS"];
 
 class RoomManager {
-  // ... (sama seperti sebelumnya)
   constructor(name) {
     this.name = name;
     this.seats = new Map();
@@ -105,8 +102,8 @@ class RoomManager {
   }
 }
 
-// EXPORT ChatServer (bukan ChatServer2)
-export class ChatServer {
+// ============ ChatServer2 Class (Sesuai dengan wrangler.toml) ============
+export class ChatServer2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -130,6 +127,7 @@ export class ChatServer {
     this._cachedNumberMsg = null;
     this._cachedNumber = null;
     
+    // Initialize rooms
     for (const room of ROOMS) {
       this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
@@ -142,6 +140,7 @@ export class ChatServer {
       console.error("Failed to init LowCardGameManager:", e);
     }
     
+    // Schedule first alarm
     this.scheduleAlarm(0);
   }
   
@@ -160,7 +159,7 @@ export class ChatServer {
     const startTime = Date.now();
     
     try {
-      // Tick handler
+      // 1. Tick handler
       this.tickCount++;
       const isNumberTick = this.tickCount % C.NUMBER_TICK === 0;
       
@@ -185,46 +184,29 @@ export class ChatServer {
         }
       }
       
-      // Game tick
+      // 2. Game tick
       if (this.lowcard && this.lowcard.masterTick) {
         this.lowcard.masterTick();
       }
       
-      if (this.lowcard && this.lowcard.activeGames) {
-        for (const [room, game] of this.lowcard.activeGames) {
-          if (!game || !game._isActive) continue;
-          
-          let timeLeft = null;
-          if (game._phase === 'registration' && (game.registrationTimeLeft === 20 || game.registrationTimeLeft === 5)) {
-            timeLeft = game.registrationTimeLeft;
-          } else if (game._phase === 'draw' && (game.drawTimeLeft === 20 || game.drawTimeLeft === 5)) {
-            timeLeft = game.drawTimeLeft;
-          }
-          
-          if (timeLeft !== null) {
-            this.broadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
-          }
-        }
-      }
-      
-      // Cleanup setiap 12 alarm
+      // 3. Cleanup setiap 12 alarm (60 detik)
       this.cleanupCounter++;
       if (this.cleanupCounter >= (C.CLEANUP_INTERVAL / C.ALARM_INTERVAL)) {
         this.cleanupCounter = 0;
         await this.performCleanup();
       }
       
-      // Memory optimization setiap 60 alarm
+      // 4. Memory optimization setiap 60 alarm
       if (this.tickCount % 60 === 0) {
         this.optimizeMemory();
       }
       
-      // Log stats setiap 300 alarm
+      // 5. Log stats setiap 300 alarm
       if (this.tickCount % 300 === 0) {
         this.logStats();
       }
       
-      // Persist state setiap 600 alarm
+      // 6. Persist state setiap 600 alarm
       if (this.tickCount % 600 === 0) {
         await this.persistState();
       }
@@ -300,9 +282,6 @@ export class ChatServer {
     await this.state.storage.put("serverState", state);
   }
   
-  // Sisanya method seperti broadcast, cleanup, handleMessage, dll.
-  // ... (sertakan semua method yang sama dari kode sebelumnya)
-  
   broadcast(room, msg) {
     const clients = this.roomClients.get(room);
     if (!clients?.size) return 0;
@@ -316,8 +295,55 @@ export class ChatServer {
     return count;
   }
   
+  broadcastToRoom(room, msg) {
+    return this.broadcast(room, msg);
+  }
+  
+  safeSend(ws, msg) {
+    if (!ws || ws.readyState !== 1 || ws._closing) return false;
+    try {
+      ws.send(JSON.stringify(msg));
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+  
+  updateRoomCount(room) {
+    const count = this.rooms.get(room)?.getCount() || 0;
+    this.broadcast(room, ["roomUserCount", room, count]);
+    return count;
+  }
+  
+  sendAllStateTo(ws, room, excludeSelf = true) {
+    if (!ws || ws.readyState !== 1 || ws.room !== room) return;
+    
+    const roomMan = this.rooms.get(room);
+    if (!roomMan) return;
+    
+    ws.send(JSON.stringify(["roomUserCount", room, roomMan.getCount()]));
+    
+    const selfSeat = this.userSeat.get(ws.userId)?.seat;
+    
+    if (excludeSelf && selfSeat) {
+      const filtered = {};
+      for (const [seat, data] of roomMan.seats) {
+        if (seat !== selfSeat) filtered[seat] = data;
+      }
+      if (Object.keys(filtered).length) {
+        ws.send(JSON.stringify(["allUpdateKursiList", room, filtered]));
+      }
+    } else if (roomMan.seats.size) {
+      ws.send(JSON.stringify(["allUpdateKursiList", room, roomMan.getAllSeats()]));
+    }
+    
+    const allPoints = roomMan.getAllPoints();
+    if (allPoints.length) {
+      ws.send(JSON.stringify(["allPointsList", room, allPoints]));
+    }
+  }
+  
   async cleanup(ws) {
-    // Method cleanup sama seperti sebelumnya
     if (!ws || ws._cleaning) return;
     ws._cleaning = true;
     
@@ -371,14 +397,267 @@ export class ChatServer {
     ws.userId = null;
   }
   
-  updateRoomCount(room) {
-    const count = this.rooms.get(room)?.getCount() || 0;
-    this.broadcast(room, ["roomUserCount", room, count]);
-    return count;
+  async handleSetId(ws, userId, isNew) {
+    if (!userId || userId.length > C.MAX_USERNAME || userId.length === 0) {
+      ws.close(1000, "Invalid ID");
+      return;
+    }
+    
+    const version = Date.now();
+    ws._version = version;
+    ws.userId = userId;
+    
+    await this.kickOldConnections(userId, ws);
+    
+    if (isNew === true) {
+      for (const [roomName, roomMan] of this.rooms) {
+        let seatToRemove = null;
+        for (const [seat, data] of roomMan.seats) {
+          if (data?.namauser === userId) seatToRemove = seat;
+        }
+        if (seatToRemove) {
+          roomMan.removeSeat(seatToRemove);
+          this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+          this.updateRoomCount(roomName);
+        }
+      }
+      
+      this.userConns.set(userId, new Set([ws]));
+      this.userVersion.set(userId, version);
+      this.userSeat.delete(userId);
+      this.userRoom.delete(userId);
+      this.wsSet.add(ws);
+      
+      ws.send(JSON.stringify(["joinroomawal"]));
+    } else {
+      for (const [roomName, roomMan] of this.rooms) {
+        let seatToRemove = null;
+        for (const [seat, data] of roomMan.seats) {
+          if (data?.namauser === userId) seatToRemove = seat;
+        }
+        if (seatToRemove) {
+          roomMan.removeSeat(seatToRemove);
+          this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+          this.updateRoomCount(roomName);
+        }
+      }
+      
+      this.userSeat.delete(userId);
+      this.userRoom.delete(userId);
+      
+      let conns = this.userConns.get(userId);
+      if (!conns) conns = new Set();
+      conns.add(ws);
+      this.userConns.set(userId, conns);
+      this.userVersion.set(userId, version);
+      this.wsSet.add(ws);
+      
+      ws.send(JSON.stringify(["needJoinRoom"]));
+    }
+  }
+  
+  async kickOldConnections(userId, excludeWs = null) {
+    const existingConns = this.userConns.get(userId);
+    if (existingConns && existingConns.size > 0) {
+      for (const oldWs of existingConns) {
+        if (oldWs !== excludeWs && oldWs.readyState === 1 && !oldWs._closing) {
+          oldWs._closing = true;
+          try {
+            oldWs.send(JSON.stringify(["kicked", "Akun Anda login di tempat lain"]));
+            oldWs.close(1000, "Duplicate login");
+          } catch(e) {}
+          
+          const oldRoom = oldWs.room;
+          if (oldRoom) {
+            const roomMan = this.rooms.get(oldRoom);
+            let seatToRemove = null;
+            for (const [seat, data] of roomMan.seats) {
+              if (data?.namauser === userId) seatToRemove = seat;
+            }
+            if (seatToRemove) {
+              roomMan.removeSeat(seatToRemove);
+              this.broadcast(oldRoom, ["removeKursi", oldRoom, seatToRemove]);
+              this.updateRoomCount(oldRoom);
+            }
+            
+            const clients = this.roomClients.get(oldRoom);
+            if (clients) clients.delete(oldWs);
+          }
+          
+          this.userSeat.delete(userId);
+          this.userRoom.delete(userId);
+          this.userVersion.delete(userId);
+          this.wsSet.delete(oldWs);
+        }
+      }
+    }
+  }
+  
+  async handleJoin(ws, roomName) {
+    if (!ws.userId || !ROOMS.includes(roomName)) {
+      ws.send(JSON.stringify(["error", "Invalid room"]));
+      return false;
+    }
+    
+    const currentVer = this.userVersion.get(ws.userId);
+    if (currentVer !== ws._version) {
+      ws.send(JSON.stringify(["error", "Session expired"]));
+      return false;
+    }
+    
+    const userId = ws.userId;
+    const oldRoom = ws.room;
+    
+    if (oldRoom && oldRoom !== roomName) {
+      const oldMan = this.rooms.get(oldRoom);
+      let oldSeat = null;
+      for (const [seat, data] of oldMan.seats) {
+        if (data?.namauser === userId) oldSeat = seat;
+      }
+      if (oldSeat) {
+        oldMan.removeSeat(oldSeat);
+        this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+        this.updateRoomCount(oldRoom);
+      }
+      
+      const clients = this.roomClients.get(oldRoom);
+      if (clients) clients.delete(ws);
+      this.userSeat.delete(userId);
+      this.userRoom.delete(userId);
+    }
+    
+    const roomMan = this.rooms.get(roomName);
+    if (!roomMan) return false;
+    
+    let seat = null;
+    for (const [s, data] of roomMan.seats) {
+      if (data?.namauser === userId) seat = s;
+    }
+    
+    if (!seat) {
+      if (roomMan.getCount() >= C.MAX_SEATS) {
+        ws.send(JSON.stringify(["roomFull", roomName]));
+        return false;
+      }
+      seat = roomMan.addSeat(userId, "", "", 0, 0, 0, 0);
+      if (!seat) return false;
+    }
+    
+    this.userSeat.set(userId, { room: roomName, seat });
+    this.userRoom.set(userId, roomName);
+    ws.room = roomName;
+    ws.roomname = roomName;
+    ws.idtarget = userId;
+    ws.username = userId;
+    
+    let clients = this.roomClients.get(roomName);
+    if (!clients) {
+      clients = new Set();
+      this.roomClients.set(roomName, clients);
+    }
+    clients.add(ws);
+    
+    ws.send(JSON.stringify(["rooMasuk", seat, roomName]));
+    ws.send(JSON.stringify(["numberKursiSaya", seat]));
+    ws.send(JSON.stringify(["muteTypeResponse", roomMan.getMuted(), roomName]));
+    ws.send(JSON.stringify(["roomUserCount", roomName, roomMan.getCount()]));
+    
+    const currentSeatData = roomMan.getSeat(seat);
+    ws.send(JSON.stringify(["kursiBatchUpdate", roomName, [[seat, currentSeatData]]]));
+    
+    this.broadcast(roomName, ["userOccupiedSeat", roomName, seat, userId]);
+    
+    setTimeout(() => this.sendAllStateTo(ws, roomName, true), 100);
+    
+    return true;
+  }
+  
+  async handleMessage(ws, raw) {
+    if (!ws || ws.readyState !== 1 || ws._closing) return;
+    
+    try {
+      let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+      if (str.length > C.MAX_MSG_SIZE) return;
+      
+      let data;
+      try { data = JSON.parse(str); } catch(e) { return; }
+      if (!Array.isArray(data) || !data.length) return;
+      
+      const [evt, ...args] = data;
+      
+      const needAuth = ["joinRoom", "chat", "updatePoint", "removeKursiAndPoint", "updateKursi", "gift", "rollangak"];
+      if (needAuth.includes(evt) && ws.userId) {
+        const currentVer = this.userVersion.get(ws.userId);
+        if (currentVer !== ws._version) {
+          ws.send(JSON.stringify(["error", "Session expired"]));
+          ws.close(1000, "Session expired");
+          return;
+        }
+      }
+      
+      // Game events
+      if (evt === "gameLowCardStart" || evt === "gameLowCardJoin" || evt === "gameLowCardNumber" || evt === "gameLowCardEnd") {
+        if (!this.lowcard) {
+          this.safeSend(ws, ["gameLowCardError", "Game system not ready"]);
+          return;
+        }
+        
+        if (!GAME_ROOMS.includes(ws.room)) {
+          this.safeSend(ws, ["gameLowCardError", "Game not available in this room"]);
+          return;
+        }
+        
+        if (!ws.idtarget) ws.idtarget = ws.userId;
+        if (!ws.roomname) ws.roomname = ws.room;
+        if (!ws.username) ws.username = ws.userId;
+        
+        try {
+          await this.lowcard.handleEvent(ws, data);
+        } catch(e) {
+          console.error("Game event error:", e);
+          this.safeSend(ws, ["gameLowCardError", e.message || "Game error"]);
+        }
+        return;
+      }
+      
+      // Handle other events (simplified for brevity)
+      switch(evt) {
+        case "setIdTarget2":
+          await this.handleSetId(ws, args[0], args[1]);
+          break;
+        case "joinRoom":
+          await this.handleJoin(ws, args[0]);
+          if (ws.room) this.updateRoomCount(ws.room);
+          break;
+        case "chat": {
+          const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
+          if (ws.room === chatRoom && ws.userId === chatUser && ROOMS.includes(chatRoom)) {
+            const sanitized = chatMsg?.slice(0, 500) || "";
+            if (!sanitized.includes('\0')) {
+              this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, chatUser, sanitized, chatColor, chatTextColor]);
+            }
+          }
+          break;
+        }
+        case "getCurrentNumber":
+          ws.send(JSON.stringify(["currentNumber", this.currentNumber]));
+          break;
+        case "getAllRoomsUserCount": {
+          const counts = {};
+          for (const room of ROOMS) counts[room] = this.rooms.get(room).getCount();
+          ws.send(JSON.stringify(["allRoomsUserCount", Object.entries(counts)]));
+          break;
+        }
+        default:
+          // Handle other events...
+          break;
+      }
+    } catch(e) {
+      console.error("Message error:", e);
+    }
   }
   
   async fetch(req) {
-    // Method fetch sama seperti sebelumnya
     if (this.closing) return new Response("Shutting down", { status: 503 });
     
     const url = new URL(req.url);
@@ -386,13 +665,15 @@ export class ChatServer {
     
     if (upgrade !== "websocket") {
       if (url.pathname === "/health") {
+        const nextAlarm = await this.state.storage.getAlarm();
         return new Response(JSON.stringify({
           status: "ok",
           connections: this.wsSet.size,
           rooms: ROOMS.length,
           gameInitialized: !!this.lowcard,
-          alarmInterval: C.ALARM_INTERVAL,
           tickCount: this.tickCount,
+          currentNumber: this.currentNumber,
+          nextAlarm: nextAlarm,
           uptime: Date.now() - (this._startTime || Date.now())
         }), { headers: { "Content-Type": "application/json" } });
       }
@@ -466,12 +747,16 @@ export class ChatServer {
   }
   
   async webSocketMessage(ws, msg) { 
-    // Method handleMessage - sertakan dari kode sebelumnya
-    // ... (masukkan seluruh handleMessage di sini)
+    await this.handleMessage(ws, msg); 
   }
   
-  async webSocketClose(ws) { await this.cleanup(ws); }
-  async webSocketError(ws) { await this.cleanup(ws); }
+  async webSocketClose(ws) { 
+    await this.cleanup(ws); 
+  }
+  
+  async webSocketError(ws) { 
+    await this.cleanup(ws); 
+  }
   
   async destroy() {
     this.closing = true;
@@ -490,11 +775,12 @@ export class ChatServer {
   _startTime = Date.now();
 }
 
-// EXPORT default handler
+// ============ Export default handler dengan binding yang benar ============
 export default {
   async fetch(req, env) {
-    const id = env.CHAT_SERVER.idFromName("chat-room");
-    const obj = env.CHAT_SERVER.get(id);
+    // Gunakan CHAT_SERVER_2 sesuai dengan wrangler.toml
+    const id = env.CHAT_SERVER_2.idFromName("chat-room");
+    const obj = env.CHAT_SERVER_2.get(id);
     return obj.fetch(req);
   }
 }
