@@ -2,7 +2,20 @@
 // name = "chatcloudnew"
 // main = "index.js"
 
-import LowCardGameManager from "./lowcard.js";
+// SAFE IMPORT - with fallback
+let LowCardGameManager;
+try {
+  LowCardGameManager = (await import("./lowcard.js")).default;
+} catch(e) {
+  console.error("Failed to load lowcard.js:", e);
+  // Create dummy class to prevent crashes
+  LowCardGameManager = class DummyLowCardGame {
+    constructor() { console.log("Dummy LowCardGame created"); }
+    async masterTick() {}
+    async handleEvent() {}
+    async destroy() {}
+  };
+}
 
 const C = {
   TICK_INTERVAL: 5000,
@@ -18,7 +31,8 @@ const C = {
   MAX_MESSAGE_AGE: 300000,
   CLEANUP_BATCH_SIZE: 50,
   MAX_VERSION_AGE: 3600000,
-  MAX_JSON_SIZE: 524288
+  MAX_JSON_SIZE: 524288,
+  GAME_TIMEOUT: 10000        // Added game timeout
 };
 
 const ROOMS = [
@@ -248,6 +262,7 @@ export class ChatServer2 {
       this.roomClients.set(room, new Set());
     }
     
+    // Initialize game with error handling
     this.initGameWithRetry();
     
     if (this.state) {
@@ -260,7 +275,9 @@ export class ChatServer2 {
     this.alarmScheduled = true;
     try {
       await this.state.storage.setAlarm(Date.now() + C.TICK_INTERVAL);
-    } catch(e) {}
+    } catch(e) {
+      // Silently fail - no reset
+    }
   }
   
   async alarm() {
@@ -269,7 +286,9 @@ export class ChatServer2 {
       await this.tick();
       await this.cleanupDeadConnections();
       await this.deepMemoryCleanup();
-    } catch(e) {} finally {
+    } catch(e) {
+      // NO AUTO RESET - just log (silent for production)
+    } finally {
       this.alarmScheduled = false;
       if (!this.closing) {
         await this.scheduleAlarm();
@@ -292,7 +311,7 @@ export class ChatServer2 {
     let cleanedCount = 0;
     
     try {
-      // Hanya cleanup data stale, TIDAK ada reset otomatis
+      // Only cleanup stale data, NO auto reset
       const expiredVersion = [];
       for (const [userId, version] of this.userVersion) {
         if (now - version > C.MAX_VERSION_AGE) {
@@ -314,7 +333,6 @@ export class ChatServer2 {
           }
         }
         if (!hasLive && connsArray.length > 0) {
-          // Hapus hanya jika benar-benar mati
           this.userConns.delete(userId);
           cleanedCount++;
         }
@@ -345,7 +363,9 @@ export class ChatServer2 {
         this.wsSet.delete(ws);
         cleanedCount++;
       }
-    } catch(e) {}
+    } catch(e) {
+      // NO RESET
+    }
     
     this._cleanupStats = {
       lastRun: now,
@@ -438,7 +458,7 @@ export class ChatServer2 {
   }
 
   async tick() {
-    // PENCEGAHAN: Check kondisi aman sebelum jalan
+    // SAFETY: Check conditions before running
     if (this.closing || this._processing || this._tickLock || this._recoveryMode) return;
     
     this._tickLock = true;
@@ -447,8 +467,7 @@ export class ChatServer2 {
     try {
       await this._doTick();
     } catch(e) {
-      // TIDAK ADA RESET - hanya log (tapi log dihapus untuk production)
-      // Error ini tidak akan crash server karena sudah di-catch
+      // NO AUTO RESET
     } finally {
       this._processing = false;
       this._tickLock = false;
@@ -468,7 +487,7 @@ export class ChatServer2 {
           try {
             room.setNumber(this.currentNumber);
           } catch(e) {
-            // Room error tidak akan crash, hanya skip
+            // Room error won't crash
           }
         }
       }
@@ -513,13 +532,15 @@ export class ChatServer2 {
         await this.lowcard.destroy();
       }
       this.lowcard = new LowCardGameManager(this);
-    } catch(e) {} finally {
+    } catch(e) {
+      // NO RESET
+    } finally {
       this._reinitGame = false;
     }
   }
 
   broadcast(room, msg) {
-    // PENCEGAHAN: Validasi semua parameter
+    // SAFETY: Validate all parameters
     if (!room || !msg) return 0;
     
     const clients = this.roomClients.get(room);
@@ -544,7 +565,6 @@ export class ChatServer2 {
           count++;
         }
       } catch(e) {
-        // Hapus client yang bermasalah tanpa crash
         if (clients) clients.delete(ws);
         if (this.wsSet) this.wsSet.delete(ws);
       }
@@ -557,7 +577,7 @@ export class ChatServer2 {
   }
 
   safeSend(ws, msg) {
-    // PENCEGAHAN: Validasi lengkap
+    // SAFETY: Full validation
     if (!ws || !msg) return false;
     if (ws.readyState !== 1 || ws._closing) return false;
     
@@ -613,7 +633,7 @@ export class ChatServer2 {
   }
 
   async cleanup(ws) {
-    // PENCEGAHAN: Validasi dan guard clause
+    // SAFETY: Validation and guard clause
     if (!ws || ws._cleaning) return;
     
     try {
@@ -690,7 +710,9 @@ export class ChatServer2 {
         } catch(e) {}
       }
       
-    } catch(e) {} finally {
+    } catch(e) {
+      // NO RESET
+    } finally {
       try {
         ws.room = null;
         ws.roomname = null;
@@ -705,7 +727,7 @@ export class ChatServer2 {
   }
 
   async handleSetId(ws, userId, isNew) {
-    // PENCEGAHAN: Validasi input
+    // SAFETY: Input validation
     if (!userId || typeof userId !== 'string') {
       try { ws.close(1000, "Invalid ID"); } catch(e) {}
       return;
@@ -737,7 +759,7 @@ export class ChatServer2 {
   }
 
   async handleJoin(ws, roomName) {
-    // PENCEGAHAN: Validasi lengkap
+    // SAFETY: Full validation
     if (!ws || !ws.userId) {
       this.safeSend(ws, ["error", "Invalid session"]);
       return false;
@@ -834,7 +856,7 @@ export class ChatServer2 {
   }
 
   async handleEvent(ws, evt, args) {
-    // PENCEGAHAN: Validasi event
+    // SAFETY: Validate event
     if (!ws || !evt) return;
     
     switch(evt) {
@@ -1096,7 +1118,7 @@ export class ChatServer2 {
   }
 
   async handleMessage(ws, raw) {
-    // PENCEGAHAN: Validasi awal
+    // SAFETY: Initial validation
     if (!ws || ws.readyState !== 1 || ws._closing || this._recoveryMode) return;
     
     try {
@@ -1149,7 +1171,7 @@ export class ChatServer2 {
         
         try {
           const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Game event timeout")), 10000)
+            setTimeout(() => reject(new Error("Game event timeout")), C.GAME_TIMEOUT)
           );
           
           await Promise.race([
@@ -1167,7 +1189,7 @@ export class ChatServer2 {
       await this.handleEvent(ws, evt, args);
       
     } catch(e) {
-      // TIDAK ADA RESET - hanya cleanup koneksi bermasalah
+      // NO AUTO RESET - just cleanup problematic connection
       await this.cleanup(ws);
     }
   }
@@ -1290,13 +1312,5 @@ export class ChatServer2 {
     this.userRoom.clear();
     this.rooms.clear();
     this.roomClients.clear();
-  }
-}
-
-export default {
-  async fetch(req, env) {
-    const id = env.CHAT_SERVER_2.idFromName("chat-room");
-    const obj = env.CHAT_SERVER_2.get(id);
-    return obj.fetch(req);
   }
 }
