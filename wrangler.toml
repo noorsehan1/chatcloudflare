@@ -2,7 +2,6 @@ name = "chatcloudnew"
 main = "index.js"
 compatibility_date = "2026-04-03"
 compatibility_flags = ["durable_object_alarms"]
-# HAPUS usage_model = "bundled" - tidak perlu untuk free tier
 
 [[durable_objects.bindings]]
 name = "CHAT_SERVER_2"
@@ -10,4 +9,4 @@ class_name = "ChatServer2"
 
 [[migrations]]
 tag = "v1"
- new_classes = ["ChatServer2"]
+new_classes = ["ChatServer2"]
