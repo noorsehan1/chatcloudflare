@@ -1,7 +1,7 @@
 // ==================== CHAT SERVER - ALARM 10 DETIK ====================
 // DENGAN FIX RACE CONDITION SAAT RECONNECT
 
- import LowCardGameManager from "./lowcard.js";
+import LowCardGameManager from "./lowcard.js";
 
 const C = {
   ALARM_INTERVAL: 10000,
