@@ -2,7 +2,7 @@
 // HANYA 1 ALARM untuk SEMUA (termasuk game timer)
 // TANPA case "ping"
 
-import LowCardGameManager from "./lowcard.js";
+ import LowCardGameManager from "./lowcard.js";
 
 const C = {
   ALARM_INTERVAL: 10000,     // SATU ALARM: 10 DETIK
