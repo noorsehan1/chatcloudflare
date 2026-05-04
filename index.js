@@ -3,7 +3,7 @@
 
 import LowCardGameManager from "./lowcard.js";
 
-const C = {
+  const C = {
   ALARM_INTERVAL: 10000,
   NUMBER_CHANGE_TICKS: 90,
   MAX_SEATS: 35,
