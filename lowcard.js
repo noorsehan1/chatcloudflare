@@ -1,6 +1,5 @@
 // ==================== lowcard.js (LowCardGameManager) ====================
-// HANYA menggunakan 1 alarm dari ChatServer (10 detik)
-// TIDAK ADA timer tambahan
+// OPTIMIZED FOR FREE TIER - Dengan jeda bot draw natural
 
 const CONSTANTS = Object.freeze({
   MAX_LOWCARD_GAMES: 50,
@@ -9,9 +8,16 @@ const CONSTANTS = Object.freeze({
   // TIMER GAME dalam TICK (1 tick alarm = 10 detik)
   REGISTRATION_TICKS: 2,     // 2 tick = 20 detik
   DRAW_TICKS: 2,             // 2 tick = 20 detik
-  EVALUATION_DELAY_TICKS: 1, // 1 tick = 10 detik (opsional)
+  EVALUATION_DELAY_MS: 2000,
+  MAX_EVALUATION_TIME_MS: 10000,
+  MAX_DRAW_WAIT_MS: 30000,
+  LOCK_TIMEOUT_MS: 5000,
   MAX_GAME_AGE_TICKS: 2160,  // 6 jam = 2160 tick (10 detik)
-  MAX_BOTS_PER_GAME: 4
+  MAX_BOTS_PER_GAME: 4,
+  // Jeda bot draw (dalam milidetik)
+  BOT_DRAW_MIN_DELAY_MS: 1000,   // 1 detik
+  BOT_DRAW_MAX_DELAY_MS: 4000,   // 4 detik
+  TICK_TO_SECOND: 10
 });
 
 export class LowCardGameManager {
@@ -20,6 +26,7 @@ export class LowCardGameManager {
     this.activeGames = new Map();
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._destroyed = false;
+    this._gameLocks = new Map();
     this._masterTickCounter = 0;
     
     this._stats = {
@@ -32,10 +39,9 @@ export class LowCardGameManager {
       totalBotsDrawn: 0
     };
     
-    console.log("LowCardGameManager initialized - SINGLE ALARM MODE (1 tick = 10 detik)");
+    console.log("LowCardGameManager initialized - Bot draw with random delays");
   }
   
-  // ============ SERIALIZE (untuk persistensi) ============
   serializeGame(game) {
     if (!game) return null;
     return {
@@ -55,7 +61,8 @@ export class LowCardGameManager {
       _phase: game._phase,
       _createdAt: game._createdAt,
       _hasSentRegWarning: game._hasSentRegWarning,
-      _hasSentDrawWarning: game._hasSentDrawWarning
+      _hasSentDrawWarning: game._hasSentDrawWarning,
+      _pendingBotTimeouts: Array.from(game._pendingBotTimeouts || [])
     };
   }
   
@@ -80,17 +87,18 @@ export class LowCardGameManager {
       evaluationLocked: false,
       drawTimeExpired: false,
       _createdAt: gameData._createdAt || Date.now(),
+      _createdTick: gameData._createdTick || 0,
       _isActive: true,
       _phase: gameData._phase,
       _evalTimeout: null,
+      _evalStartTime: null,
       _hasSentRegWarning: gameData._hasSentRegWarning || false,
       _hasSentDrawWarning: gameData._hasSentDrawWarning || false,
+      _pendingBotTimeouts: new Set(),
       registrationOpen: gameData._phase === 'registration'
     };
   }
   
-  // ============ SATU-SATUNYA TIMER ============
-  // Dipanggil dari ChatServer.alarm() setiap 10 DETIK
   masterTick() {
     if (this._destroyed) return;
     
@@ -103,7 +111,6 @@ export class LowCardGameManager {
         continue;
       }
       
-      // Cek game stale (6 jam = 2160 tick)
       if (game._createdAt && 
           (this._masterTickCounter - game._createdTick) > CONSTANTS.MAX_GAME_AGE_TICKS) {
         console.log(`Game in ${room} is stale, ending...`);
@@ -114,7 +121,6 @@ export class LowCardGameManager {
       this._processGameTick(room, game);
     }
     
-    // Cleanup setiap 12 tick (2 menit)
     if (this._masterTickCounter % 12 === 0) {
       this.cleanupStaleGames();
     }
@@ -134,26 +140,21 @@ export class LowCardGameManager {
     }
   }
   
-  // ============ REGISTRASI PHASE ============
   _handleRegistrationTick(room, game) {
     if (!game.registrationOpen) return;
     
-    // Kurangi 1 tick (10 detik)
     game.registrationTicksLeft--;
     
     const ticksLeft = game.registrationTicksLeft;
     
-    // Kirim warning 10 detik tersisa (1 tick lagi)
     if (ticksLeft === 1 && !game._hasSentRegWarning) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "10s"]);
       game._hasSentRegWarning = true;
     }
     
-    // Registrasi selesai
     if (ticksLeft <= 0 && game.registrationOpen) {
       game.registrationOpen = false;
       
-      // Tambah bot jika hanya 1 pemain
       if (game.players && game.players.size === 1) {
         this._addFourMozBots(room);
       }
@@ -168,7 +169,6 @@ export class LowCardGameManager {
     const playerCount = game.players?.size || 0;
     
     if (playerCount < 2) {
-      // Tidak cukup pemain, batalkan game
       this._safeBroadcast(room, ["gameLowCardError", "Need at least 2 players"]);
       this.activeGames.delete(room);
       return;
@@ -179,8 +179,8 @@ export class LowCardGameManager {
     game.drawTimeExpired = false;
     game._hasSentDrawWarning = false;
     game.drawStartTime = Date.now();
+    game._pendingBotTimeouts = new Set();
     
-    // Kirim daftar pemain
     const playersList = Array.from(game.players.values())
       .filter(p => p && p.name)
       .map(p => p.name);
@@ -190,31 +190,27 @@ export class LowCardGameManager {
     this._safeBroadcast(room, ["gameLowCardNextRound", 1]);
   }
   
-  // ============ DRAW PHASE ============
   _handleDrawTick(room, game) {
     if (game.drawTimeExpired) return;
     
-    // Kurangi 1 tick (10 detik)
     game.drawTicksLeft--;
     
     const ticksLeft = game.drawTicksLeft;
     
-    // Kirim warning 10 detik tersisa
     if (ticksLeft === 1 && !game._hasSentDrawWarning) {
       this._safeBroadcast(room, ["gameLowCardTimeLeft", "10s"]);
       game._hasSentDrawWarning = true;
     }
     
-    // Bot draw logic (pada tick terakhir, semua bot langsung draw)
+    // Bot draw dengan jeda - hanya di tick terakhir
     if (game.useBots && game.botPlayers && game.botPlayers.size > 0 && !game.evaluationLocked) {
-      this._handleBotDraws(room, game, ticksLeft);
+      this._handleBotDrawsWithDelay(room, game, ticksLeft);
     }
     
-    // Waktu habis
     if (ticksLeft <= 0 && !game.drawTimeExpired) {
       game.drawTimeExpired = true;
       
-      // Force draw untuk bot yang belum draw
+      // Force draw untuk bot yang belum draw (timeout safety)
       if (game.useBots && game.botPlayers) {
         const notDrawnBots = Array.from(game.botPlayers.keys())
           .filter(botId => !game.eliminated?.has(botId) && !game.numbers?.has(botId));
@@ -227,17 +223,54 @@ export class LowCardGameManager {
     }
   }
   
-  _handleBotDraws(room, game, ticksLeft) {
+  // ============ BOT DRAW DENGAN JEDA NATURAL ============
+  _handleBotDrawsWithDelay(room, game, ticksLeft) {
+    if (!game.botPlayers) return;
+    
     const activeBots = Array.from(game.botPlayers.keys())
       .filter(botId => !game.eliminated?.has(botId));
     const notDrawnBots = activeBots.filter(botId => !game.numbers?.has(botId));
     
     if (notDrawnBots.length === 0) return;
     
-    // Di tick terakhir (10 detik tersisa), semua bot langsung draw
+    // Hanya proses di tick terakhir (10 detik tersisa)
     if (ticksLeft === 1) {
-      for (const botId of notDrawnBots) {
-        this._forceBotDraw(room, botId, game);
+      // Hapus timeout lama jika ada
+      if (game._pendingBotTimeouts) {
+        for (const timeoutId of game._pendingBotTimeouts) {
+          clearTimeout(timeoutId);
+        }
+        game._pendingBotTimeouts.clear();
+      }
+      
+      // Kirim bot dengan jeda acak
+      let cumulativeDelay = 500; // delay awal 0.5 detik
+      
+      for (let i = 0; i < notDrawnBots.length; i++) {
+        // Jeda acak antara 1-4 detik antar bot
+        const randomDelay = CONSTANTS.BOT_DRAW_MIN_DELAY_MS + 
+          Math.random() * (CONSTANTS.BOT_DRAW_MAX_DELAY_MS - CONSTANTS.BOT_DRAW_MIN_DELAY_MS);
+        cumulativeDelay += randomDelay;
+        
+        const timeoutId = setTimeout(() => {
+          const currentGame = this._safeGetGame(room);
+          if (currentGame && currentGame._isActive && 
+              !currentGame.drawTimeExpired && 
+              !currentGame.evaluationLocked) {
+            const botId = notDrawnBots[i];
+            if (!currentGame.numbers.has(botId)) {
+              this._forceBotDraw(room, botId, currentGame);
+              this._stats.totalBotsDrawn++;
+            }
+          }
+          // Hapus dari pending setelah eksekusi
+          if (currentGame?._pendingBotTimeouts) {
+            currentGame._pendingBotTimeouts.delete(timeoutId);
+          }
+        }, cumulativeDelay);
+        
+        if (!game._pendingBotTimeouts) game._pendingBotTimeouts = new Set();
+        game._pendingBotTimeouts.add(timeoutId);
       }
     }
   }
@@ -254,32 +287,40 @@ export class LowCardGameManager {
     const botPlayer = game.players.get(botId);
     const botName = botPlayer?.name || botId;
     this._safeBroadcast(room, ["gameLowCardPlayerDraw", botName, botNumber, tanda]);
-    this._stats.totalBotsDrawn++;
   }
   
-  // ============ EVALUASI ============
   _handleEvaluatingTick(room, game) {
-    // Evaluasi sudah dijadwalkan, tunggu selesai
-    // Tidak perlu melakukan apa-apa, evaluasi akan selesai dengan setTimeout
+    if (game._evalStartTime && 
+        (Date.now() - game._evalStartTime) > CONSTANTS.MAX_EVALUATION_TIME_MS) {
+      console.log(`Evaluation timeout in ${room}, forcing end`);
+      this.endGame(room).catch(e => this._logError(`Force end error: ${e.message}`));
+    }
   }
   
   _evaluateRound(room, game) {
     if (!game || !game._isActive) return;
     if (game.evaluationLocked) return;
     
+    // Bersihkan semua pending bot timeouts
+    if (game._pendingBotTimeouts) {
+      for (const timeoutId of game._pendingBotTimeouts) {
+        clearTimeout(timeoutId);
+      }
+      game._pendingBotTimeouts.clear();
+    }
+    
     game.evaluationLocked = true;
     game._phase = 'evaluating';
     
     this._safeBroadcast(room, ["gameLowCardWait", "Please wait for results..."]);
     
-    // Gunakan setTimeout untuk delay evaluasi (TIDAK menambah alarm)
     setTimeout(() => {
       if (this._destroyed) return;
-      const currentGame = this.activeGames.get(room);
+      const currentGame = this._safeGetGame(room);
       if (currentGame && currentGame._isActive && currentGame._phase === 'evaluating') {
         this._processEvaluation(room, currentGame);
       }
-    }, 2000);
+    }, CONSTANTS.EVALUATION_DELAY_MS);
   }
   
   _processEvaluation(room, game) {
@@ -383,11 +424,11 @@ export class LowCardGameManager {
     game._hasSentDrawWarning = false;
     game.numbers = new Map();
     game.tanda = new Map();
+    game._pendingBotTimeouts = new Set();
     
     this._safeBroadcast(room, ["gameLowCardNextRound", game.round]);
   }
   
-  // ============ BOT HELPERS ============
   _getRandomCardTanda() {
     const tandaOptions = ["C1", "C2", "C3", "C4"];
     return tandaOptions[Math.floor(Math.random() * tandaOptions.length)];
@@ -411,7 +452,7 @@ export class LowCardGameManager {
   }
   
   _addFourMozBots(room) {
-    const game = this.activeGames.get(room);
+    const game = this._safeGetGame(room);
     if (!game || !game._isActive || this._destroyed) return;
     if (game.useBots || (game.botPlayers && game.botPlayers.size > 0)) return;
     
@@ -419,7 +460,7 @@ export class LowCardGameManager {
     const botNames = ["🎮moz1", "🎮moz2", "🎮moz3", "🎮moz4"];
     
     for (let i = 0; i < CONSTANTS.MAX_BOTS_PER_GAME; i++) {
-      const botId = `BOT_${room}_${i}_${Date.now()}`;
+      const botId = `BOT_${room}_${i}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
       const botName = botNames[i];
       
       game.players.set(botId, { id: botId, name: botName });
@@ -429,7 +470,6 @@ export class LowCardGameManager {
     }
   }
   
-  // ============ PUBLIC METHODS ============
   async startGame(ws, bet) {
     if (this._destroyed) return;
     if (!ws?.roomname || !ws?.idtarget) {
@@ -439,8 +479,8 @@ export class LowCardGameManager {
     
     const room = ws.roomname;
     
-    const existingGame = this.activeGames.get(room);
-    if (existingGame && existingGame._isActive) {
+    const existingGame = this._safeGetGame(room);
+    if (existingGame) {
       this._safeSend(ws, ["gameLowCardError", "Game already running in this room"]);
       return;
     }
@@ -479,7 +519,8 @@ export class LowCardGameManager {
       _isActive: true,
       _phase: 'registration',
       _hasSentRegWarning: false,
-      _hasSentDrawWarning: false
+      _hasSentDrawWarning: false,
+      _pendingBotTimeouts: new Set()
     };
     
     game.players.set(ws.idtarget, { id: ws.idtarget, name: ws.username || ws.idtarget });
@@ -499,9 +540,9 @@ export class LowCardGameManager {
     }
     
     const room = ws.roomname;
-    const game = this.activeGames.get(room);
+    const game = this._safeGetGame(room);
     
-    if (!game || !game._isActive) {
+    if (!game) {
       this._safeSend(ws, ["gameLowCardError", "No active game"]);
       return;
     }
@@ -533,9 +574,9 @@ export class LowCardGameManager {
     }
     
     const room = ws.roomname;
-    const game = this.activeGames.get(room);
+    const game = this._safeGetGame(room);
     
-    if (!game || !game._isActive) {
+    if (!game) {
       this._safeSend(ws, ["gameLowCardError", "No active game"]);
       return;
     }
@@ -578,7 +619,6 @@ export class LowCardGameManager {
     const playerName = player?.name || ws.idtarget;
     this._safeBroadcast(room, ["gameLowCardPlayerDraw", playerName, n, tanda]);
     
-    // Cek apakah semua player sudah draw
     const activePlayers = Array.from(game.players.keys()).filter(id => !game.eliminated.has(id));
     const allDrawn = game.numbers.size === activePlayers.length;
     
@@ -588,8 +628,16 @@ export class LowCardGameManager {
   }
   
   async endGame(room) {
-    const game = this.activeGames.get(room);
-    if (!game || !game._isActive) return;
+    const game = this._safeGetGame(room);
+    if (!game) return;
+    
+    // Bersihkan semua pending bot timeouts
+    if (game._pendingBotTimeouts) {
+      for (const timeoutId of game._pendingBotTimeouts) {
+        clearTimeout(timeoutId);
+      }
+      game._pendingBotTimeouts.clear();
+    }
     
     const playersList = [];
     if (game.players) {
@@ -622,9 +670,8 @@ export class LowCardGameManager {
         continue;
       }
       
-      // Cek game yang terlalu lama di evaluating phase
       if (game._phase === 'evaluating' && game._evalStartTime) {
-        if ((Date.now() - game._evalStartTime) > 10000) {
+        if ((Date.now() - game._evalStartTime) > CONSTANTS.MAX_EVALUATION_TIME_MS * 2) {
           this.endGame(room);
         }
       }
@@ -632,9 +679,7 @@ export class LowCardGameManager {
   }
   
   getGame(room) {
-    if (this._destroyed || !room) return null;
-    const game = this.activeGames.get(room);
-    return (game && game._isActive) ? game : null;
+    return this._safeGetGame(room);
   }
   
   healthCheck() {
@@ -679,6 +724,15 @@ export class LowCardGameManager {
     if (this._destroyed) return;
     this._destroyed = true;
     
+    // Bersihkan semua pending bot timeouts dari semua game
+    for (const game of this.activeGames.values()) {
+      if (game._pendingBotTimeouts) {
+        for (const timeoutId of game._pendingBotTimeouts) {
+          clearTimeout(timeoutId);
+        }
+      }
+    }
+    
     const snapshot = Array.from(this.activeGames.entries());
     for (const [room, game] of snapshot) {
       if (game) {
@@ -692,7 +746,6 @@ export class LowCardGameManager {
     console.log("LowCardGameManager destroyed");
   }
   
-  // ============ BROADCAST HELPERS ============
   _safeBroadcast(room, message) {
     try {
       if (this._destroyed) return;
@@ -712,6 +765,12 @@ export class LowCardGameManager {
     } catch (e) {
       return false;
     }
+  }
+  
+  _safeGetGame(room) {
+    if (this._destroyed || !room) return null;
+    const game = this.activeGames.get(room);
+    return (game && game._isActive === true) ? game : null;
   }
   
   _logError(message) {
